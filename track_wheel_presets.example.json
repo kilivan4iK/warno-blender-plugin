@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "presets": {
+    "Default": {
+      "pair_dist_scale": 0.42,
+      "pair_edge_scale": 1.08,
+      "pair_target_ratio": 0.97,
+      "pair_min_pool_ratio": 0.6,
+      "pair_axial_scale": 1.15,
+      "pair_ring_min": 0.08,
+      "pair_ring_max": 1.08
+    },
+    "Strict_Leopard_D5": {
+      "pair_dist_scale": 0.3,
+      "pair_edge_scale": 1.03,
+      "pair_target_ratio": 0.92,
+      "pair_min_pool_ratio": 0.75,
+      "pair_axial_scale": 1.0,
+      "pair_ring_min": 0.18,
+      "pair_ring_max": 1.02
+    }
+  }
+}
