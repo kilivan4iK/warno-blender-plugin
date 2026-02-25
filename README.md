@@ -21,6 +21,13 @@ Author: Kilivanchik
 4. Configure paths (`Mesh SPK/Folder`, `Atlas Assets`, `TGV Converter`, WARNO folder for ZZ.dat mode).
 5. Click `Scan Assets` (or `Scan ALL Assets (takes a long time)`) and import.
 
+## Clean PC first run
+- `tgv_converter` default is `tgv_to_png.py`.
+- `auto_install_tgv_deps` default is `true`.
+- `tgv_deps_dir` default is `.warno_pydeps` (local project folder, no admin rights needed).
+- First import on a clean machine may auto-install converter deps (`Pillow`, `zstandard`).
+- Texture pipeline uses ZZ runtime / Atlas paths and does not require legacy `output/`.
+
 ## Notes
 - Tool is focused on WARNO extraction/import workflows; behavior can vary by model type.
 - Manual texture correction is available via the included C++ tool.

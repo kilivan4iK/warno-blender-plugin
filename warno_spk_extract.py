@@ -4916,6 +4916,8 @@ def find_generated_extra_maps(out_png: Path) -> Dict[str, Path]:
 
 
 _TGV_FOLDER_CONVERT_CACHE: set[Tuple[str, str, str, str, bool, bool, bool]] = set()
+_DEPS_READY_CACHE: Dict[Tuple[str, str], bool] = {}
+_DEPS_AUTO_INSTALL_COUNT: int = 0
 
 
 def _safe_resolved_str(path: Path) -> str:
@@ -4965,6 +4967,121 @@ def _folder_convert_cache_key(
     )
 
 
+def _python_cmd_key(py_cmd: Sequence[str]) -> str:
+    return " ".join(str(x).strip().lower() for x in py_cmd if str(x).strip())
+
+
+def _python_cmd_candidates() -> List[List[str]]:
+    cands: List[List[str]] = []
+    env_py = os.environ.get("WARNO_TGV_PYTHON", "").strip()
+    if env_py:
+        cands.append([env_py])
+    if sys.executable:
+        cands.append([sys.executable])
+    py_shim = shutil.which("py")
+    if py_shim:
+        cands.append([py_shim, "-3"])
+    py_bin = shutil.which("python")
+    if py_bin:
+        cands.append([py_bin])
+
+    uniq: List[List[str]] = []
+    seen: set[str] = set()
+    for cmd in cands:
+        key = _python_cmd_key(cmd)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        uniq.append(cmd)
+    return uniq
+
+
+def _is_missing_py_dependency_error(stderr_text: str) -> set[str]:
+    low = str(stderr_text or "").lower()
+    found: set[str] = set()
+    if ("no module named" not in low) and ("modulenotfounderror" not in low):
+        return found
+    if "pil" in low:
+        found.add("Pillow")
+    if "zstandard" in low:
+        found.add("zstandard")
+    return found
+
+
+def _converter_env_with_deps(target_dir: Path) -> Dict[str, str]:
+    env = os.environ.copy()
+    deps = str(target_dir)
+    cur = str(env.get("PYTHONPATH", "") or "").strip()
+    env["PYTHONPATH"] = deps if not cur else deps + os.pathsep + cur
+    return env
+
+
+def _ensure_converter_python_deps(py_cmd: Sequence[str], target_dir: Path) -> Tuple[bool, str]:
+    global _DEPS_AUTO_INSTALL_COUNT
+    key = (_python_cmd_key(py_cmd), _safe_resolved_str(target_dir))
+    if _DEPS_READY_CACHE.get(key):
+        return True, f"deps already ready in {target_dir}"
+
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        return False, f"cannot create deps dir {target_dir}: {exc}"
+
+    ensure_cmd = [*py_cmd, "-m", "ensurepip", "--upgrade"]
+    ensure_cmd_text = " ".join(ensure_cmd)
+    ensure_proc = subprocess.run(ensure_cmd, capture_output=True, text=True)
+    ensure_msg = (ensure_proc.stderr or ensure_proc.stdout or "").strip()
+
+    pip_cmd = [
+        *py_cmd,
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--target",
+        str(target_dir),
+        "Pillow",
+        "zstandard",
+    ]
+    pip_cmd_text = " ".join(pip_cmd)
+    pip_proc = subprocess.run(pip_cmd, capture_output=True, text=True)
+    pip_msg = (pip_proc.stderr or pip_proc.stdout or "").strip()
+    if pip_proc.returncode == 0:
+        _DEPS_READY_CACHE[key] = True
+        _DEPS_AUTO_INSTALL_COUNT += 1
+        if ensure_proc.returncode != 0 and ensure_msg:
+            return True, f"pip ok ({pip_cmd_text}), ensurepip warning ({ensure_cmd_text}): {ensure_msg[:220]}"
+        return True, f"installed to {target_dir}"
+
+    if ensure_proc.returncode != 0 and ensure_msg:
+        return (
+            False,
+            f"ensurepip failed [{ensure_cmd_text}]: {ensure_msg[:220]} | "
+            f"pip failed [{pip_cmd_text}]: {pip_msg[:320]}",
+        )
+    return False, f"pip failed [{pip_cmd_text}]: {pip_msg[:420]}"
+
+
+def get_tgv_deps_auto_install_count() -> int:
+    return int(_DEPS_AUTO_INSTALL_COUNT)
+
+
+def install_tgv_converter_deps(converter: Path, deps_dir: Path | None = None) -> Tuple[bool, str]:
+    if Path(converter).suffix.lower() != ".py":
+        return True, "converter is not a python script; deps bootstrap is not required"
+    target_dir = Path(deps_dir) if deps_dir is not None else (Path(converter).parent / ".warno_pydeps")
+    cands = _python_cmd_candidates()
+    if not cands:
+        return False, "no python interpreter candidate found for dependency install"
+    errors: List[str] = []
+    for py_cmd in cands:
+        ok, msg = _ensure_converter_python_deps(py_cmd, target_dir)
+        if ok:
+            return True, f"[{' '.join(py_cmd)}] {msg}"
+        errors.append(f"[{' '.join(py_cmd)}] {msg}")
+    return False, "; ".join(errors[:3])
+
+
 def run_tgv_converter_for_folder_once(
     converter: Path,
     src_dir: Path,
@@ -4973,6 +5090,8 @@ def run_tgv_converter_for_folder_once(
     mirror: bool = False,
     aggressive_split: bool = False,
     auto_naming: bool = False,
+    auto_install_deps: bool = True,
+    deps_dir: Path | None = None,
 ) -> None:
     key = _folder_convert_cache_key(
         converter=converter,
@@ -4993,6 +5112,8 @@ def run_tgv_converter_for_folder_once(
         mirror=mirror,
         aggressive_split=aggressive_split,
         auto_naming=auto_naming,
+        auto_install_deps=auto_install_deps,
+        deps_dir=deps_dir,
     )
     _TGV_FOLDER_CONVERT_CACHE.add(key)
 
@@ -5063,6 +5184,8 @@ def run_tgv_converter(
     mirror: bool = False,
     aggressive_split: bool = False,
     auto_naming: bool = True,
+    auto_install_deps: bool = True,
+    deps_dir: Path | None = None,
 ) -> None:
     split = str(split_mode or "auto").strip().lower()
     if split not in {"auto", "all", "none"}:
@@ -5078,56 +5201,51 @@ def run_tgv_converter(
     ):
         return
 
-    def python_cmd_candidates() -> List[List[str]]:
-        cands: List[List[str]] = []
-        env_py = os.environ.get("WARNO_TGV_PYTHON", "").strip()
-        if env_py:
-            cands.append([env_py])
-        if sys.executable:
-            cands.append([sys.executable])
-        py_shim = shutil.which("py")
-        if py_shim:
-            cands.append([py_shim, "-3"])
-        py_bin = shutil.which("python")
-        if py_bin:
-            cands.append([py_bin])
-
-        uniq: List[List[str]] = []
-        seen: set[str] = set()
-        for cmd in cands:
-            key = " ".join(str(x).strip().lower() for x in cmd if str(x).strip())
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            uniq.append(cmd)
-        return uniq
-
     errors: List[str] = []
+    dep_errors: List[str] = []
+    missing_dep_hits: set[str] = set()
+    deps_target = Path(deps_dir) if deps_dir is not None else (converter.parent / ".warno_pydeps")
 
     if converter.suffix.lower() == ".py":
-        for py_cmd in python_cmd_candidates():
-            cmd = [*py_cmd, str(converter), str(src_tgv), str(dst_png), "--split", split]
-            if mirror:
-                cmd.append("--mirror")
-            if aggressive_split:
-                cmd.append("--aggressive-split")
-            if not auto_naming:
-                cmd.append("--no-auto-naming")
-            proc = subprocess.run(cmd, capture_output=True, text=True)
-            if proc.returncode == 0:
-                return
-
-            # Compatibility fallback for custom/older converters that don't support --split.
-            fallback_cmd = [*py_cmd, str(converter), str(src_tgv), str(dst_png)]
-            if mirror:
-                fallback_cmd.append("--mirror")
-            proc2 = subprocess.run(fallback_cmd, capture_output=True, text=True)
-            if proc2.returncode == 0:
-                return
-
-            msg = (proc2.stderr or proc2.stdout or proc.stderr or proc.stdout or "").strip()
+        for py_cmd in _python_cmd_candidates():
             who = " ".join(py_cmd)
-            errors.append(f"[{who}] {msg}")
+            retry_with_deps = False
+            runtime_env: Dict[str, str] | None = None
+            while True:
+                cmd = [*py_cmd, str(converter), str(src_tgv), str(dst_png), "--split", split]
+                if mirror:
+                    cmd.append("--mirror")
+                if aggressive_split:
+                    cmd.append("--aggressive-split")
+                if not auto_naming:
+                    cmd.append("--no-auto-naming")
+                proc = subprocess.run(cmd, capture_output=True, text=True, env=runtime_env)
+                if proc.returncode == 0:
+                    return
+
+                # Compatibility fallback for custom/older converters that don't support --split.
+                fallback_cmd = [*py_cmd, str(converter), str(src_tgv), str(dst_png)]
+                if mirror:
+                    fallback_cmd.append("--mirror")
+                proc2 = subprocess.run(fallback_cmd, capture_output=True, text=True, env=runtime_env)
+                if proc2.returncode == 0:
+                    return
+
+                msg = (proc2.stderr or proc2.stdout or proc.stderr or proc.stdout or "").strip()
+                missing = _is_missing_py_dependency_error(msg)
+                if missing:
+                    missing_dep_hits.update(missing)
+                if auto_install_deps and (not retry_with_deps) and missing:
+                    ok, dep_msg = _ensure_converter_python_deps(py_cmd, deps_target)
+                    if ok:
+                        runtime_env = _converter_env_with_deps(deps_target)
+                        retry_with_deps = True
+                        continue
+                    dep_errors.append(f"[{who}] {dep_msg}")
+                    errors.append(f"[{who}] dependency bootstrap failed: {dep_msg}")
+
+                errors.append(f"[{who}] {msg}")
+                break
     else:
         cmd = [str(converter), str(src_tgv), str(dst_png), "--split", split]
         if mirror:
@@ -5149,7 +5267,17 @@ def run_tgv_converter(
         errors.append(msg)
 
     detail = "; ".join(errors[:3]).strip() or "unknown converter error"
-    raise RuntimeError(f"TGV converter failed for {src_tgv.name}: {detail}")
+    if missing_dep_hits:
+        modules = ",".join(sorted(missing_dep_hits))
+        dep_tail = ""
+        if dep_errors:
+            dep_tail = f" | deps: {'; '.join(dep_errors[:2])}"
+        raise RuntimeError(
+            "converter_failed_missing_dep: "
+            f"TGV converter failed for {src_tgv.name} (missing {modules}): {detail}{dep_tail}. "
+            "Run 'Install/Check TGV deps' or install Pillow/zstandard for Blender Python."
+        )
+    raise RuntimeError(f"converter_failed_other: TGV converter failed for {src_tgv.name}: {detail}")
 
 
 def resolve_texture_from_atlas_ref(
@@ -5164,11 +5292,14 @@ def resolve_texture_from_atlas_ref(
     zz_resolver: ZZDatResolver | None = None,
     zz_runtime_root: Path | None = None,
     fallback_atlas_roots: Sequence[Path] | None = None,
+    auto_install_deps: bool = True,
+    deps_dir: Path | None = None,
 ) -> Dict[str, Any]:
     rel = atlas_ref_to_rel_under_assets(ref)
     role_hint = classify_texture_role(ref)
     src_png = atlas_assets_root / rel
     src_tgv = src_png.with_suffix(".tgv")
+    atlas_source = "manual_path"
 
     extra_roots: List[Path] = []
     for root in fallback_atlas_roots or []:
@@ -5188,6 +5319,7 @@ def resolve_texture_from_atlas_ref(
             if alt_tgv.exists() or alt_png.exists():
                 src_tgv = alt_tgv
                 src_png = alt_png
+                atlas_source = "fallback"
                 break
 
     if not src_tgv.exists() and not src_png.exists():
@@ -5219,6 +5351,7 @@ def resolve_texture_from_atlas_ref(
                 else:
                     src_png = extracted
                     src_tgv = extracted.with_suffix(".tgv")
+                atlas_source = "zz_runtime"
                 break
 
     if not src_tgv.exists() and not src_png.exists():
@@ -5286,6 +5419,7 @@ def resolve_texture_from_atlas_ref(
         if best_tgv is not None and best_tgv_root is not None and best_score >= 90.0:
             src_tgv = best_tgv
             src_png = best_tgv.with_suffix(".png")
+            atlas_source = "fallback"
             try:
                 rel = best_tgv.relative_to(best_tgv_root).with_suffix(".png")
             except Exception:
@@ -5293,6 +5427,7 @@ def resolve_texture_from_atlas_ref(
         elif best_png is not None and best_png_root is not None and best_score >= 90.0:
             src_png = best_png
             src_tgv = best_png.with_suffix(".tgv")
+            atlas_source = "fallback"
             try:
                 rel = best_png.relative_to(best_png_root)
             except Exception:
@@ -5307,6 +5442,7 @@ def resolve_texture_from_atlas_ref(
     if role_hint == "orm" and effective_split_mode == "none":
         effective_split_mode = "auto"
     if src_tgv.exists():
+        deps_before = get_tgv_deps_auto_install_count()
         split_mode_norm = effective_split_mode
         group_error: str | None = None
         force_auto_for_orm = role_hint == "orm" and str(tgv_split_mode or "auto").strip().lower() == "none"
@@ -5323,6 +5459,8 @@ def resolve_texture_from_atlas_ref(
                     mirror=tgv_mirror,
                     aggressive_split=tgv_aggressive_split,
                     auto_naming=False,
+                    auto_install_deps=auto_install_deps,
+                    deps_dir=deps_dir,
                 )
                 if out_png.exists():
                     source_type = "tgv_group"
@@ -5339,6 +5477,8 @@ def resolve_texture_from_atlas_ref(
                     mirror=tgv_mirror,
                     aggressive_split=tgv_aggressive_split,
                     auto_naming=True,
+                    auto_install_deps=auto_install_deps,
+                    deps_dir=deps_dir,
                 )
                 source_type = "tgv"
         except Exception:
@@ -5347,23 +5487,31 @@ def resolve_texture_from_atlas_ref(
                 source_type = "png_fallback"
             else:
                 if group_error:
-                    raise RuntimeError(f"{group_error}")
+                    if str(group_error).startswith("converter_failed_"):
+                        raise RuntimeError(str(group_error))
+                    raise RuntimeError(f"converter_failed_other: {group_error}")
                 raise
+        deps_auto_installed = get_tgv_deps_auto_install_count() > deps_before
     elif src_png.exists():
         shutil.copy2(src_png, out_png)
         source_type = "png"
+        deps_auto_installed = False
     else:
-        raise FileNotFoundError(f"Missing source texture for ref {ref}: expected {src_tgv} or {src_png}")
+        raise FileNotFoundError(
+            f"missing_source: Missing source texture for ref {ref}: expected {src_tgv} or {src_png}"
+        )
 
     extras = find_generated_extra_maps(out_png)
     return {
         "atlas_ref": ref,
         "role": classify_texture_role(ref),
+        "atlas_source": atlas_source,
         "source_type": source_type,
         "source_tgv": str(src_tgv) if src_tgv.exists() else None,
         "source_png": str(src_png) if src_png.exists() else None,
         "out_png": out_png,
         "extras": extras,
+        "deps_auto_installed": bool(deps_auto_installed),
     }
 
 

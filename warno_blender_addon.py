@@ -1036,6 +1036,17 @@ class WARNOImporterSettings(PropertyGroup):
     )
 
     auto_textures: BoolProperty(name="Auto textures", default=True)
+    auto_install_tgv_deps: BoolProperty(
+        name="Auto-install TGV deps",
+        default=True,
+        description="Auto-install Pillow/zstandard for converter on first missing dependency error",
+    )
+    tgv_deps_dir: StringProperty(
+        name="TGV deps dir",
+        subtype="DIR_PATH",
+        default=".warno_pydeps",
+        description="Project-local folder for converter Python deps",
+    )
     auto_split_main_parts: BoolProperty(
         name="Auto split main parts",
         default=True,
@@ -1219,6 +1230,8 @@ def _load_config_into_settings(settings: WARNOImporterSettings, path: Path) -> t
     settings.zz_runtime_dir = get_text("zz_runtime_dir", settings.zz_runtime_dir)
 
     settings.auto_textures = get_bool("auto_textures", settings.auto_textures)
+    settings.auto_install_tgv_deps = get_bool("auto_install_tgv_deps", settings.auto_install_tgv_deps)
+    settings.tgv_deps_dir = get_text("tgv_deps_dir", settings.tgv_deps_dir) or ".warno_pydeps"
     settings.auto_split_main_parts = get_bool("auto_split_main_parts", get_bool("split_bone_parts", settings.auto_split_main_parts))
     settings.auto_split_wheels = get_bool("auto_split_wheels", settings.auto_split_wheels)
     settings.auto_track_wheel_correction = get_bool("auto_track_wheel_correction", settings.auto_track_wheel_correction)
@@ -1282,6 +1295,8 @@ def _save_settings_to_config(settings: WARNOImporterSettings, path: Path) -> tup
     raw["zz_runtime_dir"] = settings.zz_runtime_dir
 
     raw["auto_textures"] = bool(settings.auto_textures)
+    raw["auto_install_tgv_deps"] = bool(settings.auto_install_tgv_deps)
+    raw["tgv_deps_dir"] = str(settings.tgv_deps_dir or ".warno_pydeps")
     raw["auto_split_main_parts"] = bool(settings.auto_split_main_parts)
     raw["auto_split_wheels"] = bool(settings.auto_split_wheels)
     raw["auto_track_wheel_correction"] = bool(settings.auto_track_wheel_correction)
@@ -2057,6 +2072,8 @@ def _fallback_convert_zz_parent_folder(
     texture_subdir: str,
     tgv_split_mode: str,
     tgv_aggressive_split: bool,
+    auto_install_deps: bool,
+    deps_dir: Path | None,
 ) -> int:
     parent = _pick_zz_generic_tsc_parent(extractor_mod, refs, zz_resolver)
     if not parent:
@@ -2093,6 +2110,8 @@ def _fallback_convert_zz_parent_folder(
         mirror=False,
         aggressive_split=bool(tgv_aggressive_split),
         auto_naming=False,
+        auto_install_deps=bool(auto_install_deps),
+        deps_dir=deps_dir,
     )
     return extracted
 
@@ -2116,6 +2135,9 @@ def _resolve_material_maps(
         "errors": [],
         "named": [],
         "channels": [],
+        "atlas_source": "",
+        "converter_source": "",
+        "deps_auto_installed": False,
     }
     if not settings.auto_textures:
         return maps_by_name, report
@@ -2130,14 +2152,36 @@ def _resolve_material_maps(
 
     atlas_raw_text = atlas_override or str(settings.atlas_assets_dir or "").strip()
     converter_text = converter_override or str(settings.tgv_converter or "").strip()
+    atlas_source = "zz_runtime" if atlas_override else "manual_path"
+    report["atlas_source"] = atlas_source
     converter = Path()
+    converter_source = "custom"
     if converter_text:
         converter = _resolve_path(project_root, converter_text)
+    bundled_converter = project_root / "tgv_to_png.py"
+    if converter_text and bundled_converter.exists():
+        try:
+            if converter.resolve() == bundled_converter.resolve():
+                converter_source = "bundled"
+        except Exception:
+            pass
+    modsuite_root = _resolve_path(project_root, str(settings.modding_suite_root or "").strip()) if str(settings.modding_suite_root or "").strip() else None
+    if converter_text and converter_source != "bundled" and modsuite_root is not None:
+        try:
+            if str(converter.resolve()).lower().startswith(str(modsuite_root.resolve()).lower()):
+                converter_source = "moddingSuite"
+        except Exception:
+            pass
     if (not converter_text or not converter.exists() or not converter.is_file()) and bool(settings.use_zz_dat_source):
         cand = _candidate_tgv_converter_from_modding_suite(settings)
         if cand is not None:
             converter = cand
             converter_text = str(cand)
+            converter_source = "moddingSuite"
+    if (not converter_text or not converter.exists() or not converter.is_file()) and bundled_converter.exists() and bundled_converter.is_file():
+        converter = bundled_converter
+        converter_text = str(bundled_converter)
+        converter_source = "bundled"
 
     if not atlas_raw_text:
         raise RuntimeError("Atlas Assets path is empty.")
@@ -2148,6 +2192,7 @@ def _resolve_material_maps(
         raise RuntimeError(f"Atlas Assets folder not found: {atlas_raw}")
     if not converter.exists() or not converter.is_file():
         raise RuntimeError(f"TGV converter not found: {converter}")
+    report["converter_source"] = converter_source
 
     atlas_root = extractor_mod.resolve_atlas_assets_root(atlas_raw)
     fallback_atlas_roots: List[Path] = []
@@ -2223,13 +2268,20 @@ def _resolve_material_maps(
     resolved: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     resolved_by_ref: Dict[str, dict[str, Any]] = {}
+    used_bundled_fallback = False
+    allow_bundled_fallback = (
+        converter_source == "custom"
+        and bundled_converter.exists()
+        and bundled_converter.is_file()
+    )
+    deps_dir = _resolve_path(project_root, str(settings.tgv_deps_dir or "").strip() or ".warno_pydeps")
     for ref in refs:
-        try:
-            item = extractor_mod.resolve_texture_from_atlas_ref(
+        def _resolve_with_converter(conv_path: Path):
+            return extractor_mod.resolve_texture_from_atlas_ref(
                 ref=ref,
                 atlas_assets_root=atlas_root,
                 out_model_dir=model_dir,
-                converter=converter,
+                converter=conv_path,
                 texture_subdir=settings.texture_subdir or "textures",
                 tgv_split_mode=settings.tgv_split_mode,
                 tgv_mirror=False,
@@ -2237,10 +2289,24 @@ def _resolve_material_maps(
                 zz_resolver=zz_resolver,
                 zz_runtime_root=Path(zz_runtime_root_text) if zz_runtime_root_text else None,
                 fallback_atlas_roots=fallback_atlas_roots,
+                auto_install_deps=bool(settings.auto_install_tgv_deps),
+                deps_dir=deps_dir,
             )
+
+        try:
+            item = _resolve_with_converter(converter)
             resolved.append(item)
             resolved_by_ref[str(item.get("atlas_ref", ""))] = item
         except Exception as tex_exc:
+            if allow_bundled_fallback:
+                try:
+                    item = _resolve_with_converter(bundled_converter)
+                    resolved.append(item)
+                    resolved_by_ref[str(item.get("atlas_ref", ""))] = item
+                    used_bundled_fallback = True
+                    continue
+                except Exception as tex_exc2:
+                    tex_exc = tex_exc2
             errors.append({"atlas_ref": ref, "error": str(tex_exc)})
 
     if (not resolved) and errors and zz_resolver is not None and zz_runtime_root_text:
@@ -2255,6 +2321,8 @@ def _resolve_material_maps(
                 texture_subdir=(settings.texture_subdir or "textures"),
                 tgv_split_mode=str(settings.tgv_split_mode or "auto"),
                 tgv_aggressive_split=bool(settings.tgv_aggressive_split),
+                auto_install_deps=bool(settings.auto_install_tgv_deps),
+                deps_dir=deps_dir,
             )
             if extracted_count > 0:
                 for ref in refs:
@@ -2266,11 +2334,13 @@ def _resolve_material_maps(
                         item = {
                             "atlas_ref": ref,
                             "role": extractor_mod.classify_texture_role(ref),
+                            "atlas_source": "zz_runtime",
                             "source_type": "zz_parent_folder",
                             "source_tgv": None,
                             "source_png": None,
                             "out_png": out_png,
                             "extras": extractor_mod.find_generated_extra_maps(out_png),
+                            "deps_auto_installed": False,
                         }
                         resolved.append(item)
                         resolved_by_ref[str(ref)] = item
@@ -2281,6 +2351,8 @@ def _resolve_material_maps(
         except Exception:
             pass
     report["errors"] = errors
+    if used_bundled_fallback:
+        report["converter_source"] = "bundled"
 
     chosen_maps = extractor_mod.pick_material_maps_from_textures(resolved)
     chosen_maps = _augment_maps_from_existing_files(model_dir=model_dir, asset=asset, chosen_maps=chosen_maps)
@@ -2363,14 +2435,19 @@ def _resolve_material_maps(
         {
             "atlas_ref": item["atlas_ref"],
             "role": item["role"],
+            "atlas_source": str(item.get("atlas_source", "")),
             "source_type": item["source_type"],
             "source_tgv": item["source_tgv"],
             "source_png": item["source_png"],
             "out_png": str(item["out_png"]),
             "extras": {k: str(v) for k, v in item.get("extras", {}).items()},
+            "deps_auto_installed": bool(item.get("deps_auto_installed", False)),
         }
         for item in resolved
     ]
+    if any(str(item.get("atlas_source", "")).strip().lower() == "fallback" for item in resolved):
+        report["atlas_source"] = "fallback"
+    report["deps_auto_installed"] = any(bool(item.get("deps_auto_installed", False)) for item in resolved)
     report["named"] = list(named_files)
     return maps_by_name, report
 
@@ -3318,6 +3395,48 @@ class WARNO_OT_ClearTextureFolder(Operator):
         return {"FINISHED"}
 
 
+class WARNO_OT_InstallTGVDeps(Operator):
+    bl_idname = "warno.install_tgv_deps"
+    bl_label = "Install/Check TGV deps"
+    bl_description = "Install Pillow and zstandard for the configured TGV converter Python runtime"
+
+    def execute(self, context):
+        settings = context.scene.warno_import
+        try:
+            extractor_mod = _extractor_module(settings)
+            project_root = _project_root(settings)
+
+            converter_text = str(settings.tgv_converter or "").strip()
+            converter = _resolve_path(project_root, converter_text) if converter_text else Path()
+            if (not converter_text or not converter.exists() or not converter.is_file()) and bool(settings.use_zz_dat_source):
+                cand = _candidate_tgv_converter_from_modding_suite(settings)
+                if cand is not None:
+                    converter = cand
+            if not converter.exists() or not converter.is_file():
+                bundled = project_root / "tgv_to_png.py"
+                if bundled.exists() and bundled.is_file():
+                    converter = bundled
+            if not converter.exists() or not converter.is_file():
+                raise RuntimeError(f"TGV converter not found: {converter}")
+
+            deps_dir = _resolve_path(project_root, str(settings.tgv_deps_dir or "").strip() or ".warno_pydeps")
+            ok, msg = extractor_mod.install_tgv_converter_deps(converter=converter, deps_dir=deps_dir)
+            if ok:
+                status = f"TGV deps ready: {msg}"
+                settings.status = status
+                self.report({"INFO"}, status)
+                return {"FINISHED"}
+            status = f"TGV deps install failed: {msg}"
+            settings.status = status
+            self.report({"ERROR"}, status)
+            return {"CANCELLED"}
+        except Exception as exc:
+            status = f"TGV deps check failed: {exc}"
+            settings.status = status
+            self.report({"ERROR"}, status)
+            return {"CANCELLED"}
+
+
 def _manual_channel_from_suffix_token(token: str) -> str | None:
     low = _norm_low(token)
     if low in {"d", "diff", "diffuse", "albedo", "color"}:
@@ -3961,9 +4080,22 @@ class WARNO_OT_ApplyTextures(Operator):
         tex_refs = len(texture_report.get("refs", []))
         tex_resolved = len(texture_report.get("resolved", []))
         tex_errors = len(texture_report.get("errors", []))
+        atlas_source = str(texture_report.get("atlas_source", "")).strip()
+        converter_source = str(texture_report.get("converter_source", "")).strip()
+        deps_auto_installed = bool(texture_report.get("deps_auto_installed", False))
         msg = f"Textures reapplied: mats={touched} tex:{tex_resolved}/{tex_refs}"
         if tex_errors:
             msg += f" err:{tex_errors}"
+            first = texture_report.get("errors", [{}])[0]
+            first_msg = str(first.get("error", "")).strip()
+            if first_msg:
+                msg += f" | {first_msg[:120]}"
+        if atlas_source:
+            msg += f" | atlas:{atlas_source}"
+        if converter_source:
+            msg += f" | converter:{converter_source}"
+        if deps_auto_installed:
+            msg += " | deps:auto-installed"
         settings.status = msg
         self.report({"INFO"}, msg)
         return {"FINISHED"}
@@ -4226,6 +4358,9 @@ class WARNO_OT_ImportAsset(Operator):
         tex_resolved = len(texture_report.get("resolved", []))
         tex_errors = len(texture_report.get("errors", []))
         tex_channels = texture_report.get("channels", [])
+        atlas_source = str(texture_report.get("atlas_source", "")).strip()
+        converter_source = str(texture_report.get("converter_source", "")).strip()
+        deps_auto_installed = bool(texture_report.get("deps_auto_installed", False))
         if settings.auto_textures:
             if tex_refs == 0:
                 self.report({"WARNING"}, "No texture refs found in SPK for this asset.")
@@ -4259,6 +4394,12 @@ class WARNO_OT_ImportAsset(Operator):
                 first_msg = str(first.get("error", "")).strip()
                 if first_msg:
                     msg += f" | {first_msg[:120]}"
+            if atlas_source:
+                msg += f" | atlas:{atlas_source}"
+            if converter_source:
+                msg += f" | converter:{converter_source}"
+            if deps_auto_installed:
+                msg += " | deps:auto-installed"
         if texture_dir_to_open:
             settings.last_texture_dir = texture_dir_to_open
         settings.status = msg
@@ -4303,12 +4444,15 @@ class WARNO_PT_ImporterPanel(Panel):
         tex.prop(s, "auto_textures")
         tex.prop(s, "atlas_assets_dir")
         tex.prop(s, "tgv_converter")
+        tex.prop(s, "auto_install_tgv_deps")
+        tex.prop(s, "tgv_deps_dir")
         tex.prop(s, "manual_texture_tool")
         tex.prop(s, "texture_subdir")
         tex.prop(s, "tgv_split_mode")
         tex.prop(s, "tgv_aggressive_split")
         tex.prop(s, "auto_rename_textures")
         tex.prop(s, "use_ao_multiply")
+        tex.operator("warno.install_tgv_deps", text="Install/Check TGV deps", icon="CONSOLE")
         tex.operator("warno.open_texture_folder", text="Open Texture Folder", icon="FILE_FOLDER")
         tex.operator("warno.clear_texture_folder", text="Clear texture folder from old files", icon="TRASH")
         tex.operator("warno.manual_texture_correcting", text="Manual texture correcting", icon="PREFERENCES")
@@ -4385,6 +4529,7 @@ CLASSES = [
     WARNO_OT_PickAssetBrowser,
     WARNO_OT_PickAssetPopup,
     WARNO_OT_PrepareZZRuntime,
+    WARNO_OT_InstallTGVDeps,
     WARNO_OT_OpenTextureFolder,
     WARNO_OT_ClearTextureFolder,
     WARNO_OT_ManualTextureCorrecting,
