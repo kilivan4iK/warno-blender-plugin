@@ -27,6 +27,7 @@ Author: Kilivanchik
 - `tgv_deps_dir` default is `.warno_pydeps` (local project folder, no admin rights needed).
 - First import on a clean machine may auto-install converter deps (`Pillow`, `zstandard`).
 - Texture pipeline uses ZZ runtime / Atlas paths and does not require legacy `output/`.
+- Resolver policy is strict: if exact texture ref is not found, addon keeps it unresolved (no unsafe "wrong texture" substitution).
 
 ## Notes
 - Tool is focused on WARNO extraction/import workflows; behavior can vary by model type.

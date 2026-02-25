@@ -2309,47 +2309,8 @@ def _resolve_material_maps(
                     tex_exc = tex_exc2
             errors.append({"atlas_ref": ref, "error": str(tex_exc)})
 
-    if (not resolved) and errors and zz_resolver is not None and zz_runtime_root_text:
-        try:
-            extracted_count = _fallback_convert_zz_parent_folder(
-                extractor_mod=extractor_mod,
-                refs=refs,
-                zz_resolver=zz_resolver,
-                runtime_root=Path(zz_runtime_root_text),
-                converter=converter,
-                model_dir=model_dir,
-                texture_subdir=(settings.texture_subdir or "textures"),
-                tgv_split_mode=str(settings.tgv_split_mode or "auto"),
-                tgv_aggressive_split=bool(settings.tgv_aggressive_split),
-                auto_install_deps=bool(settings.auto_install_tgv_deps),
-                deps_dir=deps_dir,
-            )
-            if extracted_count > 0:
-                for ref in refs:
-                    try:
-                        rel = extractor_mod.atlas_ref_to_rel_under_assets(ref)
-                        out_png = model_dir / (settings.texture_subdir or "textures") / rel
-                        if not out_png.exists():
-                            continue
-                        item = {
-                            "atlas_ref": ref,
-                            "role": extractor_mod.classify_texture_role(ref),
-                            "atlas_source": "zz_runtime",
-                            "source_type": "zz_parent_folder",
-                            "source_tgv": None,
-                            "source_png": None,
-                            "out_png": out_png,
-                            "extras": extractor_mod.find_generated_extra_maps(out_png),
-                            "deps_auto_installed": False,
-                        }
-                        resolved.append(item)
-                        resolved_by_ref[str(ref)] = item
-                    except Exception:
-                        continue
-                if resolved_by_ref:
-                    errors = [e for e in errors if str(e.get("atlas_ref", "")) not in resolved_by_ref]
-        except Exception:
-            pass
+    # Strict resolve policy:
+    # Do not auto-convert parent ZZ folders when direct refs failed. It can pull wrong textures.
     report["errors"] = errors
     if used_bundled_fallback:
         report["converter_source"] = "bundled"

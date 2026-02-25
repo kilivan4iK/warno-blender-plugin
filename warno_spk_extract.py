@@ -4231,15 +4231,19 @@ def _zz_dat_sort_key(path: Path) -> int:
         suffix = stem[3:]
         if suffix.isdigit():
             return int(suffix)
-    return 10**9
+    # Non-ZZ packages (e.g. *_Assets.dat) should have lower precedence than ZZ packs.
+    return -2
 
 
 def find_warno_zz_dat_files(warno_root: Path) -> List[Path]:
     root = Path(warno_root)
     if not root.exists() or not root.is_dir():
         return []
+    scan_root = root / "Data"
+    if not scan_root.exists() or not scan_root.is_dir():
+        scan_root = root
     out: List[Path] = []
-    for p in root.rglob("ZZ*.dat"):
+    for p in scan_root.rglob("ZZ*.dat"):
         try:
             if p.is_file() and _is_numbered_zz_dat_name(p.name):
                 out.append(p)
@@ -4247,6 +4251,46 @@ def find_warno_zz_dat_files(warno_root: Path) -> List[Path]:
             continue
     out.sort(key=lambda p: (_zz_dat_sort_key(p), str(p).lower()))
     return out
+
+
+def find_warno_texture_dat_files(warno_root: Path) -> List[Path]:
+    root = Path(warno_root)
+    if not root.exists() or not root.is_dir():
+        return []
+    scan_root = root / "Data"
+    if not scan_root.exists() or not scan_root.is_dir():
+        scan_root = root
+
+    ordered: List[Path] = []
+    seen: set[str] = set()
+
+    def _push(path: Path) -> None:
+        try:
+            if not path.exists() or not path.is_file():
+                return
+            key = str(path.resolve()).lower()
+        except Exception:
+            return
+        if key in seen:
+            return
+        seen.add(key)
+        ordered.append(path)
+
+    for p in find_warno_zz_dat_files(root):
+        _push(p)
+
+    assets_dats: List[Path] = []
+    for p in scan_root.rglob("*_Assets.dat"):
+        try:
+            if p.is_file() and p.name.lower().endswith("_assets.dat"):
+                assets_dats.append(p)
+        except Exception:
+            continue
+    assets_dats.sort(key=lambda p: str(p).lower())
+    for p in assets_dats:
+        _push(p)
+
+    return ordered
 
 
 def _read_u32_le(buf: bytes, offset: int) -> int:
@@ -4471,9 +4515,7 @@ class ZZDatResolver:
         self._build_index()
         return list(self._assets.keys())
 
-    def find(self, asset_path: str) -> Dict[str, Any] | None:
-        self._build_index()
-        norm = normalize_asset_path(str(asset_path or "")).lower()
+    def _find_exact_norm(self, norm: str) -> Dict[str, Any] | None:
         if not norm:
             return None
         hit = self._assets.get(norm)
@@ -4491,6 +4533,19 @@ class ZZDatResolver:
             hit = self._assets.get(alt)
             if hit is not None:
                 return hit
+        return None
+
+    def find_exact(self, asset_path: str) -> Dict[str, Any] | None:
+        self._build_index()
+        norm = normalize_asset_path(str(asset_path or "")).lower()
+        return self._find_exact_norm(norm)
+
+    def find(self, asset_path: str) -> Dict[str, Any] | None:
+        self._build_index()
+        norm = normalize_asset_path(str(asset_path or "")).lower()
+        hit = self._find_exact_norm(norm)
+        if hit is not None:
+            return hit
 
         base = Path(norm).name.lower()
         if base:
@@ -4753,8 +4808,8 @@ class ZZDatResolver:
             out_path.write_bytes(data)
         return out_path
 
-    def extract_asset_to_runtime(self, asset_path: str, runtime_root: Path) -> Path | None:
-        hit = self.find(asset_path)
+    def extract_asset_to_runtime(self, asset_path: str, runtime_root: Path, exact_only: bool = False) -> Path | None:
+        hit = self.find_exact(asset_path) if exact_only else self.find(asset_path)
         if hit is None:
             return None
         return self.extract_hit_to_runtime(hit, runtime_root)
@@ -4764,9 +4819,9 @@ _ZZ_RESOLVER_CACHE: Dict[Tuple[Tuple[str, int, int], ...], ZZDatResolver] = {}
 
 
 def get_zz_runtime_resolver(warno_root: Path) -> ZZDatResolver:
-    dat_files = find_warno_zz_dat_files(warno_root)
+    dat_files = find_warno_texture_dat_files(warno_root)
     if not dat_files:
-        raise FileNotFoundError(f"No ZZ*.dat found under WARNO folder: {warno_root}")
+        raise FileNotFoundError(f"No texture DAT packages found under WARNO folder: {warno_root}")
 
     key_rows: List[Tuple[str, int, int]] = []
     for p in dat_files:
@@ -5340,7 +5395,7 @@ def resolve_texture_from_atlas_ref(
             ]
             for cand in candidates:
                 try:
-                    extracted = zz_resolver.extract_asset_to_runtime(cand, runtime_root)
+                    extracted = zz_resolver.extract_asset_to_runtime(cand, runtime_root, exact_only=True)
                 except Exception:
                     extracted = None
                 if extracted is None:
@@ -5354,84 +5409,8 @@ def resolve_texture_from_atlas_ref(
                 atlas_source = "zz_runtime"
                 break
 
-    if not src_tgv.exists() and not src_png.exists():
-        # Last-resort fallback: find by basename in atlas roots with path-similarity scoring.
-        # This avoids wrong picks like FX/* when ref expects Decors/*.
-        tgv_name = rel.with_suffix(".tgv").name.lower()
-        png_name = rel.with_suffix(".png").name.lower()
-        search_roots = [atlas_assets_root] + [p for p in extra_roots if p != atlas_assets_root]
-        req_norm = normalize_asset_path(str(rel)).lower()
-        req_parent = normalize_asset_path(str(PurePosixPath(req_norm).parent)).lower()
-        req_parts = [p for p in PurePosixPath(req_parent).parts if p]
-        generic = {"pc", "atlas", "assets", "3d", "2d", "output", "mods", "moddata", "base"}
-        req_tokens = [p.lower() for p in req_parts if p.lower() not in generic]
-
-        best_score = float("-inf")
-        best_tgv: Path | None = None
-        best_tgv_root: Path | None = None
-        best_png: Path | None = None
-        best_png_root: Path | None = None
-
-        def _score_candidate(path: Path, root: Path) -> float:
-            try:
-                rel_key = normalize_asset_path(str(path.relative_to(root))).lower()
-            except Exception:
-                rel_key = normalize_asset_path(path.name).lower()
-            score = float(shared_suffix_score(rel_key, req_norm) * 100)
-            if req_parent and normalize_asset_path(str(PurePosixPath(rel_key).parent)).lower().endswith(req_parent):
-                score += 160.0
-            for tok in req_tokens:
-                if tok and f"/{tok}/" in f"/{rel_key}/":
-                    score += 12.0
-            if "/decors/" in req_norm and "/decors/" not in rel_key:
-                score -= 45.0
-            if "/units/" in req_norm and "/units/" not in rel_key:
-                score -= 45.0
-            if "/fx/" in rel_key and "/fx/" not in req_norm:
-                score -= 35.0
-            score -= min(20.0, float(len(rel_key)) * 0.01)
-            return score
-
-        for root in search_roots:
-            try:
-                tgv_candidates = [p for p in root.rglob("*.tgv") if p.name.lower() == tgv_name]
-            except Exception:
-                tgv_candidates = []
-            for p in tgv_candidates:
-                sc = _score_candidate(p, root)
-                if sc > best_score:
-                    best_score = sc
-                    best_tgv = p
-                    best_tgv_root = root
-            if best_tgv is not None:
-                continue
-            try:
-                png_candidates = [p for p in root.rglob("*.png") if p.name.lower() == png_name]
-            except Exception:
-                png_candidates = []
-            for p in png_candidates:
-                sc = _score_candidate(p, root)
-                if sc > best_score:
-                    best_score = sc
-                    best_png = p
-                    best_png_root = root
-
-        if best_tgv is not None and best_tgv_root is not None and best_score >= 90.0:
-            src_tgv = best_tgv
-            src_png = best_tgv.with_suffix(".png")
-            atlas_source = "fallback"
-            try:
-                rel = best_tgv.relative_to(best_tgv_root).with_suffix(".png")
-            except Exception:
-                rel = Path(best_tgv.name).with_suffix(".png")
-        elif best_png is not None and best_png_root is not None and best_score >= 90.0:
-            src_png = best_png
-            src_tgv = best_png.with_suffix(".tgv")
-            atlas_source = "fallback"
-            try:
-                rel = best_png.relative_to(best_png_root)
-            except Exception:
-                rel = Path(best_png.name)
+    # Strict resolve policy: do not broad-scan by basename across atlas roots.
+    # If exact ref cannot be resolved from runtime/atlas roots, return missing_source.
 
     out_png = out_model_dir / texture_subdir / rel
     out_png.parent.mkdir(parents=True, exist_ok=True)
