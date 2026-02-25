@@ -13,8 +13,10 @@ import json
 import math
 import re
 import subprocess
+import time
 from collections import defaultdict
 from contextlib import ExitStack
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Sequence, Tuple
 
@@ -34,6 +36,7 @@ from mathutils import Vector
 
 
 MODULE_CACHE: dict[tuple[str, str], tuple[int, Any]] = {}
+ZZ_RUNTIME_SESSION_CACHE: dict[tuple[str, str, tuple[tuple[str, int, int], ...]], Dict[str, Any]] = {}
 SAFE_NAME_RX = re.compile(r"[^A-Za-z0-9_.-]+")
 LOD_SUFFIX_LOCAL_RX = re.compile(r"_(LOW|MID|HIGH|LOD[0-9]+)$", re.IGNORECASE)
 CONTROL_CHAR_RX = re.compile(r"[\x00-\x1f\x7f]+")
@@ -330,6 +333,56 @@ def _zz_runtime_root(settings: "WARNOImporterSettings") -> Path:
     return project_root / "out_blender_runtime" / "zz_runtime"
 
 
+def _log_file_path(settings: "WARNOImporterSettings") -> Path:
+    root = _project_root(settings)
+    name = str(settings.log_file_name or "").strip() or "warno_import.log"
+    safe = _safe_name(name, "warno_import.log")
+    if "." not in safe:
+        safe += ".log"
+    return root / safe
+
+
+def _warno_log(settings: Any, message: str, level: str = "INFO", stage: str = "") -> None:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lvl = str(level or "INFO").upper().strip() or "INFO"
+    stg = str(stage or "").strip()
+    prefix = f"[{ts}] [{lvl}]"
+    if stg:
+        prefix += f" [{stg}]"
+    line = f"{prefix} {message}"
+    print(line)
+    if settings is None or not bool(getattr(settings, "log_to_file", False)):
+        return
+    try:
+        path = _log_file_path(settings)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _set_status(settings: Any, text: str, log_level: str = "INFO", stage: str = "") -> None:
+    settings.status = str(text or "")
+    _warno_log(settings, settings.status, level=log_level, stage=stage)
+
+
+def _dat_signature_for_cache(extractor_mod, warno_root: Path) -> tuple[tuple[str, int, int], ...]:
+    rows: List[tuple[str, int, int]] = []
+    try:
+        dat_files = extractor_mod.find_warno_texture_dat_files(warno_root)
+    except Exception:
+        dat_files = []
+    for p in dat_files:
+        try:
+            st = p.stat()
+            rows.append((str(Path(p).resolve()).lower(), int(st.st_mtime_ns), int(st.st_size)))
+        except Exception:
+            continue
+    rows.sort(key=lambda x: x[0])
+    return tuple(rows)
+
+
 def _candidate_tgv_converter_from_modding_suite(settings: "WARNOImporterSettings") -> Path | None:
     project_root = _project_root(settings)
     raw = str(settings.modding_suite_root or "").strip()
@@ -351,7 +404,11 @@ def _candidate_tgv_converter_from_modding_suite(settings: "WARNOImporterSettings
     return None
 
 
-def _prepare_zz_runtime_sources(extractor_mod, settings: "WARNOImporterSettings") -> Dict[str, Any]:
+def _prepare_zz_runtime_sources(
+    extractor_mod,
+    settings: "WARNOImporterSettings",
+    force_rebuild: bool = False,
+) -> Dict[str, Any]:
     if not bool(settings.use_zz_dat_source):
         return {}
     project_root = _project_root(settings)
@@ -364,6 +421,19 @@ def _prepare_zz_runtime_sources(extractor_mod, settings: "WARNOImporterSettings"
 
     runtime_root = _zz_runtime_root(settings)
     runtime_root.mkdir(parents=True, exist_ok=True)
+    warno_key = str(warno_root.resolve()).lower()
+    runtime_key = str(runtime_root.resolve()).lower()
+    dat_signature = _dat_signature_for_cache(extractor_mod, warno_root)
+    cache_key = (warno_key, runtime_key, dat_signature)
+    if force_rebuild:
+        for old_key in list(ZZ_RUNTIME_SESSION_CACHE.keys()):
+            if old_key[0] == warno_key and old_key[1] == runtime_key:
+                ZZ_RUNTIME_SESSION_CACHE.pop(old_key, None)
+    else:
+        cached = ZZ_RUNTIME_SESSION_CACHE.get(cache_key)
+        if cached is not None:
+            return dict(cached)
+
     info = extractor_mod.prepare_runtime_sources_from_zz(warno_root=warno_root, runtime_root=runtime_root)
     info["runtime_root"] = str(runtime_root)
     cand_tgv = _candidate_tgv_converter_from_modding_suite(settings)
@@ -376,7 +446,8 @@ def _prepare_zz_runtime_sources(extractor_mod, settings: "WARNOImporterSettings"
         resolver = None
     if resolver is not None:
         info["zz_resolver"] = resolver
-    return info
+    ZZ_RUNTIME_SESSION_CACHE[cache_key] = dict(info)
+    return dict(info)
 
 
 def _dedupe_paths(paths: Sequence[Path]) -> List[Path]:
@@ -1036,6 +1107,30 @@ class WARNOImporterSettings(PropertyGroup):
     )
 
     auto_textures: BoolProperty(name="Auto textures", default=True)
+    fast_exact_texture_resolve: BoolProperty(
+        name="Fast exact texture resolve",
+        default=True,
+        description="Resolve only exact refs and exact companion maps (faster, avoids long folder scans)",
+    )
+    allow_group_texture_convert: BoolProperty(
+        name="Allow group texture convert",
+        default=False,
+        description="Allow folder-wide TGV conversion for ambiguous cases (slower)",
+    )
+    texture_process_timeout_sec: IntProperty(
+        name="Converter timeout (sec)",
+        default=120,
+        min=10,
+        max=1800,
+        description="Timeout for each converter process",
+    )
+    texture_stage_timeout_sec: IntProperty(
+        name="Texture stage timeout (sec)",
+        default=240,
+        min=30,
+        max=3600,
+        description="Global timeout for full texture resolving stage",
+    )
     auto_install_tgv_deps: BoolProperty(
         name="Auto-install TGV deps",
         default=True,
@@ -1167,6 +1262,21 @@ class WARNOImporterSettings(PropertyGroup):
         default=True,
         description="If enabled, AO is multiplied into Base Color; otherwise AO texture stays unconnected",
     )
+    log_to_file: BoolProperty(
+        name="Log to file",
+        default=True,
+        description="Write import/texture stages into project log file",
+    )
+    log_file_name: StringProperty(
+        name="Log file",
+        default="warno_import.log",
+        description="Log file name in project root",
+    )
+    open_console_on_import: BoolProperty(
+        name="Open System Console on import",
+        default=False,
+        description="Open Blender system console before import to watch live logs",
+    )
 
     rotate_x: FloatProperty(name="Rotate X", default=0.0)
     rotate_y: FloatProperty(name="Rotate Y", default=0.0)
@@ -1230,6 +1340,16 @@ def _load_config_into_settings(settings: WARNOImporterSettings, path: Path) -> t
     settings.zz_runtime_dir = get_text("zz_runtime_dir", settings.zz_runtime_dir)
 
     settings.auto_textures = get_bool("auto_textures", settings.auto_textures)
+    settings.fast_exact_texture_resolve = get_bool("fast_exact_texture_resolve", settings.fast_exact_texture_resolve)
+    settings.allow_group_texture_convert = get_bool("allow_group_texture_convert", settings.allow_group_texture_convert)
+    try:
+        settings.texture_process_timeout_sec = int(raw.get("texture_process_timeout_sec", settings.texture_process_timeout_sec))
+    except Exception:
+        pass
+    try:
+        settings.texture_stage_timeout_sec = int(raw.get("texture_stage_timeout_sec", settings.texture_stage_timeout_sec))
+    except Exception:
+        pass
     settings.auto_install_tgv_deps = get_bool("auto_install_tgv_deps", settings.auto_install_tgv_deps)
     settings.tgv_deps_dir = get_text("tgv_deps_dir", settings.tgv_deps_dir) or ".warno_pydeps"
     settings.auto_split_main_parts = get_bool("auto_split_main_parts", get_bool("split_bone_parts", settings.auto_split_main_parts))
@@ -1263,6 +1383,9 @@ def _load_config_into_settings(settings: WARNOImporterSettings, path: Path) -> t
     settings.tgv_aggressive_split = get_bool("tgv_aggressive_split", settings.tgv_aggressive_split)
     settings.auto_rename_textures = get_bool("auto_rename_textures", settings.auto_rename_textures)
     settings.use_ao_multiply = get_bool("ao_multiply_diffuse", settings.use_ao_multiply)
+    settings.log_to_file = get_bool("log_to_file", settings.log_to_file)
+    settings.log_file_name = get_text("log_file_name", settings.log_file_name) or "warno_import.log"
+    settings.open_console_on_import = get_bool("open_console_on_import", settings.open_console_on_import)
 
     settings.rotate_x = get_float("rotate_x", settings.rotate_x)
     settings.rotate_y = get_float("rotate_y", settings.rotate_y)
@@ -1295,6 +1418,10 @@ def _save_settings_to_config(settings: WARNOImporterSettings, path: Path) -> tup
     raw["zz_runtime_dir"] = settings.zz_runtime_dir
 
     raw["auto_textures"] = bool(settings.auto_textures)
+    raw["fast_exact_texture_resolve"] = bool(settings.fast_exact_texture_resolve)
+    raw["allow_group_texture_convert"] = bool(settings.allow_group_texture_convert)
+    raw["texture_process_timeout_sec"] = int(settings.texture_process_timeout_sec)
+    raw["texture_stage_timeout_sec"] = int(settings.texture_stage_timeout_sec)
     raw["auto_install_tgv_deps"] = bool(settings.auto_install_tgv_deps)
     raw["tgv_deps_dir"] = str(settings.tgv_deps_dir or ".warno_pydeps")
     raw["auto_split_main_parts"] = bool(settings.auto_split_main_parts)
@@ -1317,6 +1444,9 @@ def _save_settings_to_config(settings: WARNOImporterSettings, path: Path) -> tup
     raw["tgv_aggressive_split"] = bool(settings.tgv_aggressive_split)
     raw["auto_rename_textures"] = bool(settings.auto_rename_textures)
     raw["ao_multiply_diffuse"] = bool(settings.use_ao_multiply)
+    raw["log_to_file"] = bool(settings.log_to_file)
+    raw["log_file_name"] = str(settings.log_file_name or "warno_import.log")
+    raw["open_console_on_import"] = bool(settings.open_console_on_import)
 
     raw["rotate_x"] = float(settings.rotate_x)
     raw["rotate_y"] = float(settings.rotate_y)
@@ -1748,6 +1878,8 @@ def _guess_texture_refs_for_asset(
     asset: str,
     atlas_assets_root: Path,
     runtime_info: Dict[str, Any] | None = None,
+    max_refs: int = 24,
+    include_zz_scan: bool = True,
 ) -> List[str]:
     runtime_info = runtime_info or {}
     out: List[str] = []
@@ -1756,7 +1888,8 @@ def _guess_texture_refs_for_asset(
         return out
 
     zz_resolver = runtime_info.get("zz_resolver")
-    if zz_resolver is not None:
+    limit = max(1, int(max_refs))
+    if include_zz_scan and zz_resolver is not None:
         try:
             keys = zz_resolver.all_asset_keys()
         except Exception:
@@ -1770,6 +1903,10 @@ def _guess_texture_refs_for_asset(
                 if low.endswith(".tgv"):
                     low = low[:-4] + ".png"
                 out.append(low)
+                if len(out) >= limit:
+                    break
+            if len(out) >= limit:
+                break
 
     for d in dirs:
         rel_under_assets = d
@@ -1788,12 +1925,16 @@ def _guess_texture_refs_for_asset(
             except Exception:
                 continue
             out.append(f"PC/Atlas/Assets/{rel}")
+            if len(out) >= limit:
+                break
+        if len(out) >= limit:
+            break
 
     if not out:
         return []
     uniq = list(dict.fromkeys(_norm_ref_like(v) for v in out if str(v).strip()))
     uniq.sort(key=lambda v: (-_score_guessed_ref(v), len(v), v))
-    return uniq
+    return uniq[:limit]
 
 
 def _augment_maps_from_existing_files(
@@ -1843,6 +1984,92 @@ def _augment_maps_from_existing_files(
         if channel not in out:
             out[channel] = pair[1]
     return out
+
+
+def _atlas_ref_exact_exists(
+    extractor_mod,
+    ref: str,
+    atlas_root: Path,
+    fallback_roots: Sequence[Path],
+    zz_resolver: Any | None,
+) -> bool:
+    try:
+        rel = extractor_mod.atlas_ref_to_rel_under_assets(ref)
+    except Exception:
+        return False
+    rel_png = rel.with_suffix(".png")
+    rel_tgv = rel.with_suffix(".tgv")
+
+    roots: List[Path] = [atlas_root]
+    for r in fallback_roots:
+        if r not in roots:
+            roots.append(r)
+    for root in roots:
+        try:
+            if (root / rel_png).exists() or (root / rel_tgv).exists():
+                return True
+        except Exception:
+            continue
+
+    if zz_resolver is None:
+        return False
+    candidates = [
+        f"PC/Atlas/Assets/{rel_png.as_posix()}",
+        f"PC/Atlas/Assets/{rel_tgv.as_posix()}",
+        f"Assets/{rel_png.as_posix()}",
+        f"Assets/{rel_tgv.as_posix()}",
+    ]
+    for cand in candidates:
+        try:
+            if zz_resolver.find_exact(cand) is not None:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _build_fast_companion_refs(extractor_mod, refs: Sequence[str], cap: int = 24) -> List[str]:
+    if not refs:
+        return []
+    tokens = [
+        "tsccolor_diffusetexturenoalpha",
+        "tscnm_normaltexture",
+        "tscorm_combinedormtexture",
+        "tscorm_combinedrmtexture",
+        "tsccoloralpha_combineddatexture",
+        "singlechannellinearmap_roughnesstexture",
+        "singlechannellinearmap_metallictexture",
+        "singlechannellinearmap_occlusiontexture",
+        "singlechannellinearmap_alphatexture",
+    ]
+    out: List[str] = []
+    max_refs = max(1, int(cap))
+    for ref in refs:
+        try:
+            rel = extractor_mod.atlas_ref_to_rel_under_assets(ref)
+        except Exception:
+            continue
+        stem = str(rel.stem or "")
+        stem_low = stem.lower()
+        source_token = ""
+        for tok in tokens:
+            if tok in stem_low:
+                source_token = tok
+                break
+        if not source_token:
+            continue
+        for target_token in tokens:
+            if target_token == source_token:
+                continue
+            cand_stem = re.sub(source_token, target_token, stem, flags=re.IGNORECASE)
+            cand_rel = rel.with_name(f"{cand_stem}.png")
+            out.append(f"PC/Atlas/Assets/{cand_rel.as_posix()}")
+            if len(out) >= max_refs * 3:
+                break
+        if len(out) >= max_refs * 3:
+            break
+    uniq = list(dict.fromkeys(out))
+    return uniq[: max_refs * 3]
 
 
 def _size_area(size: tuple[int, int] | None) -> float:
@@ -2128,6 +2355,7 @@ def _resolve_material_maps(
     runtime_info: Dict[str, Any] | None = None,
 ) -> tuple[Dict[str, Dict[str, Path]], dict[str, Any]]:
     maps_by_name: Dict[str, Dict[str, Path]] = {}
+    stage_t0 = time.monotonic()
     report: dict[str, Any] = {
         "refs": [],
         "refs_by_material": {},
@@ -2141,6 +2369,8 @@ def _resolve_material_maps(
     }
     if not settings.auto_textures:
         return maps_by_name, report
+
+    _warno_log(settings, f"texture resolve start asset={asset}", stage="texture")
 
     project_root = _project_root(settings)
     runtime_info = runtime_info or {}
@@ -2224,25 +2454,39 @@ def _resolve_material_maps(
     for mid in material_ids:
         refs.extend(refs_by_material.get(int(mid), []))
     refs = extractor_mod.unique_keep_order(refs) if hasattr(extractor_mod, "unique_keep_order") else list(dict.fromkeys(refs))
-    guessed_refs: List[str] = []
-    try:
-        guessed_refs = _guess_texture_refs_for_asset(
-            extractor_mod=extractor_mod,
-            asset=asset,
-            atlas_assets_root=atlas_root,
-            runtime_info=runtime_info,
-        )
-    except Exception:
-        guessed_refs = []
     if not refs:
         refs = spk.find_texture_refs_for_asset(asset, material_ids=material_ids)
-    # Some packs expose sparse material refs (often only diffuse). Merge conservative
-    # directory guesses to recover missing companion maps (normal/orm/single-channel).
-    if guessed_refs:
-        if bool(settings.use_zz_dat_source):
-            # ZZ mode: always merge all folder refs to convert full unit texture set from runtime.
-            refs = extractor_mod.unique_keep_order(list(refs) + list(guessed_refs)) if hasattr(extractor_mod, "unique_keep_order") else list(dict.fromkeys(list(refs) + list(guessed_refs)))
-        else:
+    refs = extractor_mod.unique_keep_order(refs) if hasattr(extractor_mod, "unique_keep_order") else list(dict.fromkeys(refs))
+
+    guessed_refs: List[str] = []
+    if refs and bool(settings.use_zz_dat_source) and bool(settings.fast_exact_texture_resolve):
+        companion = _build_fast_companion_refs(extractor_mod, refs, cap=24)
+        companion_exact = [
+            ref
+            for ref in companion
+            if _atlas_ref_exact_exists(
+                extractor_mod=extractor_mod,
+                ref=ref,
+                atlas_root=atlas_root,
+                fallback_roots=fallback_atlas_roots,
+                zz_resolver=zz_resolver,
+            )
+        ]
+        if companion_exact:
+            refs = extractor_mod.unique_keep_order(list(refs) + list(companion_exact)) if hasattr(extractor_mod, "unique_keep_order") else list(dict.fromkeys(list(refs) + list(companion_exact)))
+    elif refs:
+        try:
+            guessed_refs = _guess_texture_refs_for_asset(
+                extractor_mod=extractor_mod,
+                asset=asset,
+                atlas_assets_root=atlas_root,
+                runtime_info=runtime_info,
+                max_refs=48,
+                include_zz_scan=bool(settings.use_zz_dat_source),
+            )
+        except Exception:
+            guessed_refs = []
+        if guessed_refs:
             low_refs = [str(r).lower() for r in refs]
             has_nm = any(("normaltexture" in r) or ("_nm" in r) or ("/tscnm_" in r) for r in low_refs)
             has_orm = any(
@@ -2255,7 +2499,18 @@ def _resolve_material_maps(
             )
             if (not has_nm) or (not has_orm) or len(refs) <= 2:
                 refs = extractor_mod.unique_keep_order(list(refs) + list(guessed_refs)) if hasattr(extractor_mod, "unique_keep_order") else list(dict.fromkeys(list(refs) + list(guessed_refs)))
-    if not refs:
+    elif not refs:
+        try:
+            guessed_refs = _guess_texture_refs_for_asset(
+                extractor_mod=extractor_mod,
+                asset=asset,
+                atlas_assets_root=atlas_root,
+                runtime_info=runtime_info,
+                max_refs=24,
+                include_zz_scan=bool(settings.use_zz_dat_source),
+            )
+        except Exception:
+            guessed_refs = []
         refs = guessed_refs
 
     report["refs"] = list(refs)
@@ -2275,7 +2530,33 @@ def _resolve_material_maps(
         and bundled_converter.is_file()
     )
     deps_dir = _resolve_path(project_root, str(settings.tgv_deps_dir or "").strip() or ".warno_pydeps")
-    for ref in refs:
+    stage_start = time.monotonic()
+    stage_timeout_sec = max(30, int(settings.texture_stage_timeout_sec))
+    process_timeout_sec = max(10, int(settings.texture_process_timeout_sec))
+    total_refs = len(refs)
+    for idx, ref in enumerate(refs, start=1):
+        if (time.monotonic() - stage_start) > float(stage_timeout_sec):
+            errors.append(
+                {
+                    "atlas_ref": str(ref),
+                    "error": f"texture_stage_timeout: exceeded {stage_timeout_sec}s while resolving refs",
+                }
+            )
+            _set_status(
+                settings,
+                f"stage: resolving textures ({idx}/{total_refs}) timeout>{stage_timeout_sec}s",
+                log_level="WARNING",
+                stage="texture",
+            )
+            break
+        if idx == 1 or idx % 4 == 0 or idx == total_refs:
+            _set_status(
+                settings,
+                f"stage: resolving textures ({idx}/{total_refs})",
+                log_level="INFO",
+                stage="texture",
+            )
+
         def _resolve_with_converter(conv_path: Path):
             return extractor_mod.resolve_texture_from_atlas_ref(
                 ref=ref,
@@ -2291,6 +2572,9 @@ def _resolve_material_maps(
                 fallback_atlas_roots=fallback_atlas_roots,
                 auto_install_deps=bool(settings.auto_install_tgv_deps),
                 deps_dir=deps_dir,
+                allow_group_convert=bool(settings.allow_group_texture_convert),
+                allow_inprocess=False,
+                subprocess_timeout_sec=process_timeout_sec,
             )
 
         try:
@@ -2410,6 +2694,16 @@ def _resolve_material_maps(
         report["atlas_source"] = "fallback"
     report["deps_auto_installed"] = any(bool(item.get("deps_auto_installed", False)) for item in resolved)
     report["named"] = list(named_files)
+    _warno_log(
+        settings,
+        (
+            f"texture resolve done refs={len(report.get('refs', []))} "
+            f"resolved={len(report.get('resolved', []))} errors={len(report.get('errors', []))} "
+            f"channels={','.join(report.get('channels', [])) if report.get('channels') else '-'} "
+            f"elapsed={time.monotonic()-stage_t0:.1f}s"
+        ),
+        stage="texture",
+    )
     return maps_by_name, report
 
 
@@ -3037,6 +3331,8 @@ class WARNO_OT_LoadTrackPreset(Operator):
 def _scan_assets_impl(self, context, scan_all: bool):
     settings = context.scene.warno_import
     project_root = _project_root(settings)
+    t0 = time.monotonic()
+    _warno_log(settings, f"scan start mode={'ALL' if scan_all else 'query'} query='{settings.query}'", stage="scan")
 
     try:
         extractor_mod = _extractor_module(settings)
@@ -3094,7 +3390,9 @@ def _scan_assets_impl(self, context, scan_all: bool):
         f"Matches: {len(matches)} "
         f"(cached: {len(assets)} | groups:{len(groups)} | folders:{len(folders)} | mode:{mode_txt} | spk:{len(spk_paths)})"
     )
+    msg += f" | elapsed:{time.monotonic()-t0:.1f}s"
     settings.status = msg
+    _warno_log(settings, msg, stage="scan")
     self.report({"INFO"}, msg)
     return {"FINISHED"}
 
@@ -3234,9 +3532,11 @@ class WARNO_OT_PrepareZZRuntime(Operator):
 
     def execute(self, context):
         settings = context.scene.warno_import
+        t0 = time.monotonic()
         try:
+            _set_status(settings, "stage: preparing runtime", stage="runtime")
             extractor_mod = _extractor_module(settings)
-            info = _prepare_zz_runtime_sources(extractor_mod, settings)
+            info = _prepare_zz_runtime_sources(extractor_mod, settings, force_rebuild=True)
             if not info:
                 msg = "ZZ runtime source is disabled."
                 settings.status = msg
@@ -3272,12 +3572,15 @@ class WARNO_OT_PrepareZZRuntime(Operator):
                 f"mesh_spk={len(mesh_spk_files) if mesh_spk_files else (1 if mesh_spk else 0)}, "
                 f"skeleton_spk={len(skeleton_spk_files) if skeleton_spk_files else (1 if skeleton_spk else 0)}"
             )
+            msg += f" | elapsed:{time.monotonic()-t0:.1f}s"
             settings.status = msg
+            _warno_log(settings, msg, stage="runtime")
             self.report({"INFO"}, msg)
             return {"FINISHED"}
         except Exception as exc:
             msg = f"ZZ runtime prepare failed: {exc}"
             settings.status = msg
+            _warno_log(settings, msg, level="ERROR", stage="runtime")
             self.report({"ERROR"}, msg)
             return {"CANCELLED"}
 
@@ -3395,6 +3698,51 @@ class WARNO_OT_InstallTGVDeps(Operator):
             status = f"TGV deps check failed: {exc}"
             settings.status = status
             self.report({"ERROR"}, status)
+            return {"CANCELLED"}
+
+
+class WARNO_OT_OpenSystemConsole(Operator):
+    bl_idname = "warno.open_system_console"
+    bl_label = "Open System Console"
+    bl_description = "Open Blender system console window for live logs"
+
+    def execute(self, context):
+        settings = context.scene.warno_import
+        try:
+            if hasattr(bpy.ops.wm, "console_toggle"):
+                bpy.ops.wm.console_toggle()
+                _warno_log(settings, "System console toggled.", stage="ui")
+                return {"FINISHED"}
+            msg = "System console is not available on this platform/build."
+            self.report({"WARNING"}, msg)
+            _warno_log(settings, msg, level="WARNING", stage="ui")
+            return {"CANCELLED"}
+        except Exception as exc:
+            msg = f"Failed to open system console: {exc}"
+            self.report({"ERROR"}, msg)
+            _warno_log(settings, msg, level="ERROR", stage="ui")
+            return {"CANCELLED"}
+
+
+class WARNO_OT_OpenLogFile(Operator):
+    bl_idname = "warno.open_log_file"
+    bl_label = "Open Log File"
+    bl_description = "Open warno import log file from project root"
+
+    def execute(self, context):
+        settings = context.scene.warno_import
+        path = _log_file_path(settings)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.exists():
+                path.write_text("", encoding="utf-8")
+            bpy.ops.wm.path_open(filepath=str(path))
+            _warno_log(settings, f"Opened log file: {path}", stage="ui")
+            return {"FINISHED"}
+        except Exception as exc:
+            msg = f"Cannot open log file: {exc}"
+            self.report({"ERROR"}, msg)
+            _warno_log(settings, msg, level="ERROR", stage="ui")
             return {"CANCELLED"}
 
 
@@ -3946,6 +4294,8 @@ class WARNO_OT_ApplyTextures(Operator):
 
     def execute(self, context):
         settings = context.scene.warno_import
+        t0 = time.monotonic()
+        _warno_log(settings, "Apply/Reapply textures started.", stage="apply_textures")
         col_name = str(settings.last_import_collection or "").strip()
         asset = _collection_asset_from_name(col_name) if col_name else ""
         if not asset:
@@ -3959,6 +4309,7 @@ class WARNO_OT_ApplyTextures(Operator):
             project_root = _project_root(settings)
             runtime_info: Dict[str, Any] = {}
             if settings.use_zz_dat_source:
+                _set_status(settings, "stage: preparing runtime", stage="apply_textures")
                 runtime_info = _prepare_zz_runtime_sources(extractor_mod, settings)
             mesh_spk_paths = _resolve_mesh_spk_paths(project_root, settings, runtime_info)
             if not mesh_spk_paths:
@@ -3986,6 +4337,7 @@ class WARNO_OT_ApplyTextures(Operator):
 
                 model_dir = _cache_asset_dir(extractor_mod, settings, asset_real)
                 model_dir.mkdir(parents=True, exist_ok=True)
+                _set_status(settings, "stage: resolving textures", stage="apply_textures")
                 material_maps_by_name, texture_report = _resolve_material_maps(
                     extractor_mod=extractor_mod,
                     spk=spk,
@@ -4000,6 +4352,7 @@ class WARNO_OT_ApplyTextures(Operator):
         except Exception as exc:
             msg = f"Texture apply failed: {exc}"
             settings.status = msg
+            _warno_log(settings, msg, level="ERROR", stage="apply_textures")
             self.report({"ERROR"}, msg)
             return {"CANCELLED"}
 
@@ -4014,6 +4367,7 @@ class WARNO_OT_ApplyTextures(Operator):
             self.report({"WARNING"}, "No target mesh objects found for texture apply.")
             return {"CANCELLED"}
 
+        _set_status(settings, "stage: applying materials", stage="apply_textures")
         role_by_mat_key: Dict[str, str] = {}
         for mid, mname in material_name_by_id.items():
             role_by_mat_key[_material_key(mname)] = str(material_role_by_id.get(int(mid), "other"))
@@ -4057,7 +4411,9 @@ class WARNO_OT_ApplyTextures(Operator):
             msg += f" | converter:{converter_source}"
         if deps_auto_installed:
             msg += " | deps:auto-installed"
+        msg += f" | elapsed:{time.monotonic()-t0:.1f}s"
         settings.status = msg
+        _warno_log(settings, msg, stage="apply_textures")
         self.report({"INFO"}, msg)
         return {"FINISHED"}
 
@@ -4069,10 +4425,19 @@ class WARNO_OT_ImportAsset(Operator):
 
     def execute(self, context):
         settings = context.scene.warno_import
+        t0 = time.monotonic()
+        if bool(settings.open_console_on_import):
+            try:
+                if hasattr(bpy.ops.wm, "console_toggle"):
+                    bpy.ops.wm.console_toggle()
+            except Exception:
+                pass
+        _warno_log(settings, "Import started.", stage="import")
         asset = str(settings.selected_asset or "").strip()
         if not asset or asset == "__none__":
             msg = "Pick asset first (Scan Assets)."
             settings.status = msg
+            _warno_log(settings, msg, level="WARNING", stage="import")
             self.report({"WARNING"}, msg)
             return {"CANCELLED"}
 
@@ -4088,22 +4453,26 @@ class WARNO_OT_ImportAsset(Operator):
         runtime_info: Dict[str, Any] = {}
         if settings.use_zz_dat_source:
             try:
+                _set_status(settings, "stage: preparing runtime", stage="import")
                 runtime_info = _prepare_zz_runtime_sources(extractor_mod, settings)
             except Exception as exc:
                 msg = f"ZZ runtime prepare failed: {exc}"
                 settings.status = msg
+                _warno_log(settings, msg, level="ERROR", stage="import")
                 self.report({"ERROR"}, msg)
                 return {"CANCELLED"}
         mesh_spk_paths = _resolve_mesh_spk_paths(project_root, settings, runtime_info)
         if not mesh_spk_paths:
             msg = "No mesh SPK files found. Set Mesh SPK/Folder or prepare ZZ runtime."
             settings.status = msg
+            _warno_log(settings, msg, level="ERROR", stage="import")
             self.report({"ERROR"}, msg)
             return {"CANCELLED"}
         pick = _pick_best_asset_spk_path(extractor_mod, mesh_spk_paths, asset)
         if pick is None:
             msg = f"Asset not found in selected SPK sources: {asset}"
             settings.status = msg
+            _warno_log(settings, msg, level="ERROR", stage="import")
             self.report({"ERROR"}, msg)
             return {"CANCELLED"}
         mesh_spk_path, asset_hint = pick
@@ -4129,6 +4498,7 @@ class WARNO_OT_ImportAsset(Operator):
 
         try:
             with ExitStack() as stack:
+                _set_status(settings, "stage: reading SPK/model", stage="import")
                 spk = stack.enter_context(extractor_mod.SpkMeshExtractor(mesh_spk_path))
                 hit = spk.find_best_fat_entry_for_asset(asset)
                 if hit is None and asset_hint and asset_hint != asset:
@@ -4186,6 +4556,7 @@ class WARNO_OT_ImportAsset(Operator):
                 model_dir = _cache_asset_dir(extractor_mod, settings, asset_real)
                 model_dir.mkdir(parents=True, exist_ok=True)
                 texture_dir_to_open = str(model_dir.resolve())
+                _set_status(settings, "stage: resolving textures", stage="import")
                 material_maps_by_name, texture_report = _resolve_material_maps(
                     extractor_mod=extractor_mod,
                     spk=spk,
@@ -4212,12 +4583,14 @@ class WARNO_OT_ImportAsset(Operator):
         except Exception as exc:
             msg = f"Import prep failed: {exc}"
             settings.status = msg
+            _warno_log(settings, msg, level="ERROR", stage="import")
             self.report({"ERROR"}, msg)
             return {"CANCELLED"}
 
         if not buckets:
             msg = "No mesh geometry to import."
             settings.status = msg
+            _warno_log(settings, msg, level="WARNING", stage="import")
             self.report({"WARNING"}, msg)
             return {"CANCELLED"}
 
@@ -4296,6 +4669,7 @@ class WARNO_OT_ImportAsset(Operator):
             mesh_count += 1
 
         # Geometry cleanup on import: merge by distance first.
+        _set_status(settings, "stage: building scene objects", stage="import")
         if settings.use_merge_by_distance:
             _merge_by_distance(imported_objects, float(settings.merge_distance))
 
@@ -4361,9 +4735,11 @@ class WARNO_OT_ImportAsset(Operator):
                 msg += f" | converter:{converter_source}"
             if deps_auto_installed:
                 msg += " | deps:auto-installed"
+        msg += f" | elapsed:{time.monotonic()-t0:.1f}s"
         if texture_dir_to_open:
             settings.last_texture_dir = texture_dir_to_open
         settings.status = msg
+        _warno_log(settings, msg, stage="import")
         self.report({"INFO"}, msg)
         return {"FINISHED"}
 
@@ -4411,9 +4787,19 @@ class WARNO_PT_ImporterPanel(Panel):
         tex.prop(s, "texture_subdir")
         tex.prop(s, "tgv_split_mode")
         tex.prop(s, "tgv_aggressive_split")
+        tex.prop(s, "fast_exact_texture_resolve")
+        tex.prop(s, "allow_group_texture_convert")
+        tex.prop(s, "texture_process_timeout_sec")
+        tex.prop(s, "texture_stage_timeout_sec")
         tex.prop(s, "auto_rename_textures")
         tex.prop(s, "use_ao_multiply")
+        tex.prop(s, "log_to_file")
+        tex.prop(s, "log_file_name")
+        tex.prop(s, "open_console_on_import")
         tex.operator("warno.install_tgv_deps", text="Install/Check TGV deps", icon="CONSOLE")
+        row = tex.row(align=True)
+        row.operator("warno.open_system_console", text="Open System Console", icon="CONSOLE")
+        row.operator("warno.open_log_file", text="Open Log File", icon="TEXT")
         tex.operator("warno.open_texture_folder", text="Open Texture Folder", icon="FILE_FOLDER")
         tex.operator("warno.clear_texture_folder", text="Clear texture folder from old files", icon="TRASH")
         tex.operator("warno.manual_texture_correcting", text="Manual texture correcting", icon="PREFERENCES")
@@ -4491,6 +4877,8 @@ CLASSES = [
     WARNO_OT_PickAssetPopup,
     WARNO_OT_PrepareZZRuntime,
     WARNO_OT_InstallTGVDeps,
+    WARNO_OT_OpenSystemConsole,
+    WARNO_OT_OpenLogFile,
     WARNO_OT_OpenTextureFolder,
     WARNO_OT_ClearTextureFolder,
     WARNO_OT_ManualTextureCorrecting,

@@ -28,6 +28,8 @@ Author: Kilivanchik
 - First import on a clean machine may auto-install converter deps (`Pillow`, `zstandard`).
 - Texture pipeline uses ZZ runtime / Atlas paths and does not require legacy `output/`.
 - Resolver policy is strict: if exact texture ref is not found, addon keeps it unresolved (no unsafe "wrong texture" substitution).
+- Default performance profile is `Fast exact texture resolve` with hard timeouts (prevents long UI freezes on large shared folders).
+- Live diagnostics: use `Open System Console` and `Open Log File` (`warno_import.log` in project root).
 
 ## Notes
 - Tool is focused on WARNO extraction/import workflows; behavior can vary by model type.

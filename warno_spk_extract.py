@@ -5147,6 +5147,8 @@ def run_tgv_converter_for_folder_once(
     auto_naming: bool = False,
     auto_install_deps: bool = True,
     deps_dir: Path | None = None,
+    allow_inprocess: bool = True,
+    subprocess_timeout_sec: int = 120,
 ) -> None:
     key = _folder_convert_cache_key(
         converter=converter,
@@ -5169,6 +5171,8 @@ def run_tgv_converter_for_folder_once(
         auto_naming=auto_naming,
         auto_install_deps=auto_install_deps,
         deps_dir=deps_dir,
+        allow_inprocess=allow_inprocess,
+        subprocess_timeout_sec=subprocess_timeout_sec,
     )
     _TGV_FOLDER_CONVERT_CACHE.add(key)
 
@@ -5241,11 +5245,21 @@ def run_tgv_converter(
     auto_naming: bool = True,
     auto_install_deps: bool = True,
     deps_dir: Path | None = None,
+    allow_inprocess: bool = True,
+    subprocess_timeout_sec: int = 120,
 ) -> None:
     split = str(split_mode or "auto").strip().lower()
     if split not in {"auto", "all", "none"}:
         split = "auto"
-    if run_tgv_converter_inprocess(
+    timeout_value: int | None
+    try:
+        timeout_value = int(subprocess_timeout_sec)
+    except Exception:
+        timeout_value = 120
+    if timeout_value is not None and timeout_value <= 0:
+        timeout_value = None
+
+    if allow_inprocess and run_tgv_converter_inprocess(
         converter=converter,
         src_tgv=src_tgv,
         dst_png=dst_png,
@@ -5274,7 +5288,19 @@ def run_tgv_converter(
                     cmd.append("--aggressive-split")
                 if not auto_naming:
                     cmd.append("--no-auto-naming")
-                proc = subprocess.run(cmd, capture_output=True, text=True, env=runtime_env)
+                try:
+                    proc = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        env=runtime_env,
+                        timeout=timeout_value,
+                    )
+                except subprocess.TimeoutExpired:
+                    raise RuntimeError(
+                        f"converter_timeout: TGV converter timed out after {timeout_value}s "
+                        f"for {src_tgv.name}"
+                    )
                 if proc.returncode == 0:
                     return
 
@@ -5282,7 +5308,19 @@ def run_tgv_converter(
                 fallback_cmd = [*py_cmd, str(converter), str(src_tgv), str(dst_png)]
                 if mirror:
                     fallback_cmd.append("--mirror")
-                proc2 = subprocess.run(fallback_cmd, capture_output=True, text=True, env=runtime_env)
+                try:
+                    proc2 = subprocess.run(
+                        fallback_cmd,
+                        capture_output=True,
+                        text=True,
+                        env=runtime_env,
+                        timeout=timeout_value,
+                    )
+                except subprocess.TimeoutExpired:
+                    raise RuntimeError(
+                        f"converter_timeout: TGV converter fallback timed out after {timeout_value}s "
+                        f"for {src_tgv.name}"
+                    )
                 if proc2.returncode == 0:
                     return
 
@@ -5309,13 +5347,25 @@ def run_tgv_converter(
             cmd.append("--aggressive-split")
         if not auto_naming:
             cmd.append("--no-auto-naming")
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_value)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f"converter_timeout: TGV converter timed out after {timeout_value}s "
+                f"for {src_tgv.name}"
+            )
         if proc.returncode == 0:
             return
         fallback_cmd = [str(converter), str(src_tgv), str(dst_png)]
         if mirror:
             fallback_cmd.append("--mirror")
-        proc2 = subprocess.run(fallback_cmd, capture_output=True, text=True)
+        try:
+            proc2 = subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=timeout_value)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f"converter_timeout: TGV converter fallback timed out after {timeout_value}s "
+                f"for {src_tgv.name}"
+            )
         if proc2.returncode == 0:
             return
         msg = (proc2.stderr or proc2.stdout or proc.stderr or proc.stdout or "").strip()
@@ -5349,6 +5399,9 @@ def resolve_texture_from_atlas_ref(
     fallback_atlas_roots: Sequence[Path] | None = None,
     auto_install_deps: bool = True,
     deps_dir: Path | None = None,
+    allow_group_convert: bool = False,
+    allow_inprocess: bool = True,
+    subprocess_timeout_sec: int = 120,
 ) -> Dict[str, Any]:
     rel = atlas_ref_to_rel_under_assets(ref)
     role_hint = classify_texture_role(ref)
@@ -5427,7 +5480,7 @@ def resolve_texture_from_atlas_ref(
         force_auto_for_orm = role_hint == "orm" and str(tgv_split_mode or "auto").strip().lower() == "none"
         # Do not run folder-wide conversion when ORM is force-switched from none->auto:
         # we only need single-file ORM channel outputs and must avoid touching unrelated textures.
-        run_group_auto = split_mode_norm == "auto" and not force_auto_for_orm
+        run_group_auto = bool(allow_group_convert) and split_mode_norm == "auto" and not force_auto_for_orm
         if run_group_auto:
             try:
                 run_tgv_converter_for_folder_once(
@@ -5440,6 +5493,8 @@ def resolve_texture_from_atlas_ref(
                     auto_naming=False,
                     auto_install_deps=auto_install_deps,
                     deps_dir=deps_dir,
+                    allow_inprocess=allow_inprocess,
+                    subprocess_timeout_sec=subprocess_timeout_sec,
                 )
                 if out_png.exists():
                     source_type = "tgv_group"
@@ -5458,6 +5513,8 @@ def resolve_texture_from_atlas_ref(
                     auto_naming=True,
                     auto_install_deps=auto_install_deps,
                     deps_dir=deps_dir,
+                    allow_inprocess=allow_inprocess,
+                    subprocess_timeout_sec=subprocess_timeout_sec,
                 )
                 source_type = "tgv"
         except Exception:
