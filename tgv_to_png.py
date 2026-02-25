@@ -16,6 +16,7 @@ except ImportError:  # optional, used only for BC5 normal-Z reconstruction
 
 
 TABLE_CANDIDATES = (0x30, 0x34, 0x38, 0x3C)
+MANUAL_GRID_CHOICES = ("none", "1x2", "1x3", "1x4", "2x1", "2x2", "3x1", "4x1")
 
 
 @dataclass(frozen=True)
@@ -277,7 +278,7 @@ def detect_texture_role(path: Path, fmt: str) -> str:
         return "combined_da"
     if "normal" in name or "tscnm" in name or "BC5" in fmt_up:
         return "normal"
-    if "combinedorm" in name or "_orm" in name or "ormtexture" in name:
+    if "combinedorm" in name or "combinedrm" in name or "_orm" in name or "ormtexture" in name or "rmtexture" in name:
         return "orm"
     if "splat" in name:
         return "splat"
@@ -307,6 +308,15 @@ def atlas_category_from_text(text: str) -> str | None:
     return None
 
 
+def infer_atlas_category_from_path(path: Path) -> str | None:
+    low = str(path).replace("\\", "/").lower()
+    if "/units/" in low:
+        return "unit"
+    if "/decors/" in low or "/decor/" in low:
+        return "decor"
+    return None
+
+
 def detect_atlas_category_in_folder(folder: Path) -> str | None:
     for atlas_path in sorted(folder.glob("*.atlas")):
         try:
@@ -316,7 +326,7 @@ def detect_atlas_category_in_folder(folder: Path) -> str | None:
         category = atlas_category_from_text(text)
         if category:
             return category
-    return None
+    return infer_atlas_category_from_path(folder)
 
 
 def find_unit_name_in_folder(folder: Path) -> str | None:
@@ -894,6 +904,57 @@ def tighten_box_to_mask(
     return align_bbox_to_grid((tx0, ty0, tx1, ty1), image_size[0], image_size[1], grid=grid)
 
 
+def parse_manual_grid(manual_grid: str) -> tuple[int, int]:
+    raw = str(manual_grid or "none").strip().lower().replace(" ", "")
+    if raw in {"", "none", "off", "0"}:
+        return (0, 0)
+    if "x" not in raw:
+        return (0, 0)
+    left, right = raw.split("x", 1)
+    try:
+        cols = int(left)
+        rows = int(right)
+    except Exception:
+        return (0, 0)
+    if cols <= 0 or rows <= 0:
+        return (0, 0)
+    return (cols, rows)
+
+
+def expand_box(box: tuple[int, int, int, int], width: int, height: int, pad: int = 0) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = box
+    p = max(0, int(pad))
+    return (
+        max(0, x0 - p),
+        max(0, y0 - p),
+        min(width, x1 + p),
+        min(height, y1 + p),
+    )
+
+
+def build_manual_grid_boxes(
+    image_size: tuple[int, int],
+    manual_grid: str,
+    expand_px: int = 0,
+) -> list[tuple[int, int, int, int]]:
+    width, height = image_size
+    cols, rows = parse_manual_grid(manual_grid)
+    if cols <= 0 or rows <= 0 or width <= 1 or height <= 1:
+        return []
+
+    boxes: list[tuple[int, int, int, int]] = []
+    for ry in range(rows):
+        y0 = int(round((ry * height) / float(rows)))
+        y1 = int(round(((ry + 1) * height) / float(rows)))
+        for cx in range(cols):
+            x0 = int(round((cx * width) / float(cols)))
+            x1 = int(round(((cx + 1) * width) / float(cols)))
+            if x1 <= x0 or y1 <= y0:
+                continue
+            boxes.append(expand_box((x0, y0, x1, y1), width, height, pad=expand_px))
+    return boxes
+
+
 def refine_layout_to_content(
     image: Image.Image,
     main_box: tuple[int, int, int, int] | None,
@@ -1179,6 +1240,9 @@ def convert_one(
     aggressive_split: bool = False,
     shared_layout: LayoutInfo | None = None,
     atlas_category: str | None = None,
+    manual_grid: str = "none",
+    manual_pick: str = "all",
+    manual_expand: int = 0,
 ) -> None:
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1259,6 +1323,22 @@ def convert_one(
             part_out = part_output_path(out_file, role, kind)
             part_images.append((source_for_split.crop(box), part_out))
 
+    # Manual fixed-grid split: export all tiles as candidate textures.
+    manual_boxes = build_manual_grid_boxes(source_for_split.size, manual_grid, expand_px=manual_expand)
+    for idx, box in enumerate(manual_boxes, start=1):
+        part_out = part_output_path(out_file, role, f"MAN{idx}")
+        part_images.append((source_for_split.crop(box), part_out))
+
+    # Optional: use selected manual tile as main texture.
+    pick_raw = str(manual_pick or "all").strip().lower()
+    if manual_boxes and pick_raw not in {"all", ""}:
+        try:
+            pick_idx = int(pick_raw) - 1
+        except Exception:
+            pick_idx = -1
+        if 0 <= pick_idx < len(manual_boxes):
+            image_to_save = source_for_split.crop(manual_boxes[pick_idx])
+
     cleanup_stale_outputs(out_file)
 
     image_to_save = maybe_mirror(image_to_save, mirror)
@@ -1295,6 +1375,9 @@ def convert_path(
     mirror: bool,
     auto_naming: bool,
     aggressive_split: bool = False,
+    manual_grid: str = "none",
+    manual_pick: str = "all",
+    manual_expand: int = 0,
 ) -> None:
     if input_path.is_file():
         parent = input_path.parent
@@ -1318,6 +1401,9 @@ def convert_path(
             aggressive_split=aggressive_split,
             shared_layout=shared_layout,
             atlas_category=atlas_category,
+            manual_grid=manual_grid,
+            manual_pick=manual_pick,
+            manual_expand=manual_expand,
         )
         return
 
@@ -1367,6 +1453,9 @@ def convert_path(
             aggressive_split=aggressive_split,
             shared_layout=layout_cache.get(parent),
             atlas_category=atlas_category_cache.get(parent),
+            manual_grid=manual_grid,
+            manual_pick=manual_pick,
+            manual_expand=manual_expand,
         )
 
 
@@ -1410,6 +1499,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use more aggressive auto split heuristics",
     )
+    parser.add_argument(
+        "--manual-grid",
+        choices=MANUAL_GRID_CHOICES,
+        default="none",
+        help="Manual fixed-grid split mode (exports candidate tiles, default: none)",
+    )
+    parser.add_argument(
+        "--manual-pick",
+        choices=("all", "1", "2", "3", "4", "5", "6", "7", "8"),
+        default="all",
+        help="Which manual tile should become the main output (default: all/original)",
+    )
+    parser.add_argument(
+        "--manual-expand",
+        type=int,
+        default=0,
+        help="Expand each manual tile crop by N pixels (default: 0)",
+    )
     return parser
 
 
@@ -1426,6 +1533,9 @@ def main() -> int:
             args.mirror,
             args.auto_naming,
             args.aggressive_split,
+            args.manual_grid,
+            args.manual_pick,
+            int(args.manual_expand),
         )
     except Exception as exc:  # keep CLI output user-friendly
         print(f"[ERROR] {exc}")

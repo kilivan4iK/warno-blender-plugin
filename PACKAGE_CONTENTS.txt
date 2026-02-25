@@ -1,0 +1,16 @@
+﻿WARNO Blender Importer - GitHub upload package
+Author: Kilivanchik
+
+Included:
+- warno_blender_addon.py
+- warno_spk_extract.py
+- tgv_to_png.py
+- manual_texture_corrector_cpp (source + Release exe)
+- config.example.json
+- track_wheel_presets.example.json
+- spk/.gitkeep, skeletonsspk/.gitkeep
+
+Excluded:
+- moddingSuite/
+- moddingSuite-master/
+- output*/ tmp/debug folders

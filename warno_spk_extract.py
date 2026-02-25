@@ -284,7 +284,7 @@ def split_concatenated_node_names(blob: str) -> List[str]:
         out.append(token)
     if not out and len(raw) >= 2:
         out = [raw]
-    return unique_keep_order(out)
+    return out
 
 
 def normalize_gamedata_asset_path(path: str) -> str:
@@ -710,6 +710,8 @@ def classify_texture_role(ref: str) -> str:
         return "normal"
     if "combinedorm" in n or "combinedrm" in n or "_orm" in n:
         return "orm"
+    if "singlechannellinearmap" in n and ("roughness" in n or "metallic" in n or "occlusion" in n or "_ao" in n):
+        return "orm"
     if "diffuse" in n or "albedo" in n or "color" in n:
         return "diffuse"
     return "generic"
@@ -797,8 +799,13 @@ def sanitize_material_name(name: str) -> str:
 
 def channel_from_token(token: str) -> str | None:
     t = token.lower()
+    if "combinedorm" in t or "combinedrm" in t or t.endswith("_orm"):
+        return "orm"
     if "normal_x" in t or "normal_y" in t or "normal_z" in t:
         return None
+    # "NoAlpha" diffuse maps must never be treated as alpha.
+    if "diffusetexturenoalpha" in t or ("noalpha" in t and ("diffuse" in t or "color" in t)):
+        return "diffuse"
     if "normal_reconstructed" in t:
         return "normal"
     if "occlusion" in t or "_ao" in t:
@@ -824,6 +831,11 @@ def part_label_from_token(token: str) -> str:
         return "TRK_DROITE"
     if is_track_token(t):
         return "TRK"
+    if re.search(r"(?:^|[\\/_-])mg(?:$|[\\/_-])", t):
+        return "MG"
+    m_part = re.search(r"(?:^|[\\/_-])part[_-]?([0-9]+)(?:$|[\\/_-])", t)
+    if m_part:
+        return f"PART{m_part.group(1)}"
     return ""
 
 
@@ -2411,6 +2423,7 @@ def build_named_texture_aliases(
         "metallic": "M",
         "occlusion": "AO",
         "alpha": "A",
+        "orm": "ORM",
     }
 
     # Flatten all available channel sources.
@@ -2434,12 +2447,32 @@ def build_named_texture_aliases(
         elif role == "diffuse":
             if out_path:
                 channel_items.append(("diffuse", out_path, part))
+            # Explicit packed track block (e.g. *_trk.png) is still diffuse channel.
+            trk = extras.get("trk")
+            if trk is not None:
+                channel_items.append(("diffuse", Path(trk), "TRK"))
+            # Other packed diffuse parts (MG/PARTn/...) should remain diffuse channel too.
+            for extra_key, extra_value in extras.items():
+                if extra_key == "trk":
+                    continue
+                try:
+                    extra_path = Path(extra_value)
+                except Exception:
+                    continue
+                token = f"{extra_key} {extra_path.stem}"
+                ch_guess = channel_from_token(token)
+                if ch_guess not in {None, "diffuse"}:
+                    continue
+                part_label = part_label_from_token(token) or part
+                channel_items.append(("diffuse", extra_path, part_label))
         elif role == "normal":
             if "normal_reconstructed" in extras:
                 channel_items.append(("normal", Path(extras["normal_reconstructed"]), part))
             elif out_path:
                 channel_items.append(("normal", out_path, part))
         elif role == "orm":
+            if out_path:
+                channel_items.append(("orm", out_path, part))
             if "roughness" in extras:
                 channel_items.append(("roughness", Path(extras["roughness"]), part))
             if "metallic" in extras:
@@ -2560,6 +2593,9 @@ def build_named_texture_aliases(
             _add_named("diffuse", src, part_label)
             continue
         trk_candidates.append((src, part_label))
+    primary_diffuse_src = primary.get("diffuse")
+    if primary_diffuse_src is not None:
+        trk_candidates.append((primary_diffuse_src, "__PRIMARY__"))
 
     trk_has_non_diffuse = any(
         item.get("channel") in {"normal", "roughness", "metallic", "occlusion"}
@@ -2568,34 +2604,89 @@ def build_named_texture_aliases(
     )
 
     if trk_candidates and trk_has_non_diffuse:
+        size_cache: Dict[Path, Tuple[int, int] | None] = {}
+
+        def _sz(path: Path) -> Tuple[int, int] | None:
+            if path not in size_cache:
+                size_cache[path] = read_png_size(path)
+            return size_cache[path]
+
+        def _area(size: Tuple[int, int] | None) -> float:
+            if size is None:
+                return 0.0
+            return float(size[0] * size[1])
+
+        def _mismatch(size: Tuple[int, int] | None, target: Tuple[int, int] | None) -> float | None:
+            if size is None or target is None:
+                return None
+            tw, th = target
+            dw = abs(float(size[0] - tw)) / max(1.0, float(tw))
+            dh = abs(float(size[1] - th)) / max(1.0, float(th))
+            return max(dw, dh)
+
+        combined_candidates: List[Path] = []
+        for src, _part_label in trk_candidates:
+            low = src.stem.lower()
+            if "combinedda" in low or "coloralpha" in low:
+                combined_candidates.append(src)
+        combined_ref: Path | None = None
+        if combined_candidates:
+            combined_ref = max(combined_candidates, key=lambda p: _area(_sz(p)))
+
         def trk_diff_score(src: Path, part_label: str) -> float:
             low = src.stem.lower()
             score = 0.0
+            if part_label == "__PRIMARY__":
+                score += 14.0
             if part_label and is_track_token(part_label):
-                score += 50.0
-            if is_track_token(low):
-                score += 20.0
-            if "combinedda" in low or "coloralpha" in low:
                 score += 35.0
+            if is_track_token(low):
+                score += 18.0
+            if "combinedda" in low or "coloralpha" in low:
+                score += 26.0
+                if src == combined_ref:
+                    score += 10.0
+            if "diffusetexturenoalpha" in low:
+                score += 12.0
             if low.endswith("_diffuse") or "diffuse" in low:
                 score += 8.0
             if "noalpha" in low and is_track_token(low):
-                score -= 35.0
-            if target_size is not None:
-                s = read_png_size(src)
-                if s is not None:
-                    tw, th = target_size
+                score += 6.0
+            s = _sz(src)
+            mismatch = _mismatch(s, target_size)
+            if mismatch is not None:
+                if mismatch > 0.35:
+                    score -= 120.0
+                elif mismatch > 0.20:
+                    score -= 35.0
+                else:
+                    tw, th = target_size or (1, 1)
                     dw = abs(float(s[0] - tw)) / max(1.0, float(tw))
                     dh = abs(float(s[1] - th)) / max(1.0, float(th))
-                    score += max(-25.0, 30.0 - 40.0 * (dw + dh))
+                    score += max(-20.0, 56.0 - 70.0 * (dw + dh))
+
+            # Guardrail against cropped *_trk diffuse (common Leopard case):
+            # if explicit track NoAlpha patch mismatches TRK NM/ORM size,
+            # prefer CombinedDA diffuse candidate.
+            if "diffusetexturenoalpha" in low and is_track_token(low) and combined_ref is not None:
+                c_size = _sz(combined_ref)
+                c_mismatch = _mismatch(c_size, target_size)
+                if mismatch is not None and mismatch > 0.22:
+                    score -= 60.0
+                if mismatch is not None and c_mismatch is not None and (mismatch - c_mismatch) > 0.12:
+                    score -= 75.0
+                if _area(s) > 0.0 and _area(c_size) > 0.0 and _area(s) < 0.72 * _area(c_size):
+                    score -= 50.0
             try:
                 score += min(15.0, max(0.0, float(src.stat().st_size) / 65536.0))
             except Exception:
                 pass
             return score
 
-        best_src, _best_part = max(trk_candidates, key=lambda t: trk_diff_score(t[0], t[1]))
-        _add_named("diffuse", best_src, "TRK")
+        best_src, best_part = max(trk_candidates, key=lambda t: trk_diff_score(t[0], t[1]))
+        best_score = trk_diff_score(best_src, best_part)
+        if best_score >= 0.0:
+            _add_named("diffuse", best_src, "TRK")
 
     # Fallback: if track material has TRK NM/ORM maps but no TRK diffuse, provide one.
     trk_has_diffuse = any(
@@ -2655,45 +2746,81 @@ def remap_maps_to_named_sources(
 
 
 def pick_material_maps_from_textures(textures: Sequence[Dict[str, Any]]) -> Dict[str, Path]:
-    out: Dict[str, Path] = {}
+    best: Dict[str, Tuple[float, Path]] = {}
+
+    def consider(channel: str, src: Path | None, score: float) -> None:
+        if src is None or channel not in {"diffuse", "normal", "roughness", "metallic", "occlusion", "alpha", "orm"}:
+            return
+        cur = best.get(channel)
+        if cur is None or score > cur[0]:
+            best[channel] = (float(score), src)
+
     for item in textures:
-        role = item.get("role", "")
-        png = item.get("out_png")
+        role = str(item.get("role", ""))
+        png_raw = item.get("out_png")
+        png = Path(png_raw) if png_raw else None
         extras = item.get("extras", {})
         if isinstance(extras, dict):
             extras = {k: Path(v) if not isinstance(v, Path) else v for k, v in extras.items()}
         else:
             extras = {}
 
-        if role == "combined_da":
-            if "diffuse" in extras:
-                out.setdefault("diffuse", extras["diffuse"])
-            elif png:
-                out.setdefault("diffuse", Path(png))
-            if "alpha" in extras:
-                out.setdefault("alpha", extras["alpha"])
-        elif role == "diffuse":
-            if png:
-                out.setdefault("diffuse", Path(png))
+        stem_low = str(png.stem if png else "").lower()
+        if role == "diffuse":
+            consider("diffuse", png, 320.0)
+            trk = extras.get("trk")
+            if trk is not None:
+                # track-specific diffuse is handled later via named aliases; keep base as primary
+                consider("diffuse", Path(trk), 280.0)
+        elif role == "combined_da":
+            consider("diffuse", extras.get("diffuse"), 180.0)
+            consider("diffuse", png, 120.0)
+            consider("alpha", extras.get("alpha"), 320.0)
         elif role == "normal":
-            if "normal_reconstructed" in extras:
-                out.setdefault("normal", extras["normal_reconstructed"])
-            elif png:
-                out.setdefault("normal", Path(png))
+            consider("normal", extras.get("normal_reconstructed"), 330.0)
+            consider("normal", png, 300.0)
         elif role == "orm":
-            if "roughness" in extras:
-                out.setdefault("roughness", extras["roughness"])
-            if "metallic" in extras:
-                out.setdefault("metallic", extras["metallic"])
-            if "occlusion" in extras:
-                out.setdefault("occlusion", extras["occlusion"])
+            consider("orm", png, 305.0)
+            consider("roughness", extras.get("roughness"), 310.0)
+            consider("metallic", extras.get("metallic"), 310.0)
+            consider("occlusion", extras.get("occlusion"), 310.0)
 
+        # Mild generic backup from extras.
+        for ek, ev in extras.items():
+            token = f"{ek} {Path(ev).stem}"
+            ch = channel_from_token(token)
+            if ch is None:
+                continue
+            bonus = 20.0
+            low = token.lower()
+            if "combinedda" in low and ch == "diffuse":
+                bonus -= 40.0
+            if "diffusetexturenoalpha" in low and ch == "diffuse":
+                bonus += 60.0
+            consider(ch, Path(ev), 120.0 + bonus)
+
+        # Final weak fallback from main file itself.
+        if png is not None:
+            ch = channel_from_token(stem_low)
+            if ch is not None:
+                consider(ch, png, 90.0)
+            elif "combinedorm" in stem_low or "combinedrm" in stem_low or stem_low.endswith("_orm"):
+                consider("orm", png, 95.0)
+
+    out: Dict[str, Path] = {ch: src for ch, (_score, src) in best.items()}
     if "diffuse" not in out:
+        fallback: Path | None = None
         for item in textures:
             png = item.get("out_png")
-            if png:
-                out["diffuse"] = Path(png)
+            if not png:
+                continue
+            role = str(item.get("role", "")).lower()
+            stem_low = str(Path(png).stem).lower()
+            if role in {"diffuse", "combined_da"} or channel_from_token(stem_low) == "diffuse":
+                fallback = Path(png)
                 break
+        if fallback is not None:
+            out["diffuse"] = fallback
     return out
 
 
@@ -2726,6 +2853,7 @@ class SpkMeshExtractor:
         self.vertex_formats: List[str] = []
         self.meshes: List[Dict[str, int]] = []
         self.draw_calls: List[Dict[str, int]] = []
+        self.draw_call_stride: int = 8
         self.index_table: List[Dict[str, int]] = []
         self.vertex_table: List[Dict[str, int]] = []
         self.material_texture_refs: List[str] = []
@@ -2737,6 +2865,7 @@ class SpkMeshExtractor:
         self._vertex_cache: Dict[int, Dict[str, List[float]]] = {}
         self._node_blob_cache: Dict[int, bytes] = {}
         self._node_names_cache: Dict[int, List[str]] = {}
+        self._node_parents_cache: Dict[int, List[int]] = {}
 
         self._parse_header()
         self._parse_fat()
@@ -3493,32 +3622,186 @@ class SpkMeshExtractor:
         self._node_blob_cache[node_index] = blob
         return blob
 
+    @staticmethod
+    def _parse_node_blob_layout(blob: bytes) -> Tuple[int, int, int, int] | None:
+        if len(blob) < 32:
+            return None
+        try:
+            node_count = int(struct.unpack_from("<I", blob, 4)[0])
+            off_mat = int(struct.unpack_from("<I", blob, 8)[0])
+            off_parent = int(struct.unpack_from("<I", blob, 12)[0])
+            off_names = int(struct.unpack_from("<I", blob, 16)[0])
+        except Exception:
+            return None
+
+        if node_count <= 0 or node_count > 8192:
+            return None
+        if off_mat < 0 or off_parent < 0 or off_names < 0:
+            return None
+        if off_mat > len(blob) or off_parent > len(blob) or off_names > len(blob):
+            return None
+        if off_parent + node_count * 4 > len(blob):
+            return None
+        if off_names < off_parent:
+            return None
+        return node_count, off_mat, off_parent, off_names
+
+    @staticmethod
+    def _strip_zero_tail(raw: bytes) -> bytes:
+        end = len(raw)
+        while end > 0 and raw[end - 1] == 0:
+            end -= 1
+        return raw[:end]
+
+    @staticmethod
+    def _parse_names_from_cstrings(raw: bytes, node_count: int) -> List[str]:
+        trimmed = SpkMeshExtractor._strip_zero_tail(raw)
+        if not trimmed or b"\x00" not in trimmed:
+            return []
+        parts = trimmed.split(b"\x00")
+        names: List[str] = []
+        for part in parts:
+            if len(names) >= node_count:
+                break
+            names.append(part.decode("latin1", errors="ignore").strip())
+        if len(names) != node_count:
+            return []
+        return names
+
+    @staticmethod
+    def _select_name_lengths_blob(blob: bytes, node_count: int, off_mat: int, names_len: int) -> List[int]:
+        if node_count <= 0 or off_mat <= 0 or names_len <= 0:
+            return []
+        need = node_count * 2
+        if off_mat < need:
+            return []
+
+        best_score = -10_000
+        best_lens: List[int] = []
+        max_start = off_mat - need
+        for start in range(0, max_start + 1, 2):
+            try:
+                lens = list(struct.unpack_from(f"<{node_count}H", blob, start))
+            except Exception:
+                continue
+            total = int(sum(lens))
+            if total != names_len:
+                continue
+            if all(v == 0 for v in lens):
+                continue
+            if max(lens) > 1024:
+                continue
+            if sum(1 for v in lens if v > 0) < max(1, node_count // 8):
+                continue
+
+            score = 0
+            score += 500
+            score += sum(1 for v in lens if v > 0)
+            score += max(0, start - 24) // 2
+            if lens[0] == 0:
+                score += 20
+            if score > best_score:
+                best_score = score
+                best_lens = lens
+        return best_lens
+
+    @classmethod
+    def _parse_names_from_concat_with_lengths(
+        cls,
+        blob: bytes,
+        node_count: int,
+        off_mat: int,
+        names_raw: bytes,
+    ) -> List[str]:
+        trimmed = cls._strip_zero_tail(names_raw)
+        if not trimmed:
+            return []
+        lens = cls._select_name_lengths_blob(blob, node_count, off_mat, len(trimmed))
+        if not lens:
+            return []
+
+        out: List[str] = []
+        pos = 0
+        for ln in lens:
+            if ln <= 0:
+                out.append("")
+                continue
+            chunk = trimmed[pos : pos + ln]
+            pos += ln
+            out.append(chunk.decode("latin1", errors="ignore").strip())
+        if pos != len(trimmed):
+            return []
+        return out
+
+    def _parse_node_structured(self, node_index: int) -> Tuple[List[str], List[int]]:
+        blob = self.get_node_blob(node_index)
+        if not blob:
+            return [], []
+        layout = self._parse_node_blob_layout(blob)
+        if layout is None:
+            return [], []
+        node_count, off_mat, off_parent, off_names = layout
+
+        parents: List[int] = []
+        for i in range(node_count):
+            try:
+                parents.append(int(struct.unpack_from("<i", blob, off_parent + i * 4)[0]))
+            except Exception:
+                parents = []
+                break
+
+        names_raw = blob[off_names:]
+        names = self._parse_names_from_cstrings(names_raw, node_count)
+        if not names:
+            names = self._parse_names_from_concat_with_lengths(blob, node_count, off_mat, names_raw)
+
+        if names:
+            if len(names) < node_count:
+                names.extend([""] * (node_count - len(names)))
+            elif len(names) > node_count:
+                names = names[:node_count]
+        return names, parents
+
+    def parse_node_parent_indices(self, node_index: int) -> List[int]:
+        cached = self._node_parents_cache.get(node_index)
+        if cached is not None:
+            return cached
+        _, parents = self._parse_node_structured(node_index)
+        self._node_parents_cache[node_index] = parents
+        return parents
+
     def parse_node_names(self, node_index: int) -> List[str]:
         cached = self._node_names_cache.get(node_index)
         if cached is not None:
             return cached
+
+        names, parents = self._parse_node_structured(node_index)
+        if names:
+            self._node_names_cache[node_index] = names
+            self._node_parents_cache[node_index] = parents
+            return names
 
         blob = self.get_node_blob(node_index)
         if not blob:
             self._node_names_cache[node_index] = []
             return []
 
-        names: List[str] = []
+        fallback_names: List[str] = []
         m = NODE_NAME_TAIL_RX.search(blob)
         if m:
             tail = m.group(0).decode("ascii", errors="ignore")
-            names.extend(split_concatenated_node_names(tail))
+            fallback_names.extend(split_concatenated_node_names(tail))
 
-        if not names:
+        if not fallback_names:
             best = ""
             for mm in re.finditer(rb"[A-Za-z0-9_.]{12,}", blob):
                 candidate = mm.group(0).decode("ascii", errors="ignore")
                 if candidate.count("_") >= 2 and len(candidate) > len(best):
                     best = candidate
             if best:
-                names.extend(split_concatenated_node_names(best))
+                fallback_names.extend(split_concatenated_node_names(best))
 
-        names = unique_keep_order([n for n in names if n])
+        names = [n for n in fallback_names if n]
         self._node_names_cache[node_index] = names
         return names
 
@@ -3546,17 +3829,27 @@ class SpkMeshExtractor:
         info = self.header["drawCalls"]
         pos = int(info["offset"])
         count = int(info["num"])
+        size = int(info.get("size", 0))
+        stride = 8
+        if count > 0 and size > 0 and size % count == 0:
+            cand = size // count
+            if cand >= 8:
+                # WARNO layout-256 packs (e.g. Fulda/CommonSet) use 12-byte draw calls:
+                # file:u16 material:u16 index:u16 vertex:u16 unknown08:u32.
+                stride = cand
+        self.draw_call_stride = stride
         out: List[Dict[str, int]] = []
         for _ in range(count):
-            out.append(
-                {
-                    "file": self._u16(pos),
-                    "material": self._u16(pos + 2),
-                    "index": self._u16(pos + 4),
-                    "vertex": self._u16(pos + 6),
-                }
-            )
-            pos += 8
+            dc: Dict[str, int] = {
+                "file": self._u16(pos),
+                "material": self._u16(pos + 2),
+                "index": self._u16(pos + 4),
+                "vertex": self._u16(pos + 6),
+            }
+            if stride >= 12:
+                dc["unknown08"] = self._u32(pos + 8)
+            out.append(dc)
+            pos += stride
         self.draw_calls = out
 
     def _parse_index_table(self) -> None:
@@ -3792,20 +4085,120 @@ class SpkMeshExtractor:
         mesh = self.meshes[mesh_index]
 
         parts: List[Dict[str, Any]] = []
-        for i in range(int(mesh["num"])):
-            dc = self.draw_calls[int(mesh["drawCall"]) + i]
-            indices = self.read_indices(int(dc["index"]))
-            vertices = self.read_vertices(int(dc["vertex"]))
+        skipped_drawcalls: List[Dict[str, Any]] = []
+        dc_start = int(mesh["drawCall"])
+        dc_num = int(mesh["num"])
+
+        for i in range(dc_num):
+            dc_idx = dc_start + i
+            if dc_idx < 0 or dc_idx >= len(self.draw_calls):
+                skipped_drawcalls.append(
+                    {"drawCallIndex": dc_idx, "reason": "drawCall_out_of_range"}
+                )
+                continue
+
+            dc = self.draw_calls[dc_idx]
+            index_idx = int(dc.get("index", -1))
+            vertex_idx = int(dc.get("vertex", -1))
+            material_idx = int(dc.get("material", -1))
+
+            # Some SPK packs (e.g. decor packs) can contain placeholder draw calls
+            # with sentinel indices; skip them instead of aborting whole asset import.
+            if index_idx in {0xFFFF, -1} or vertex_idx in {0xFFFF, -1}:
+                skipped_drawcalls.append(
+                    {
+                        "drawCallIndex": dc_idx,
+                        "index": index_idx,
+                        "vertex": vertex_idx,
+                        "material": material_idx,
+                        "reason": "drawCall_sentinel_indices",
+                    }
+                )
+                continue
+            if index_idx < 0 or index_idx >= len(self.index_table):
+                skipped_drawcalls.append(
+                    {
+                        "drawCallIndex": dc_idx,
+                        "index": index_idx,
+                        "vertex": vertex_idx,
+                        "material": material_idx,
+                        "reason": "indexTable_out_of_range",
+                    }
+                )
+                continue
+            if vertex_idx < 0 or vertex_idx >= len(self.vertex_table):
+                skipped_drawcalls.append(
+                    {
+                        "drawCallIndex": dc_idx,
+                        "index": index_idx,
+                        "vertex": vertex_idx,
+                        "material": material_idx,
+                        "reason": "vertexTable_out_of_range",
+                    }
+                )
+                continue
+
+            try:
+                indices = self.read_indices(index_idx)
+                vertices = self.read_vertices(vertex_idx)
+            except Exception as exc:
+                skipped_drawcalls.append(
+                    {
+                        "drawCallIndex": dc_idx,
+                        "index": index_idx,
+                        "vertex": vertex_idx,
+                        "material": material_idx,
+                        "reason": f"decode_error:{exc}",
+                    }
+                )
+                continue
+
+            if not indices:
+                skipped_drawcalls.append(
+                    {
+                        "drawCallIndex": dc_idx,
+                        "index": index_idx,
+                        "vertex": vertex_idx,
+                        "material": material_idx,
+                        "reason": "empty_indices",
+                    }
+                )
+                continue
+            xyz = vertices.get("xyz", []) if isinstance(vertices, dict) else []
+            if not xyz:
+                skipped_drawcalls.append(
+                    {
+                        "drawCallIndex": dc_idx,
+                        "index": index_idx,
+                        "vertex": vertex_idx,
+                        "material": material_idx,
+                        "reason": "empty_vertices",
+                    }
+                )
+                continue
+
             parts.append(
                 {
-                    "drawCallIndex": int(mesh["drawCall"]) + i,
-                    "material": int(dc["material"]),
+                    "drawCallIndex": dc_idx,
+                    "material": material_idx,
                     "indices": indices,
                     "vertices": vertices,
                 }
             )
 
-        return {"asset": key, "meta": entry, "parts": parts}
+        if not parts:
+            first_reason = skipped_drawcalls[0]["reason"] if skipped_drawcalls else "no_drawcalls"
+            raise ValueError(
+                f"No valid draw calls for asset {key} "
+                f"(meshIndex={mesh_index}, drawCall={dc_start}, num={dc_num}, reason={first_reason})"
+            )
+
+        return {
+            "asset": key,
+            "meta": entry,
+            "parts": parts,
+            "skippedDrawCalls": skipped_drawcalls,
+        }
 
 
 def resolve_atlas_assets_root(path: Path) -> Path:
@@ -3815,6 +4208,677 @@ def resolve_atlas_assets_root(path: Path) -> Path:
     elif p.name.lower() != "assets" and (p / "Assets").exists():
         p = p / "Assets"
     return p
+
+
+def _is_numbered_zz_dat_name(name: str) -> bool:
+    low = str(name or "").strip().lower()
+    if not low.endswith(".dat"):
+        return False
+    stem = Path(low).stem
+    if stem == "zz":
+        return True
+    if not stem.startswith("zz_"):
+        return False
+    suffix = stem[3:]
+    return bool(suffix) and suffix.isdigit()
+
+
+def _zz_dat_sort_key(path: Path) -> int:
+    stem = path.stem.lower()
+    if stem == "zz":
+        return -1
+    if stem.startswith("zz_"):
+        suffix = stem[3:]
+        if suffix.isdigit():
+            return int(suffix)
+    return 10**9
+
+
+def find_warno_zz_dat_files(warno_root: Path) -> List[Path]:
+    root = Path(warno_root)
+    if not root.exists() or not root.is_dir():
+        return []
+    out: List[Path] = []
+    for p in root.rglob("ZZ*.dat"):
+        try:
+            if p.is_file() and _is_numbered_zz_dat_name(p.name):
+                out.append(p)
+        except Exception:
+            continue
+    out.sort(key=lambda p: (_zz_dat_sort_key(p), str(p).lower()))
+    return out
+
+
+def _read_u32_le(buf: bytes, offset: int) -> int:
+    return int(struct.unpack_from("<I", buf, offset)[0])
+
+
+def _read_cstring_in_dict(fh, dict_end: int) -> str:
+    parts: List[bytes] = []
+    while fh.tell() < dict_end:
+        b = fh.read(1)
+        if not b:
+            raise EOFError("Unexpected EOF while reading EDAT dictionary string")
+        if b == b"\x00":
+            return b"".join(parts).decode("ascii", errors="ignore")
+        parts.append(b)
+    raise ValueError("Unterminated string in EDAT dictionary")
+
+
+def _parse_zz_dat_header(dat_path: Path) -> Dict[str, int]:
+    with dat_path.open("rb") as fh:
+        head = fh.read(64)
+    if len(head) < 41:
+        raise ValueError(f"EDAT header too short: {dat_path}")
+    if head[:4] != b"edat":
+        raise ValueError(f"Invalid EDAT magic in {dat_path}: {head[:4]!r}")
+    version = _read_u32_le(head, 4)
+    if version not in {1, 2}:
+        raise ValueError(f"Unsupported EDAT version {version} in {dat_path}")
+    dict_offset = _read_u32_le(head, 25)
+    dict_length = _read_u32_le(head, 29)
+    file_offset = _read_u32_le(head, 33)
+    file_length = _read_u32_le(head, 37)
+    return {
+        "version": int(version),
+        "dict_offset": int(dict_offset),
+        "dict_length": int(dict_length),
+        "file_offset": int(file_offset),
+        "file_length": int(file_length),
+    }
+
+
+def _parse_zz_dat_v2_entries(dat_path: Path, header: Dict[str, int], legacy_padding: bool) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    dirs: List[str] = []
+    endings: List[int] = []
+    dict_offset = int(header["dict_offset"])
+    dict_length = int(header["dict_length"])
+    file_offset = int(header["file_offset"])
+    dict_end = dict_offset + dict_length
+    package_len = dat_path.stat().st_size
+
+    with dat_path.open("rb") as fh:
+        fh.seek(dict_offset)
+        while fh.tell() < dict_end:
+            block_start = fh.tell()
+            raw = fh.read(4)
+            if len(raw) != 4:
+                raise EOFError("Unexpected EOF while reading V2 fileGroupId")
+            file_group_id = int(struct.unpack("<i", raw)[0])
+
+            if file_group_id == 0:
+                file_entry_size = _read_u32_le(fh.read(4), 0)
+                raw_offset = int(struct.unpack("<q", fh.read(8))[0])
+                raw_size = int(struct.unpack("<q", fh.read(8))[0])
+                checksum = fh.read(16)
+                if len(checksum) != 16:
+                    raise EOFError("Unexpected EOF while reading V2 checksum")
+                name = _read_cstring_in_dict(fh, dict_end)
+                path = "".join(dirs) + name
+
+                if legacy_padding and len(name) % 2 == 0:
+                    if fh.tell() >= dict_end:
+                        raise ValueError("Expected legacy V2 padding byte but reached dictionary end")
+                    fh.seek(1, os.SEEK_CUR)
+
+                abs_offset = int(file_offset) + int(raw_offset)
+                if raw_offset < 0 or raw_size < 0:
+                    raise ValueError(f"Invalid V2 file entry (offset/size < 0) in {dat_path}: {path}")
+                if abs_offset < 0 or abs_offset > package_len:
+                    raise ValueError(f"Invalid V2 file offset in {dat_path}: {path}")
+                if raw_size > package_len - abs_offset:
+                    raise ValueError(f"Invalid V2 file size in {dat_path}: {path}")
+                entries.append(
+                    {
+                        "path": normalize_asset_path(path),
+                        "offset": int(raw_offset),
+                        "size": int(raw_size),
+                        "abs_offset": int(abs_offset),
+                        "file_entry_size": int(file_entry_size),
+                    }
+                )
+
+                while endings and fh.tell() == endings[-1]:
+                    dirs.pop()
+                    endings.pop()
+            elif file_group_id > 0:
+                file_entry_size = _read_u32_le(fh.read(4), 0)
+                if file_entry_size != 0:
+                    endings.append(int(block_start + file_entry_size))
+                elif endings:
+                    endings.append(endings[-1])
+                name = _read_cstring_in_dict(fh, dict_end)
+                if legacy_padding and len(name) % 2 == 0:
+                    if fh.tell() >= dict_end:
+                        raise ValueError("Expected legacy V2 dir padding byte but reached dictionary end")
+                    fh.seek(1, os.SEEK_CUR)
+                dirs.append(name)
+            else:
+                raise ValueError(f"Invalid V2 fileGroupId {file_group_id} in {dat_path}")
+    return entries
+
+
+def _parse_zz_dat_v1_entries(dat_path: Path, header: Dict[str, int]) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    dirs: List[str] = []
+    endings: List[int] = []
+    dict_offset = int(header["dict_offset"])
+    dict_length = int(header["dict_length"])
+    file_offset = int(header["file_offset"])
+    dict_end = dict_offset + dict_length
+    package_len = dat_path.stat().st_size
+
+    with dat_path.open("rb") as fh:
+        fh.seek(dict_offset)
+        while fh.tell() < dict_end:
+            block_start = fh.tell()
+            raw = fh.read(4)
+            if len(raw) != 4:
+                raise EOFError("Unexpected EOF while reading V1 fileGroupId")
+            file_group_id = int(struct.unpack("<i", raw)[0])
+
+            if file_group_id == 0:
+                file_entry_size = _read_u32_le(fh.read(4), 0)
+                raw_offset = _read_u32_le(fh.read(4), 0)
+                raw_size = _read_u32_le(fh.read(4), 0)
+                fh.seek(1, os.SEEK_CUR)
+                name = _read_cstring_in_dict(fh, dict_end)
+                path = "".join(dirs) + name
+                if (len(name) + 1) % 2 == 0:
+                    if fh.tell() < dict_end:
+                        fh.seek(1, os.SEEK_CUR)
+
+                abs_offset = int(file_offset) + int(raw_offset)
+                if abs_offset < 0 or abs_offset > package_len:
+                    continue
+                if raw_size > package_len - abs_offset:
+                    continue
+                entries.append(
+                    {
+                        "path": normalize_asset_path(path),
+                        "offset": int(raw_offset),
+                        "size": int(raw_size),
+                        "abs_offset": int(abs_offset),
+                        "file_entry_size": int(file_entry_size),
+                    }
+                )
+                while endings and fh.tell() == endings[-1]:
+                    dirs.pop()
+                    endings.pop()
+            elif file_group_id > 0:
+                file_entry_size = _read_u32_le(fh.read(4), 0)
+                if file_entry_size != 0:
+                    endings.append(int(block_start + file_entry_size))
+                elif endings:
+                    endings.append(endings[-1])
+                name = _read_cstring_in_dict(fh, dict_end)
+                if (len(name) + 1) % 2 == 1 and fh.tell() < dict_end:
+                    fh.seek(1, os.SEEK_CUR)
+                dirs.append(name)
+            else:
+                break
+    return entries
+
+
+def _scan_zz_dat_entries(dat_path: Path) -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
+    header = _parse_zz_dat_header(dat_path)
+    version = int(header["version"])
+    if version == 1:
+        return header, _parse_zz_dat_v1_entries(dat_path, header)
+
+    try:
+        return header, _parse_zz_dat_v2_entries(dat_path, header, legacy_padding=True)
+    except Exception:
+        return header, _parse_zz_dat_v2_entries(dat_path, header, legacy_padding=False)
+
+
+class ZZDatResolver:
+    def __init__(self, dat_files: Sequence[Path]):
+        self.dat_files = [Path(p) for p in dat_files if Path(p).exists() and Path(p).is_file()]
+        self._index_ready = False
+        self._assets: Dict[str, Dict[str, Any]] = {}
+        self._basename_to_keys: Dict[str, List[str]] = {}
+        self._header_by_dat: Dict[str, Dict[str, int]] = {}
+        self._generic_parent_hint: Dict[str, str] = {}
+
+    def _build_index(self) -> None:
+        if self._index_ready:
+            return
+        ordered = sorted(self.dat_files, key=lambda p: (_zz_dat_sort_key(p), str(p).lower()), reverse=True)
+        for dat in ordered:
+            dat_key = str(dat.resolve())
+            try:
+                header, entries = _scan_zz_dat_entries(dat)
+            except Exception:
+                continue
+            self._header_by_dat[dat_key] = header
+            for entry in entries:
+                path_raw = str(entry.get("path", "")).strip()
+                if not path_raw:
+                    continue
+                norm = normalize_asset_path(path_raw).lower()
+                if norm and norm not in self._assets:
+                    payload = dict(entry)
+                    payload["dat_path"] = dat
+                    self._assets[norm] = payload
+                    base = Path(norm).name.lower()
+                    if base:
+                        self._basename_to_keys.setdefault(base, []).append(norm)
+        self._index_ready = True
+
+    def all_asset_keys(self) -> List[str]:
+        self._build_index()
+        return list(self._assets.keys())
+
+    def find(self, asset_path: str) -> Dict[str, Any] | None:
+        self._build_index()
+        norm = normalize_asset_path(str(asset_path or "")).lower()
+        if not norm:
+            return None
+        hit = self._assets.get(norm)
+        if hit is not None:
+            return hit
+
+        # Atlas refs can come as Assets/... or PC/Atlas/Assets/...
+        if norm.startswith("assets/"):
+            alt = normalize_asset_path(f"PC/Atlas/{norm}").lower()
+            hit = self._assets.get(alt)
+            if hit is not None:
+                return hit
+        if norm.startswith("pc/atlas/assets/"):
+            alt = normalize_asset_path(norm[len("pc/atlas/") :]).lower()
+            hit = self._assets.get(alt)
+            if hit is not None:
+                return hit
+
+        base = Path(norm).name.lower()
+        if base:
+            generic_marks = (
+                "tsccolor_diffusetexturenoalpha",
+                "tscnm_normaltexture",
+                "tscorm_combinedrmtexture",
+                "tscorm_combinedormtexture",
+                "tsccoloralpha_combineddatexture",
+            )
+            is_generic_base = any(mark in base for mark in generic_marks)
+            cands = self._basename_to_keys.get(base, [])
+            req_low_for_score = norm
+            # Common atlas refs often request .png while payload is only .tgv (or reverse).
+            if not cands:
+                if base.endswith(".png"):
+                    cands = self._basename_to_keys.get(base[:-4] + ".tgv", [])
+                    if cands:
+                        req_low_for_score = norm[:-4] + ".tgv"
+                elif base.endswith(".tgv"):
+                    cands = self._basename_to_keys.get(base[:-4] + ".png", [])
+                    if cands:
+                        req_low_for_score = norm[:-4] + ".png"
+
+            # ORM alias support: some assets use CombinedRM in refs while payload is CombinedORM (or reverse).
+            orm_alt_bases: List[str] = []
+            if "combinedrmtexture" in base:
+                orm_alt_bases.append(base.replace("combinedrmtexture", "combinedormtexture"))
+            if "combinedormtexture" in base:
+                orm_alt_bases.append(base.replace("combinedormtexture", "combinedrmtexture"))
+            if orm_alt_bases:
+                merged = list(cands)
+                for alt_base in orm_alt_bases:
+                    alt = self._basename_to_keys.get(alt_base, [])
+                    if not alt and alt_base.endswith(".png"):
+                        alt = self._basename_to_keys.get(alt_base[:-4] + ".tgv", [])
+                    elif not alt and alt_base.endswith(".tgv"):
+                        alt = self._basename_to_keys.get(alt_base[:-4] + ".png", [])
+                    if alt:
+                        merged.extend(alt)
+                if merged:
+                    # Preserve order while removing duplicates.
+                    cands = list(dict.fromkeys(merged))
+            req_dir_key = normalize_asset_path(str(PurePosixPath(req_low_for_score).parent)).lower()
+            hint_parent = self._generic_parent_hint.get(req_dir_key, "") if is_generic_base else ""
+            if len(cands) == 1:
+                if is_generic_base and req_dir_key:
+                    only_key = cands[0]
+                    only_parent = normalize_asset_path(str(PurePosixPath(only_key).parent)).lower()
+                    req_is_decors = "/decors/" in req_low_for_score
+                    if only_parent and (not req_is_decors or "/decors/" in only_parent):
+                        self._generic_parent_hint[req_dir_key] = only_parent
+                return self._assets.get(cands[0])
+            if cands:
+                req_low = req_low_for_score
+                req_parent = normalize_asset_path(str(PurePosixPath(req_low).parent)).lower()
+                req_parts = [p for p in PurePosixPath(req_parent).parts if p]
+                generic = {"pc", "atlas", "assets", "3d", "2d", "output", "mods", "moddata", "base"}
+                req_tokens = [p.lower() for p in req_parts if p.lower() not in generic]
+                req_base = Path(req_low).name.lower()
+
+                def _score_candidate(key: str) -> float:
+                    key_low = str(key).lower()
+                    score = float(shared_suffix_score(key_low, req_low) * 100)
+                    key_parent = normalize_asset_path(str(PurePosixPath(key_low).parent)).lower()
+                    if req_parent and key_parent.endswith(req_parent):
+                        score += 160.0
+                    for tok in req_tokens:
+                        if tok and f"/{tok}/" in f"/{key_low}/":
+                            score += 12.0
+                    if "/decors/" in req_low and "/decors/" not in key_low:
+                        score -= 45.0
+                    if "/units/" in req_low and "/units/" not in key_low:
+                        score -= 45.0
+                    if "/decors/" in req_low and "/units/" in key_low:
+                        score -= 20.0
+                    if "/fx/" in key_low and "/fx/" not in req_low:
+                        score -= 35.0
+                    if "/units_tests/" in key_low:
+                        score -= 90.0
+                    if "/units_tests_autos/" in key_low:
+                        score -= 110.0
+                    if "/tests/" in key_low:
+                        score -= 18.0
+                    if "/editor/" in key_low:
+                        score -= 18.0
+
+                    if hint_parent:
+                        if key_parent == hint_parent:
+                            score += 220.0
+                        elif key_parent.startswith(hint_parent + "/"):
+                            score += 48.0
+
+                    # Generic TSC* atlas refs are often ambiguous across many folders.
+                    # Prefer candidate folders that provide a coherent D/NM/ORM set.
+                    if "tsc" in req_base and "texture01" in req_base:
+                        has_diff = (
+                            f"{key_parent}/tsccolor_diffusetexturenoalpha01.tgv" in self._assets
+                            or f"{key_parent}/tsccolor_diffusetexturenoalpha01.png" in self._assets
+                        )
+                        has_nm = (
+                            f"{key_parent}/tscnm_normaltexture01.tgv" in self._assets
+                            or f"{key_parent}/tscnm_normaltexture01.png" in self._assets
+                        )
+                        has_orm = (
+                            f"{key_parent}/tscorm_combinedrmtexture01.tgv" in self._assets
+                            or f"{key_parent}/tscorm_combinedrmtexture01.png" in self._assets
+                            or f"{key_parent}/tscorm_combinedormtexture01.tgv" in self._assets
+                            or f"{key_parent}/tscorm_combinedormtexture01.png" in self._assets
+                        )
+                        if "tsccolor_diffusetexturenoalpha" in req_base:
+                            if has_nm:
+                                score += 18.0
+                            if has_orm:
+                                score += 18.0
+                        elif "tscnm_normaltexture" in req_base:
+                            if has_diff:
+                                score += 18.0
+                            if has_orm:
+                                score += 14.0
+                        elif "tscorm_combinedrmtexture" in req_base or "tscorm_combinedormtexture" in req_base:
+                            if has_diff:
+                                score += 26.0
+                            if has_nm:
+                                score += 16.0
+
+                    try:
+                        size_bytes = int(self._assets.get(key_low, {}).get("size", 0) or 0)
+                    except Exception:
+                        size_bytes = 0
+                    # Avoid tiny placeholder atlas textures when resolving ambiguous generic names.
+                    if size_bytes > 0:
+                        if size_bytes <= 256:
+                            score -= 120.0
+                        elif size_bytes <= 1024:
+                            score -= 60.0
+                        elif size_bytes <= 4096:
+                            score -= 24.0
+                        elif size_bytes >= 1_000_000:
+                            score += 14.0
+                        elif size_bytes >= 200_000:
+                            score += 8.0
+
+                    score -= min(20.0, float(len(key_low)) * 0.01)
+                    return score
+
+                scored = sorted(((_score_candidate(k), k) for k in cands), reverse=True)
+                req_is_decors = "/decors/" in req_low
+                if is_generic_base and req_is_decors:
+                    decors_scored_strict = [pair for pair in scored if "/decors/" in pair[1]]
+                    if decors_scored_strict:
+                        if req_dir_key:
+                            top_parent = normalize_asset_path(str(PurePosixPath(decors_scored_strict[0][1]).parent)).lower()
+                            if top_parent:
+                                self._generic_parent_hint[req_dir_key] = top_parent
+                        return self._assets.get(decors_scored_strict[0][1])
+                    # Guardrail: for decors refs, never fallback to units-style generic TSC textures.
+                    return None
+                if scored and scored[0][0] >= 90.0:
+                    if is_generic_base and req_dir_key:
+                        top_parent = normalize_asset_path(str(PurePosixPath(scored[0][1]).parent)).lower()
+                        req_is_decors = "/decors/" in req_low
+                        if top_parent and (not req_is_decors or "/decors/" in top_parent):
+                            self._generic_parent_hint[req_dir_key] = top_parent
+                    return self._assets.get(scored[0][1])
+                if scored:
+                    req_is_decors = "/decors/" in req_low
+                    # Soft fallback for generic shared texture names where strict path
+                    # similarity cannot work (e.g. decors refs mapped to atlas templates).
+                    is_generic = is_generic_base
+                    if is_generic:
+                        # Prefer non-test candidates for generic TSC* texture names.
+                        non_test_scored = [
+                            pair
+                            for pair in scored
+                            if "/units_tests/" not in pair[1] and "/units_tests_autos/" not in pair[1]
+                        ]
+                        if req_is_decors:
+                            decors_scored = [pair for pair in non_test_scored if "/decors/" in pair[1]]
+                            if decors_scored:
+                                if req_dir_key:
+                                    top_parent = normalize_asset_path(str(PurePosixPath(decors_scored[0][1]).parent)).lower()
+                                    if top_parent:
+                                        self._generic_parent_hint[req_dir_key] = top_parent
+                                return self._assets.get(decors_scored[0][1])
+                            # Guardrail: for decors refs, never fallback to units-style generic TSC textures.
+                            return None
+                        if non_test_scored and non_test_scored[0][0] >= 35.0:
+                            if req_dir_key:
+                                top_parent = normalize_asset_path(str(PurePosixPath(non_test_scored[0][1]).parent)).lower()
+                                if top_parent:
+                                    self._generic_parent_hint[req_dir_key] = top_parent
+                            return self._assets.get(non_test_scored[0][1])
+                        if scored[0][0] >= 40.0:
+                            if req_dir_key:
+                                top_parent = normalize_asset_path(str(PurePosixPath(scored[0][1]).parent)).lower()
+                                if top_parent:
+                                    self._generic_parent_hint[req_dir_key] = top_parent
+                            return self._assets.get(scored[0][1])
+                    # Non-generic fallback: still allow strong-but-not-perfect match.
+                    if scored[0][0] >= 70.0:
+                        return self._assets.get(scored[0][1])
+        return None
+
+    def find_first_by_suffix(self, suffixes: Sequence[str], must_contain: Sequence[str] | None = None) -> Dict[str, Any] | None:
+        self._build_index()
+        clean_suffixes = [str(s).strip().lower().lstrip("/") for s in suffixes if str(s).strip()]
+        if not clean_suffixes:
+            return None
+        contains = [str(s).strip().lower() for s in (must_contain or []) if str(s).strip()]
+
+        for key, payload in self._assets.items():
+            if contains and not all(tok in key for tok in contains):
+                continue
+            if any(key.endswith(suf) for suf in clean_suffixes):
+                return payload
+        return None
+
+    def find_all_by_suffix(
+        self,
+        suffixes: Sequence[str],
+        must_contain: Sequence[str] | None = None,
+    ) -> List[Dict[str, Any]]:
+        self._build_index()
+        clean_suffixes = [str(s).strip().lower().lstrip("/") for s in suffixes if str(s).strip()]
+        if not clean_suffixes:
+            return []
+        contains = [str(s).strip().lower() for s in (must_contain or []) if str(s).strip()]
+
+        out: List[Dict[str, Any]] = []
+        for key in sorted(self._assets.keys()):
+            if contains and not all(tok in key for tok in contains):
+                continue
+            if any(key.endswith(suf) for suf in clean_suffixes):
+                out.append(self._assets[key])
+        return out
+
+    def extract_hit_to_runtime(self, hit: Dict[str, Any], runtime_root: Path) -> Path:
+        dat_path = Path(hit["dat_path"])
+        rel = normalize_asset_path(str(hit.get("path", "")))
+        if not rel:
+            raise ValueError("Cannot extract ZZ entry with empty path")
+        out_path = Path(runtime_root) / Path(*rel.split("/"))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        need_write = True
+        size = int(hit.get("size", 0))
+        if out_path.exists() and out_path.is_file():
+            try:
+                if size > 0 and out_path.stat().st_size == size:
+                    need_write = False
+            except Exception:
+                pass
+        if need_write:
+            abs_offset = int(hit["abs_offset"])
+            with dat_path.open("rb") as fh:
+                fh.seek(abs_offset)
+                data = fh.read(size)
+            if len(data) != size:
+                raise IOError(f"Failed to read full ZZ entry: {rel} from {dat_path}")
+            out_path.write_bytes(data)
+        return out_path
+
+    def extract_asset_to_runtime(self, asset_path: str, runtime_root: Path) -> Path | None:
+        hit = self.find(asset_path)
+        if hit is None:
+            return None
+        return self.extract_hit_to_runtime(hit, runtime_root)
+
+
+_ZZ_RESOLVER_CACHE: Dict[Tuple[Tuple[str, int, int], ...], ZZDatResolver] = {}
+
+
+def get_zz_runtime_resolver(warno_root: Path) -> ZZDatResolver:
+    dat_files = find_warno_zz_dat_files(warno_root)
+    if not dat_files:
+        raise FileNotFoundError(f"No ZZ*.dat found under WARNO folder: {warno_root}")
+
+    key_rows: List[Tuple[str, int, int]] = []
+    for p in dat_files:
+        st = p.stat()
+        key_rows.append((str(p.resolve()).lower(), int(st.st_mtime_ns), int(st.st_size)))
+    key = tuple(key_rows)
+    cached = _ZZ_RESOLVER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    resolver = ZZDatResolver(dat_files)
+    _ZZ_RESOLVER_CACHE.clear()
+    _ZZ_RESOLVER_CACHE[key] = resolver
+    return resolver
+
+
+def prepare_runtime_sources_from_zz(warno_root: Path, runtime_root: Path) -> Dict[str, Any]:
+    root = Path(warno_root)
+    runtime = Path(runtime_root)
+    runtime.mkdir(parents=True, exist_ok=True)
+    resolver = get_zz_runtime_resolver(root)
+
+    all_pack_spk_hits = resolver.find_all_by_suffix(
+        suffixes=[".spk"],
+        must_contain=["pc/mesh/pack/"],
+    )
+    if not all_pack_spk_hits:
+        # Fallback for package variants where path tokens differ.
+        all_pack_spk_hits = resolver.find_all_by_suffix(
+            suffixes=[".spk"],
+            must_contain=["mesh", "pack"],
+        )
+    if not all_pack_spk_hits:
+        raise FileNotFoundError("No SPK files were found under pc/mesh/pack in WARNO ZZ.dat")
+
+    extracted_spk_paths: List[Path] = []
+    for hit in all_pack_spk_hits:
+        try:
+            extracted_spk_paths.append(resolver.extract_hit_to_runtime(hit, runtime))
+        except Exception:
+            continue
+    if not extracted_spk_paths:
+        raise FileNotFoundError("Failed to extract any SPK files from WARNO ZZ.dat")
+
+    def _pick_preferred(paths: Sequence[Path], preferred_tokens: Sequence[str]) -> Path | None:
+        if not paths:
+            return None
+        lowered = [(p, normalize_asset_path(str(p)).lower()) for p in paths]
+        for token in preferred_tokens:
+            tok = token.lower()
+            for p, low in lowered:
+                if low.endswith(tok) or tok in Path(low).name:
+                    return p
+        return paths[0]
+
+    mesh_spk_files: List[Path] = []
+    skeleton_spk_files: List[Path] = []
+    for p in extracted_spk_paths:
+        name_low = p.name.lower()
+        if "skeleton" in name_low:
+            skeleton_spk_files.append(p)
+        else:
+            mesh_spk_files.append(p)
+    mesh_spk_files = sorted(mesh_spk_files, key=lambda p: str(p).lower())
+    skeleton_spk_files = sorted(skeleton_spk_files, key=lambda p: str(p).lower())
+
+    if not mesh_spk_files:
+        raise FileNotFoundError("No mesh SPK files were extracted from WARNO ZZ.dat")
+
+    mesh_spk = _pick_preferred(
+        mesh_spk_files,
+        preferred_tokens=["mesh_all.spk", "gfxdescriptor/mesh_all.spk"],
+    )
+    skeleton_spk = _pick_preferred(
+        skeleton_spk_files,
+        preferred_tokens=["skeleton_all.spk", "gfxdescriptor/skeleton_all.spk"],
+    )
+
+    mesh_spk_dir = runtime / "PC" / "mesh" / "pack"
+    if not mesh_spk_dir.exists():
+        mesh_spk_dir = mesh_spk.parent if mesh_spk is not None else runtime
+    skeleton_spk_dir = skeleton_spk.parent if skeleton_spk is not None else mesh_spk_dir
+
+    unit_ndfbin_hit = resolver.find_first_by_suffix(
+        suffixes=["unit.ndfbin"],
+        must_contain=["gfx"],
+    )
+    unite_desc_hit = resolver.find_first_by_suffix(
+        suffixes=["unitedescriptor.ndf"],
+        must_contain=["gamedata", "gameplay", "gfx"],
+    )
+    unit_ndfbin_path = resolver.extract_hit_to_runtime(unit_ndfbin_hit, runtime) if unit_ndfbin_hit is not None else None
+    unite_desc_path = resolver.extract_hit_to_runtime(unite_desc_hit, runtime) if unite_desc_hit is not None else None
+
+    atlas_assets_root = runtime / "PC" / "Atlas" / "Assets"
+    atlas_assets_root.mkdir(parents=True, exist_ok=True)
+
+    ndf_hint_source = unite_desc_path or unit_ndfbin_path
+    return {
+        "warno_root": str(root),
+        "runtime_root": str(runtime),
+        "atlas_assets_root": str(atlas_assets_root),
+        "mesh_spk": str(mesh_spk) if mesh_spk is not None else "",
+        "mesh_spk_dir": str(mesh_spk_dir),
+        "mesh_spk_files": [str(p) for p in mesh_spk_files],
+        "skeleton_spk": str(skeleton_spk) if skeleton_spk is not None else "",
+        "skeleton_spk_dir": str(skeleton_spk_dir),
+        "skeleton_spk_files": [str(p) for p in skeleton_spk_files],
+        "unit_ndfbin": str(unit_ndfbin_path) if unit_ndfbin_path is not None else "",
+        "unite_descriptor": str(unite_desc_path) if unite_desc_path is not None else "",
+        "ndf_hint_source": str(ndf_hint_source) if ndf_hint_source is not None else "",
+        "zz_dat_files": [str(p) for p in resolver.dat_files],
+    }
 
 
 def find_generated_extra_maps(out_png: Path) -> Dict[str, Path]:
@@ -3870,9 +4934,29 @@ def _folder_convert_cache_key(
     aggressive_split: bool,
     auto_naming: bool,
 ) -> Tuple[str, str, str, str, bool, bool, bool]:
+    conv_sig = _safe_resolved_str(converter)
+    try:
+        stc = converter.stat()
+        conv_sig = f"{conv_sig}:{int(stc.st_size)}:{int(stc.st_mtime_ns)}"
+    except Exception:
+        pass
+
+    # Include source folder content fingerprint so cached group conversion
+    # is re-run when additional TGV files appear later in the same folder.
+    sig_parts: List[str] = []
+    try:
+        for p in sorted(src_dir.glob("*.tgv"), key=lambda x: x.name.lower()):
+            try:
+                st = p.stat()
+                sig_parts.append(f"{p.name.lower()}:{int(st.st_size)}:{int(st.st_mtime_ns)}")
+            except Exception:
+                sig_parts.append(f"{p.name.lower()}:na")
+    except Exception:
+        pass
+    src_signature = "|".join(sig_parts)
     return (
-        _safe_resolved_str(converter),
-        _safe_resolved_str(src_dir),
+        conv_sig,
+        f"{_safe_resolved_str(src_dir)}::{src_signature}",
         _safe_resolved_str(dst_dir),
         str(split_mode or "auto").strip().lower(),
         bool(mirror),
@@ -4077,51 +5161,159 @@ def resolve_texture_from_atlas_ref(
     tgv_split_mode: str = "auto",
     tgv_mirror: bool = False,
     tgv_aggressive_split: bool = False,
+    zz_resolver: ZZDatResolver | None = None,
+    zz_runtime_root: Path | None = None,
+    fallback_atlas_roots: Sequence[Path] | None = None,
 ) -> Dict[str, Any]:
     rel = atlas_ref_to_rel_under_assets(ref)
+    role_hint = classify_texture_role(ref)
     src_png = atlas_assets_root / rel
     src_tgv = src_png.with_suffix(".tgv")
 
+    extra_roots: List[Path] = []
+    for root in fallback_atlas_roots or []:
+        try:
+            p = resolve_atlas_assets_root(Path(root))
+        except Exception:
+            p = Path(root)
+        if p.exists() and p.is_dir():
+            extra_roots.append(p)
+
+    # Try exact path in additional atlas roots (e.g. WARNO/Output/PC/Atlas/Assets)
+    # before broad basename fallback.
     if not src_tgv.exists() and not src_png.exists():
-        # Fallback: find by basename anywhere under atlas root.
+        for alt_root in extra_roots:
+            alt_png = alt_root / rel
+            alt_tgv = alt_png.with_suffix(".tgv")
+            if alt_tgv.exists() or alt_png.exists():
+                src_tgv = alt_tgv
+                src_png = alt_png
+                break
+
+    if not src_tgv.exists() and not src_png.exists():
+        # Optional runtime fallback: extract missing atlas asset directly from ZZ.dat packages.
+        if zz_resolver is not None:
+            runtime_root = Path(zz_runtime_root) if zz_runtime_root is not None else None
+            if runtime_root is None:
+                runtime_root = atlas_assets_root
+                for _ in range(3):
+                    runtime_root = runtime_root.parent
+            rel_tgv = rel.with_suffix(".tgv")
+            rel_png = rel.with_suffix(".png")
+            candidates = [
+                normalize_asset_path(f"PC/Atlas/Assets/{rel_tgv.as_posix()}"),
+                normalize_asset_path(f"PC/Atlas/Assets/{rel_png.as_posix()}"),
+                normalize_asset_path(f"Assets/{rel_tgv.as_posix()}"),
+                normalize_asset_path(f"Assets/{rel_png.as_posix()}"),
+            ]
+            for cand in candidates:
+                try:
+                    extracted = zz_resolver.extract_asset_to_runtime(cand, runtime_root)
+                except Exception:
+                    extracted = None
+                if extracted is None:
+                    continue
+                if extracted.suffix.lower() == ".tgv":
+                    src_tgv = extracted
+                    src_png = extracted.with_suffix(".png")
+                else:
+                    src_png = extracted
+                    src_tgv = extracted.with_suffix(".tgv")
+                break
+
+    if not src_tgv.exists() and not src_png.exists():
+        # Last-resort fallback: find by basename in atlas roots with path-similarity scoring.
+        # This avoids wrong picks like FX/* when ref expects Decors/*.
         tgv_name = rel.with_suffix(".tgv").name.lower()
         png_name = rel.with_suffix(".png").name.lower()
+        search_roots = [atlas_assets_root] + [p for p in extra_roots if p != atlas_assets_root]
+        req_norm = normalize_asset_path(str(rel)).lower()
+        req_parent = normalize_asset_path(str(PurePosixPath(req_norm).parent)).lower()
+        req_parts = [p for p in PurePosixPath(req_parent).parts if p]
+        generic = {"pc", "atlas", "assets", "3d", "2d", "output", "mods", "moddata", "base"}
+        req_tokens = [p.lower() for p in req_parts if p.lower() not in generic]
 
-        found_tgv = None
-        for p in atlas_assets_root.rglob("*.tgv"):
-            if p.name.lower() == tgv_name:
-                found_tgv = p
-                break
-        found_png = None
-        if found_tgv is None:
-            for p in atlas_assets_root.rglob("*.png"):
-                if p.name.lower() == png_name:
-                    found_png = p
-                    break
+        best_score = float("-inf")
+        best_tgv: Path | None = None
+        best_tgv_root: Path | None = None
+        best_png: Path | None = None
+        best_png_root: Path | None = None
 
-        if found_tgv is not None:
-            src_tgv = found_tgv
-            src_png = found_tgv.with_suffix(".png")
+        def _score_candidate(path: Path, root: Path) -> float:
             try:
-                rel = found_tgv.relative_to(atlas_assets_root).with_suffix(".png")
+                rel_key = normalize_asset_path(str(path.relative_to(root))).lower()
             except Exception:
-                rel = Path(found_tgv.name).with_suffix(".png")
-        elif found_png is not None:
-            src_png = found_png
-            src_tgv = found_png.with_suffix(".tgv")
+                rel_key = normalize_asset_path(path.name).lower()
+            score = float(shared_suffix_score(rel_key, req_norm) * 100)
+            if req_parent and normalize_asset_path(str(PurePosixPath(rel_key).parent)).lower().endswith(req_parent):
+                score += 160.0
+            for tok in req_tokens:
+                if tok and f"/{tok}/" in f"/{rel_key}/":
+                    score += 12.0
+            if "/decors/" in req_norm and "/decors/" not in rel_key:
+                score -= 45.0
+            if "/units/" in req_norm and "/units/" not in rel_key:
+                score -= 45.0
+            if "/fx/" in rel_key and "/fx/" not in req_norm:
+                score -= 35.0
+            score -= min(20.0, float(len(rel_key)) * 0.01)
+            return score
+
+        for root in search_roots:
             try:
-                rel = found_png.relative_to(atlas_assets_root)
+                tgv_candidates = [p for p in root.rglob("*.tgv") if p.name.lower() == tgv_name]
             except Exception:
-                rel = Path(found_png.name)
+                tgv_candidates = []
+            for p in tgv_candidates:
+                sc = _score_candidate(p, root)
+                if sc > best_score:
+                    best_score = sc
+                    best_tgv = p
+                    best_tgv_root = root
+            if best_tgv is not None:
+                continue
+            try:
+                png_candidates = [p for p in root.rglob("*.png") if p.name.lower() == png_name]
+            except Exception:
+                png_candidates = []
+            for p in png_candidates:
+                sc = _score_candidate(p, root)
+                if sc > best_score:
+                    best_score = sc
+                    best_png = p
+                    best_png_root = root
+
+        if best_tgv is not None and best_tgv_root is not None and best_score >= 90.0:
+            src_tgv = best_tgv
+            src_png = best_tgv.with_suffix(".png")
+            try:
+                rel = best_tgv.relative_to(best_tgv_root).with_suffix(".png")
+            except Exception:
+                rel = Path(best_tgv.name).with_suffix(".png")
+        elif best_png is not None and best_png_root is not None and best_score >= 90.0:
+            src_png = best_png
+            src_tgv = best_png.with_suffix(".tgv")
+            try:
+                rel = best_png.relative_to(best_png_root)
+            except Exception:
+                rel = Path(best_png.name)
 
     out_png = out_model_dir / texture_subdir / rel
     out_png.parent.mkdir(parents=True, exist_ok=True)
 
     source_type = ""
+    effective_split_mode = str(tgv_split_mode or "auto").strip().lower()
+    # Even when user chooses "none", ORM must still be unpacked to R/M/AO channel maps.
+    if role_hint == "orm" and effective_split_mode == "none":
+        effective_split_mode = "auto"
     if src_tgv.exists():
-        split_mode_norm = str(tgv_split_mode or "auto").strip().lower()
+        split_mode_norm = effective_split_mode
         group_error: str | None = None
-        if split_mode_norm == "auto":
+        force_auto_for_orm = role_hint == "orm" and str(tgv_split_mode or "auto").strip().lower() == "none"
+        # Do not run folder-wide conversion when ORM is force-switched from none->auto:
+        # we only need single-file ORM channel outputs and must avoid touching unrelated textures.
+        run_group_auto = split_mode_norm == "auto" and not force_auto_for_orm
+        if run_group_auto:
             try:
                 run_tgv_converter_for_folder_once(
                     converter=converter,
@@ -4143,7 +5335,7 @@ def resolve_texture_from_atlas_ref(
                     converter,
                     src_tgv,
                     out_png,
-                    split_mode=tgv_split_mode,
+                    split_mode=effective_split_mode,
                     mirror=tgv_mirror,
                     aggressive_split=tgv_aggressive_split,
                     auto_naming=True,
