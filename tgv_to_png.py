@@ -1112,6 +1112,19 @@ def preview_8bit_from_16bit(image: Image.Image) -> Image.Image:
     return Image.frombytes("L", image.size, high_bytes)
 
 
+def _non_opaque_alpha_channel(image: Image.Image) -> Image.Image | None:
+    if image.mode not in {"RGBA", "LA"}:
+        return None
+    alpha = image.getchannel("A")
+    extrema = alpha.getextrema()
+    if not isinstance(extrema, tuple) or len(extrema) != 2:
+        return None
+    mn, mx = int(extrema[0]), int(extrema[1])
+    if mn >= 255 and mx >= 255:
+        return None
+    return alpha
+
+
 def save_auto_channels(image: Image.Image, role: str, out_main: Path) -> list[Path]:
     out_paths: list[Path] = []
     stem = out_main.with_suffix("")
@@ -1179,6 +1192,17 @@ def save_auto_channels(image: Image.Image, role: str, out_main: Path) -> list[Pa
         preview.save(preview_path)
         out_paths.append(preview_path)
 
+    elif role == "generic":
+        alpha = _non_opaque_alpha_channel(image)
+        if alpha is not None:
+            alpha_path = stem.with_name(f"{stem.name}_alpha.png")
+            alpha.save(alpha_path)
+            out_paths.append(alpha_path)
+            if canonical_tag == "D":
+                alias_path = stem.with_name(f"{base_name}_A.png")
+                alpha.save(alias_path)
+                out_paths.append(alias_path)
+
     return out_paths
 
 
@@ -1222,6 +1246,8 @@ def cleanup_stale_outputs(out_main: Path) -> None:
     if tag:
         candidates.update(parent.glob(f"{base}_*_{tag}.png"))
         candidates.update(parent.glob(f"{base}_*_{tag}_*.png"))
+        if tag in {"D", "DA"}:
+            candidates.add(parent / f"{base}_A.png")
 
     for path in candidates:
         if not path.is_file():

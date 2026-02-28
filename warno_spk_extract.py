@@ -2447,6 +2447,8 @@ def build_named_texture_aliases(
         elif role == "diffuse":
             if out_path:
                 channel_items.append(("diffuse", out_path, part))
+            if "alpha" in extras:
+                channel_items.append(("alpha", Path(extras["alpha"]), part))
             # Explicit packed track block (e.g. *_trk.png) is still diffuse channel.
             trk = extras.get("trk")
             if trk is not None:
@@ -4965,6 +4967,11 @@ def find_generated_extra_maps(out_png: Path) -> Dict[str, Path]:
     m = re.match(r"(?i)^(.+?)_(NM|ORM|DA|D|A|AO|R|M)$", stem.name)
     if m:
         base = m.group(1)
+        tag = m.group(2).upper()
+        if tag == "D":
+            canonical_alpha = stem.with_name(f"{base}_A.png")
+            if canonical_alpha.exists():
+                out.setdefault("alpha", canonical_alpha)
         for p in stem.parent.glob(f"{base}_TRK_*.png"):
             out.setdefault(p.stem.lower(), p)
     return out

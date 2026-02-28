@@ -40,6 +40,7 @@ ZZ_RUNTIME_SESSION_CACHE: dict[tuple[str, str, tuple[tuple[str, int, int], ...]]
 SAFE_NAME_RX = re.compile(r"[^A-Za-z0-9_.-]+")
 LOD_SUFFIX_LOCAL_RX = re.compile(r"_(LOW|MID|HIGH|LOD[0-9]+)$", re.IGNORECASE)
 CONTROL_CHAR_RX = re.compile(r"[\x00-\x1f\x7f]+")
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tga", ".tif", ".tiff"}
 
 
 def _guess_default_project_root() -> str:
@@ -320,6 +321,85 @@ def _cache_asset_dir(extractor_mod, settings: "WARNOImporterSettings", asset: st
     else:
         cache_base = project_root / "output_blender"
     return cache_base / rel.parent
+
+
+def _folder_direct_image_count(folder: Path) -> int:
+    if not folder.exists() or not folder.is_dir():
+        return 0
+    count = 0
+    try:
+        for p in folder.iterdir():
+            if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS:
+                count += 1
+    except Exception:
+        return 0
+    return count
+
+
+def _normalize_asset_rel_dir_for_source_folder(asset: str) -> List[str]:
+    norm = str(asset or "").strip().replace("\\", "/")
+    norm = re.sub(r"/+", "/", norm).strip("/")
+    if not norm:
+        return []
+    pp = PurePosixPath(norm)
+    parts = [str(x) for x in pp.parts]
+    low = [x.lower() for x in parts]
+
+    rel_parts: List[str] = []
+    if "assets" in low:
+        idx = low.index("assets")
+        rel_parts = parts[idx + 1 : -1]
+    else:
+        rel_parts = parts[:-1]
+    out = [str(x).strip().lower() for x in rel_parts if str(x).strip() and str(x) not in {".", ".."}]
+    return out
+
+
+def _pick_manual_tool_input_dir(settings: "WARNOImporterSettings", extractor_mod: Any | None = None) -> Path:
+    raw = str(settings.last_texture_dir or "").strip()
+    base_dir = Path(raw) if raw else Path()
+    if not base_dir.exists() or not base_dir.is_dir():
+        return base_dir
+    if not bool(settings.use_source_folder_for_textures):
+        return base_dir
+
+    textures_root = base_dir / "textures"
+    if not textures_root.exists() or not textures_root.is_dir():
+        return base_dir
+
+    asset_raw = str(settings.selected_asset or "").strip()
+    if asset_raw and asset_raw != "__none__":
+        if extractor_mod is not None and hasattr(extractor_mod, "normalize_asset_path"):
+            try:
+                asset_raw = str(extractor_mod.normalize_asset_path(asset_raw))
+            except Exception:
+                pass
+        rel_parts = _normalize_asset_rel_dir_for_source_folder(asset_raw)
+        if rel_parts:
+            candidate = textures_root.joinpath(*rel_parts)
+            if _folder_direct_image_count(candidate) > 0:
+                return candidate
+
+    best_score: tuple[int, int, str] | None = None
+    best_path: Path | None = None
+    scan_dirs: List[Path] = [textures_root]
+    try:
+        scan_dirs.extend([p for p in textures_root.rglob("*") if p.is_dir()])
+    except Exception:
+        pass
+
+    for folder in scan_dirs:
+        count = _folder_direct_image_count(folder)
+        if count <= 0:
+            continue
+        rel_len = len(folder.relative_to(textures_root).parts) if folder != textures_root else 0
+        score = (count, -rel_len, str(folder).lower())
+        if best_score is None or score > best_score:
+            best_score = score
+            best_path = folder
+    if best_path is not None:
+        return best_path
+    return base_dir
 
 
 def _zz_runtime_root(settings: "WARNOImporterSettings") -> Path:
@@ -1050,6 +1130,11 @@ class WARNOImporterSettings(PropertyGroup):
         default="manual_texture_corrector_cpp/build/Release/manual_texture_corrector.exe",
         description="Path to external C++ manual texture correction tool",
     )
+    use_source_folder_for_textures: BoolProperty(
+        name="Use source folder for textures",
+        default=False,
+        description="For manual texture tool, use textures/<asset-path> source folder when available",
+    )
     texture_subdir: StringProperty(name="Texture Subdir", default="textures")
     cache_dir: StringProperty(name="Cache Dir", subtype="DIR_PATH", default="output_blender")
     use_zz_dat_source: BoolProperty(
@@ -1104,6 +1189,16 @@ class WARNOImporterSettings(PropertyGroup):
         name="Show LODs",
         default=False,
         description="Expand to pick LOD variant under selected main asset",
+    )
+    show_first_setup_logs: BoolProperty(
+        name="First Setup / Logs",
+        default=False,
+        description="Show initial setup (sources/deps) and logging controls",
+    )
+    show_import_options: BoolProperty(
+        name="Import Options",
+        default=True,
+        description="Show/hide import options",
     )
 
     auto_textures: BoolProperty(name="Auto textures", default=True)
@@ -1278,9 +1373,10 @@ class WARNOImporterSettings(PropertyGroup):
         description="Open Blender system console before import to watch live logs",
     )
 
-    rotate_x: FloatProperty(name="Rotate X", default=0.0)
-    rotate_y: FloatProperty(name="Rotate Y", default=0.0)
-    rotate_z: FloatProperty(name="Rotate Z", default=0.0)
+    # Deprecated: rotations are fixed to zero in import flow.
+    rotate_x: FloatProperty(name="Rotate X", default=0.0, options={"HIDDEN"})
+    rotate_y: FloatProperty(name="Rotate Y", default=0.0, options={"HIDDEN"})
+    rotate_z: FloatProperty(name="Rotate Z", default=0.0, options={"HIDDEN"})
     # Deprecated: Mirror Y is always ON.
     mirror_y: BoolProperty(name="Mirror Y", default=True, options={"HIDDEN"})
 
@@ -1330,9 +1426,13 @@ def _load_config_into_settings(settings: WARNOImporterSettings, path: Path) -> t
     settings.skeleton_spk = get_text("skeleton_spk", settings.skeleton_spk)
     settings.project_root = get_text("project_root", settings.project_root) or settings.project_root
     settings.atlas_assets_dir = get_text("atlas_assets_dir", settings.atlas_assets_dir)
-    settings.tgv_converter = get_text("tgv_converter", settings.tgv_converter)
+    settings.tgv_converter = get_text("tgv_converter", settings.tgv_converter) or "tgv_to_png.py"
     settings.manual_texture_tool = get_text("manual_texture_tool", settings.manual_texture_tool) or settings.manual_texture_tool
-    settings.texture_subdir = get_text("texture_subdir", settings.texture_subdir) or "textures"
+    settings.use_source_folder_for_textures = get_bool(
+        "use_source_folder_for_textures",
+        settings.use_source_folder_for_textures,
+    )
+    settings.texture_subdir = "textures"
     settings.cache_dir = get_text("cache_dir", settings.cache_dir) or settings.cache_dir
     settings.use_zz_dat_source = get_bool("use_zz_dat_source", settings.use_zz_dat_source)
     settings.warno_root = get_text("warno_root", settings.warno_root)
@@ -1387,9 +1487,9 @@ def _load_config_into_settings(settings: WARNOImporterSettings, path: Path) -> t
     settings.log_file_name = get_text("log_file_name", settings.log_file_name) or "warno_import.log"
     settings.open_console_on_import = get_bool("open_console_on_import", settings.open_console_on_import)
 
-    settings.rotate_x = get_float("rotate_x", settings.rotate_x)
-    settings.rotate_y = get_float("rotate_y", settings.rotate_y)
-    settings.rotate_z = get_float("rotate_z", settings.rotate_z)
+    settings.rotate_x = 0.0
+    settings.rotate_y = 0.0
+    settings.rotate_z = 0.0
     settings.mirror_y = True
     return True, f"Loaded: {path}"
 
@@ -1408,9 +1508,10 @@ def _save_settings_to_config(settings: WARNOImporterSettings, path: Path) -> tup
     raw["spk_path"] = settings.spk_path
     raw["skeleton_spk"] = settings.skeleton_spk
     raw["atlas_assets_dir"] = settings.atlas_assets_dir
-    raw["tgv_converter"] = settings.tgv_converter
+    raw["tgv_converter"] = str(settings.tgv_converter or "tgv_to_png.py")
     raw["manual_texture_tool"] = settings.manual_texture_tool
-    raw["texture_subdir"] = settings.texture_subdir
+    raw["use_source_folder_for_textures"] = bool(settings.use_source_folder_for_textures)
+    raw["texture_subdir"] = "textures"
     raw["cache_dir"] = settings.cache_dir
     raw["use_zz_dat_source"] = bool(settings.use_zz_dat_source)
     raw["warno_root"] = settings.warno_root
@@ -1448,9 +1549,9 @@ def _save_settings_to_config(settings: WARNOImporterSettings, path: Path) -> tup
     raw["log_file_name"] = str(settings.log_file_name or "warno_import.log")
     raw["open_console_on_import"] = bool(settings.open_console_on_import)
 
-    raw["rotate_x"] = float(settings.rotate_x)
-    raw["rotate_y"] = float(settings.rotate_y)
-    raw["rotate_z"] = float(settings.rotate_z)
+    raw["rotate_x"] = 0.0
+    raw["rotate_y"] = 0.0
+    raw["rotate_z"] = 0.0
     raw["mirror_y"] = True
     raw.pop("unit_ndfbin", None)
     raw["fbx_use_merge_by_distance"] = bool(settings.use_merge_by_distance)
@@ -2563,7 +2664,7 @@ def _resolve_material_maps(
                 atlas_assets_root=atlas_root,
                 out_model_dir=model_dir,
                 converter=conv_path,
-                texture_subdir=settings.texture_subdir or "textures",
+                texture_subdir="textures",
                 tgv_split_mode=settings.tgv_split_mode,
                 tgv_mirror=False,
                 tgv_aggressive_split=bool(settings.tgv_aggressive_split),
@@ -3224,12 +3325,34 @@ def _build_helper_armature(
 
 class WARNO_OT_LoadConfig(Operator):
     bl_idname = "warno.load_config"
-    bl_label = "Load Config"
+    bl_label = "Load My config"
     bl_description = "Load plugin settings from config.json"
 
     def execute(self, context):
         settings = context.scene.warno_import
         path = _config_path(settings)
+        ok, msg = _load_config_into_settings(settings, path)
+        _refresh_wheel_preset_cache(settings)
+        settings.status = msg
+        self.report({"INFO" if ok else "WARNING"}, msg)
+        return {"FINISHED" if ok else "CANCELLED"}
+
+
+class WARNO_OT_LoadExampleConfig(Operator):
+    bl_idname = "warno.load_example_config"
+    bl_label = "Load example config"
+    bl_description = "Load plugin settings from config.example.json"
+
+    def execute(self, context):
+        settings = context.scene.warno_import
+        project_candidate = _project_root(settings) / "config.example.json"
+        addon_candidate = Path(__file__).resolve().parent / "config.example.json"
+        path = project_candidate if project_candidate.exists() else addon_candidate
+        if not path.exists() or not path.is_file():
+            msg = "config.example.json not found in project/addon folder."
+            settings.status = msg
+            self.report({"WARNING"}, msg)
+            return {"CANCELLED"}
         ok, msg = _load_config_into_settings(settings, path)
         _refresh_wheel_preset_cache(settings)
         settings.status = msg
@@ -3625,7 +3748,6 @@ class WARNO_OT_ClearTextureFolder(Operator):
             return {"CANCELLED"}
 
         # Remove generated texture files only (keep mesh/manifests unrelated to textures).
-        image_exts = {".png", ".jpg", ".jpeg", ".bmp", ".tga", ".tif", ".tiff"}
         deleted = 0
         failed = 0
         extra_files = {"manual_texture_manifest.json"}
@@ -3635,7 +3757,7 @@ class WARNO_OT_ClearTextureFolder(Operator):
                 continue
             low_name = p.name.lower()
             low_ext = p.suffix.lower()
-            if low_ext in image_exts or low_name in extra_files:
+            if low_ext in IMAGE_EXTENSIONS or low_name in extra_files:
                 try:
                     p.unlink()
                     deleted += 1
@@ -4110,8 +4232,17 @@ class WARNO_OT_ManualTextureCorrecting(Operator):
             self.report({"ERROR"}, msg)
             return {"CANCELLED"}
 
-        out_dir = tex_dir / "manual_corrected"
-        cmd = [str(tool_path), "--input", str(tex_dir), "--output", str(out_dir)]
+        extractor_mod = None
+        try:
+            extractor_mod = _extractor_module(settings)
+        except Exception:
+            extractor_mod = None
+        input_dir = _pick_manual_tool_input_dir(settings, extractor_mod)
+        if not input_dir.exists() or not input_dir.is_dir():
+            input_dir = tex_dir
+
+        out_dir = input_dir / "manual_corrected"
+        cmd = [str(tool_path), "--input", str(input_dir), "--output", str(out_dir)]
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True)
         except Exception as exc:
@@ -4132,11 +4263,11 @@ class WARNO_OT_ManualTextureCorrecting(Operator):
             tool_error_msg = f"Manual tool failed (code {code}{crash_note}). {err}".strip()
 
         preferred_manifest = out_dir / "manual_texture_manifest.json"
-        manifest = _find_latest_manual_manifest(tex_dir, preferred_manifest)
+        manifest = _find_latest_manual_manifest(input_dir, preferred_manifest)
 
         # Reload images from known roots to pick file changes.
         roots_low = []
-        roots = [tex_dir, out_dir]
+        roots = [tex_dir, input_dir, out_dir]
         if manifest is not None:
             roots.append(manifest.parent)
         for root in roots:
@@ -4479,9 +4610,9 @@ class WARNO_OT_ImportAsset(Operator):
 
         need_bone_map = bool(settings.auto_split_main_parts or settings.auto_split_wheels or settings.auto_pull_bones)
         rot = extractor_mod.build_rotation_params(
-            float(settings.rotate_x),
-            float(settings.rotate_y),
-            float(settings.rotate_z),
+            0.0,
+            0.0,
+            0.0,
             mirror_y=True,
         )
 
@@ -4761,48 +4892,58 @@ class WARNO_PT_ImporterPanel(Panel):
         root_box.label(text="Project")
         root_box.prop(s, "project_root")
         row = root_box.row(align=True)
-        row.operator("warno.load_config", text="Load Config")
+        row.operator("warno.load_config", text="Load My config")
+        row.operator("warno.load_example_config", text="Load example config")
         row.operator("warno.save_config", text="Save Config")
 
-        src = layout.box()
-        src.label(text="Sources")
-        src.prop(s, "use_zz_dat_source")
-        if s.use_zz_dat_source:
-            src.prop(s, "warno_root")
-            src.prop(s, "modding_suite_root")
-            src.prop(s, "zz_runtime_dir")
-            src.operator("warno.prepare_zz_runtime", text="Prepare ZZ Runtime", icon="FILE_REFRESH")
-        src.prop(s, "spk_path")
-        src.prop(s, "skeleton_spk")
-        src.prop(s, "cache_dir")
+        setup = layout.box()
+        header = setup.row(align=True)
+        setup_icon = "TRIA_DOWN" if bool(s.show_first_setup_logs) else "TRIA_RIGHT"
+        header.prop(s, "show_first_setup_logs", text="First Setup / Logs", icon=setup_icon, emboss=False)
+        if s.show_first_setup_logs:
+            src = setup.column(align=True)
+            src.prop(s, "use_zz_dat_source")
+            if s.use_zz_dat_source:
+                src.prop(s, "warno_root")
+                src.prop(s, "modding_suite_root")
+                src.prop(s, "zz_runtime_dir")
+                src.operator("warno.prepare_zz_runtime", text="Prepare ZZ Runtime", icon="FILE_REFRESH")
+            src.prop(s, "spk_path")
+            src.prop(s, "skeleton_spk")
+            src.prop(s, "cache_dir")
+            src.separator()
+            src.prop(s, "auto_install_tgv_deps")
+            src.prop(s, "tgv_deps_dir")
+            src.operator("warno.install_tgv_deps", text="Install/Check TGV deps", icon="CONSOLE")
+            row = src.row(align=True)
+            row.operator("warno.open_system_console", text="Open System Console", icon="CONSOLE")
+            row.operator("warno.open_log_file", text="Open Log File", icon="TEXT")
+            src.prop(s, "log_to_file")
+            src.prop(s, "log_file_name")
+            src.prop(s, "open_console_on_import")
 
         tex = layout.box()
         tex.label(text="Textures")
-        tex.prop(s, "auto_textures")
         tex.prop(s, "atlas_assets_dir")
-        tex.prop(s, "tgv_converter")
-        tex.prop(s, "auto_install_tgv_deps")
-        tex.prop(s, "tgv_deps_dir")
         tex.prop(s, "manual_texture_tool")
-        tex.prop(s, "texture_subdir")
         tex.prop(s, "tgv_split_mode")
-        tex.prop(s, "tgv_aggressive_split")
-        tex.prop(s, "fast_exact_texture_resolve")
-        tex.prop(s, "allow_group_texture_convert")
-        tex.prop(s, "texture_process_timeout_sec")
-        tex.prop(s, "texture_stage_timeout_sec")
-        tex.prop(s, "auto_rename_textures")
-        tex.prop(s, "use_ao_multiply")
-        tex.prop(s, "log_to_file")
-        tex.prop(s, "log_file_name")
-        tex.prop(s, "open_console_on_import")
-        tex.operator("warno.install_tgv_deps", text="Install/Check TGV deps", icon="CONSOLE")
+        checks = tex.grid_flow(row_major=True, columns=2, even_columns=True, even_rows=False, align=True)
+        checks.prop(s, "auto_textures")
+        checks.prop(s, "auto_rename_textures")
+        checks.prop(s, "use_ao_multiply")
+        checks.prop(s, "fast_exact_texture_resolve")
+        checks.prop(s, "allow_group_texture_convert")
+        checks.prop(s, "tgv_aggressive_split")
+        time_row = tex.row(align=True)
+        time_row.prop(s, "texture_process_timeout_sec")
+        time_row.prop(s, "texture_stage_timeout_sec")
         row = tex.row(align=True)
-        row.operator("warno.open_system_console", text="Open System Console", icon="CONSOLE")
-        row.operator("warno.open_log_file", text="Open Log File", icon="TEXT")
-        tex.operator("warno.open_texture_folder", text="Open Texture Folder", icon="FILE_FOLDER")
-        tex.operator("warno.clear_texture_folder", text="Clear texture folder from old files", icon="TRASH")
-        tex.operator("warno.manual_texture_correcting", text="Manual texture correcting", icon="PREFERENCES")
+        row.operator("warno.open_texture_folder", text="Open Texture Folder", icon="FILE_FOLDER")
+        row.operator("warno.clear_texture_folder", text="Clear texture folder from old files", icon="TRASH")
+        row = tex.row(align=True)
+        row.operator("warno.manual_texture_correcting", text="Manual texture correcting", icon="PREFERENCES")
+        row.prop(s, "use_source_folder_for_textures", text="Use source folder for textures")
+        tex.operator("warno.apply_textures", text="Apply/Reapply Textures", icon="SHADING_TEXTURE")
 
         qry = layout.box()
         qry.label(text="Asset Picker")
@@ -4822,42 +4963,45 @@ class WARNO_PT_ImporterPanel(Panel):
         qry.label(text=f"Current: {str(s.selected_asset or '').strip()}", icon="OBJECT_DATA")
 
         opts = layout.box()
-        opts.label(text="Import Options")
-        opts.prop(s, "auto_split_main_parts")
-        opts.prop(s, "auto_split_wheels")
-        opts.prop(s, "auto_name_parts")
-        opts.prop(s, "auto_pull_bones")
-        opts.prop(s, "auto_track_wheel_correction")
-        if s.auto_track_wheel_correction:
-            corr = opts.column(align=True)
-            corr.prop(s, "track_fix_distance_scale")
-            corr.prop(s, "track_fix_edge_scale")
-            corr.prop(s, "track_fix_target_ratio")
-            corr.prop(s, "track_fix_min_pool_ratio")
-            corr.prop(s, "track_fix_axial_scale")
-            row = corr.row(align=True)
-            row.prop(s, "track_fix_ring_min")
-            row.prop(s, "track_fix_ring_max")
-            corr.separator()
-            corr.prop(s, "track_preset_name")
-            corr.prop(s, "selected_track_preset")
-            row = corr.row(align=True)
-            row.operator("warno.reset_track_tuning", text="Reset Defaults", icon="LOOP_BACK")
-            row.operator("warno.load_track_preset", text="Load Preset", icon="IMPORT")
-            corr.operator("warno.save_track_preset", text="Save Preset", icon="ADD")
-            corr.operator("warno.apply_track_correction", text="Apply Correction Now", icon="MODIFIER")
-        opts.prop(s, "auto_name_materials")
-        opts.prop(s, "rotate_x")
-        opts.prop(s, "rotate_y")
-        opts.prop(s, "rotate_z")
+        hdr = opts.row(align=True)
+        opt_icon = "TRIA_DOWN" if bool(s.show_import_options) else "TRIA_RIGHT"
+        hdr.prop(s, "show_import_options", text="Import Options", icon=opt_icon, emboss=False)
+        if s.show_import_options:
+            opt_grid = opts.grid_flow(row_major=True, columns=2, even_columns=True, even_rows=False, align=True)
+            opt_grid.prop(s, "auto_split_main_parts")
+            opt_grid.prop(s, "auto_split_wheels")
+            opt_grid.prop(s, "auto_name_parts")
+            opt_grid.prop(s, "auto_pull_bones")
+            opt_grid.prop(s, "auto_track_wheel_correction")
+            opt_grid.prop(s, "auto_name_materials")
+            if s.auto_track_wheel_correction:
+                corr = opts.column(align=True)
+                corr.prop(s, "track_fix_distance_scale")
+                corr.prop(s, "track_fix_edge_scale")
+                corr.prop(s, "track_fix_target_ratio")
+                corr.prop(s, "track_fix_min_pool_ratio")
+                corr.prop(s, "track_fix_axial_scale")
+                row = corr.row(align=True)
+                row.prop(s, "track_fix_ring_min")
+                row.prop(s, "track_fix_ring_max")
+                corr.separator()
+                corr.prop(s, "track_preset_name")
+                corr.prop(s, "selected_track_preset")
+                row = corr.row(align=True)
+                row.operator("warno.reset_track_tuning", text="Reset Defaults", icon="LOOP_BACK")
+                row.operator("warno.load_track_preset", text="Load Preset", icon="IMPORT")
+                corr.operator("warno.save_track_preset", text="Save Preset", icon="ADD")
+                corr.operator("warno.apply_track_correction", text="Apply Correction Now", icon="MODIFIER")
 
         geo = layout.box()
         geo.label(text="Geometry Cleanup")
-        geo.prop(s, "use_merge_by_distance")
-        geo.prop(s, "merge_distance")
-        geo.prop(s, "auto_smooth_angle")
+        row = geo.row(align=True)
+        row.prop(s, "use_merge_by_distance", text="Merge by distance")
+        rvals = row.row(align=True)
+        rvals.prop(s, "merge_distance", text="Merge distance")
+        rvals.prop(s, "auto_smooth_angle", text="Smooth angle")
+        rvals.enabled = bool(s.use_merge_by_distance)
         geo.operator("warno.apply_auto_smooth", text="Apply Auto smooth to the model", icon="MOD_SMOOTH")
-        layout.operator("warno.apply_textures", text="Apply/Reapply Textures", icon="SHADING_TEXTURE")
 
         layout.operator("warno.import_asset", text="Import To Blender", icon="IMPORT")
         if s.status:
@@ -4867,6 +5011,7 @@ class WARNO_PT_ImporterPanel(Panel):
 CLASSES = [
     WARNOImporterSettings,
     WARNO_OT_LoadConfig,
+    WARNO_OT_LoadExampleConfig,
     WARNO_OT_SaveConfig,
     WARNO_OT_ResetTrackTuning,
     WARNO_OT_SaveTrackPreset,
