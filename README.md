@@ -1,7 +1,8 @@
 # WARNO Blender Importer
 
-Author: Kilivanchik
-ModdingSuite for ZZ.dat support: https://github.com/kilivan4iK/moddingSuite/releases
+- Author: Kilivanchik
+- ModdingSuite for ZZ.dat support: https://github.com/kilivan4iK/moddingSuite/releases
+
 ## Included files
 - `warno_blender_addon.py` - Blender addon panel/importer
 - `warno_spk_extract.py` - core mesh/skeleton/material/texture logic
