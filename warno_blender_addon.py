@@ -13,6 +13,7 @@ import json
 import math
 import re
 import subprocess
+import threading
 import time
 from collections import defaultdict
 from contextlib import ExitStack
@@ -22,6 +23,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 import bmesh
 import bpy
+from bpy.app.handlers import persistent
 from bpy.props import BoolProperty
 from bpy.props import EnumProperty
 from bpy.props import FloatProperty
@@ -37,13 +39,55 @@ from mathutils import Vector
 
 MODULE_CACHE: dict[tuple[str, str], tuple[int, Any]] = {}
 ZZ_RUNTIME_SESSION_CACHE: dict[tuple[str, str, tuple[tuple[str, int, int], ...]], Dict[str, Any]] = {}
+ASSET_INDEX_SESSION_CACHE: dict[str, Dict[str, Any]] = {}
+ASSET_PICKER_VIEW_CACHE: dict[str, Dict[str, Any]] = {}
 SAFE_NAME_RX = re.compile(r"[^A-Za-z0-9_.-]+")
 LOD_SUFFIX_LOCAL_RX = re.compile(r"_(LOW|MID|HIGH|LOD[0-9]+)$", re.IGNORECASE)
 CONTROL_CHAR_RX = re.compile(r"[\x00-\x1f\x7f]+")
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tga", ".tif", ".tiff"}
 
 
+def _addon_state_path() -> Path:
+    try:
+        cfg_root = Path(str(bpy.utils.user_resource("CONFIG") or "")).expanduser()
+        if not str(cfg_root):
+            raise RuntimeError("empty config root")
+    except Exception:
+        cfg_root = Path.home()
+    return cfg_root / "warno_importer_state.json"
+
+
+def _read_addon_state() -> Dict[str, Any]:
+    path = _addon_state_path()
+    try:
+        if not path.exists() or not path.is_file():
+            return {}
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        if isinstance(raw, dict):
+            return raw
+    except Exception:
+        pass
+    return {}
+
+
+def _read_saved_project_root() -> str:
+    raw = _read_addon_state()
+    txt = str(raw.get("project_root", "") or "").strip()
+    if not txt:
+        return ""
+    p = Path(txt)
+    try:
+        if p.exists() and p.is_dir():
+            return str(p)
+    except Exception:
+        return ""
+    return ""
+
+
 def _guess_default_project_root() -> str:
+    remembered = _read_saved_project_root()
+    if remembered:
+        return remembered
     here = Path(__file__).resolve().parent
     for candidate in [here, *here.parents]:
         if (candidate / "warno_spk_extract.py").exists():
@@ -307,11 +351,6 @@ def _config_path(settings: "WARNOImporterSettings") -> Path:
     return root / "config.json"
 
 
-def _wheel_preset_path(settings: "WARNOImporterSettings") -> Path:
-    root = _project_root(settings)
-    return root / "track_wheel_presets.json"
-
-
 def _cache_asset_dir(extractor_mod, settings: "WARNOImporterSettings", asset: str) -> Path:
     project_root = _project_root(settings)
     rel = extractor_mod.safe_output_relpath(asset)
@@ -321,85 +360,6 @@ def _cache_asset_dir(extractor_mod, settings: "WARNOImporterSettings", asset: st
     else:
         cache_base = project_root / "output_blender"
     return cache_base / rel.parent
-
-
-def _folder_direct_image_count(folder: Path) -> int:
-    if not folder.exists() or not folder.is_dir():
-        return 0
-    count = 0
-    try:
-        for p in folder.iterdir():
-            if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS:
-                count += 1
-    except Exception:
-        return 0
-    return count
-
-
-def _normalize_asset_rel_dir_for_source_folder(asset: str) -> List[str]:
-    norm = str(asset or "").strip().replace("\\", "/")
-    norm = re.sub(r"/+", "/", norm).strip("/")
-    if not norm:
-        return []
-    pp = PurePosixPath(norm)
-    parts = [str(x) for x in pp.parts]
-    low = [x.lower() for x in parts]
-
-    rel_parts: List[str] = []
-    if "assets" in low:
-        idx = low.index("assets")
-        rel_parts = parts[idx + 1 : -1]
-    else:
-        rel_parts = parts[:-1]
-    out = [str(x).strip().lower() for x in rel_parts if str(x).strip() and str(x) not in {".", ".."}]
-    return out
-
-
-def _pick_manual_tool_input_dir(settings: "WARNOImporterSettings", extractor_mod: Any | None = None) -> Path:
-    raw = str(settings.last_texture_dir or "").strip()
-    base_dir = Path(raw) if raw else Path()
-    if not base_dir.exists() or not base_dir.is_dir():
-        return base_dir
-    if not bool(settings.use_source_folder_for_textures):
-        return base_dir
-
-    textures_root = base_dir / "textures"
-    if not textures_root.exists() or not textures_root.is_dir():
-        return base_dir
-
-    asset_raw = str(settings.selected_asset or "").strip()
-    if asset_raw and asset_raw != "__none__":
-        if extractor_mod is not None and hasattr(extractor_mod, "normalize_asset_path"):
-            try:
-                asset_raw = str(extractor_mod.normalize_asset_path(asset_raw))
-            except Exception:
-                pass
-        rel_parts = _normalize_asset_rel_dir_for_source_folder(asset_raw)
-        if rel_parts:
-            candidate = textures_root.joinpath(*rel_parts)
-            if _folder_direct_image_count(candidate) > 0:
-                return candidate
-
-    best_score: tuple[int, int, str] | None = None
-    best_path: Path | None = None
-    scan_dirs: List[Path] = [textures_root]
-    try:
-        scan_dirs.extend([p for p in textures_root.rglob("*") if p.is_dir()])
-    except Exception:
-        pass
-
-    for folder in scan_dirs:
-        count = _folder_direct_image_count(folder)
-        if count <= 0:
-            continue
-        rel_len = len(folder.relative_to(textures_root).parts) if folder != textures_root else 0
-        score = (count, -rel_len, str(folder).lower())
-        if best_score is None or score > best_score:
-            best_score = score
-            best_path = folder
-    if best_path is not None:
-        return best_path
-    return base_dir
 
 
 def _zz_runtime_root(settings: "WARNOImporterSettings") -> Path:
@@ -413,6 +373,17 @@ def _zz_runtime_root(settings: "WARNOImporterSettings") -> Path:
     return project_root / "out_blender_runtime" / "zz_runtime"
 
 
+def _atlas_json_cache_root(settings: "WARNOImporterSettings") -> Path:
+    project_root = _project_root(settings)
+    cache_raw = str(settings.cache_dir or "").strip()
+    if cache_raw:
+        base = _resolve_path(project_root, cache_raw)
+    else:
+        base = project_root / "output_blender"
+    sub = str(settings.atlas_json_cache_subdir or "").strip() or "atlas_json_cache"
+    return base / sub
+
+
 def _log_file_path(settings: "WARNOImporterSettings") -> Path:
     root = _project_root(settings)
     name = str(settings.log_file_name or "").strip() or "warno_import.log"
@@ -420,6 +391,42 @@ def _log_file_path(settings: "WARNOImporterSettings") -> Path:
     if "." not in safe:
         safe += ".log"
     return root / safe
+
+
+def _save_project_root_state(settings: "WARNOImporterSettings") -> tuple[bool, str]:
+    try:
+        root = _project_root(settings)
+        if not root.exists() or not root.is_dir():
+            return False, f"Project root not found: {root}"
+        state = _read_addon_state()
+        state["project_root"] = str(root.resolve())
+        state["saved_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        path = _addon_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_suffix(path.suffix + ".tmp")
+        temp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.replace(path)
+        return True, f"Project root remembered: {root}"
+    except Exception as exc:
+        return False, f"Cannot remember project root: {exc}"
+
+
+def _restore_project_root_and_auto_config(settings: "WARNOImporterSettings") -> None:
+    if settings is None:
+        return
+    try:
+        remembered = _read_saved_project_root()
+        if remembered:
+            settings.project_root = remembered
+    except Exception:
+        pass
+    try:
+        cfg = _config_path(settings)
+        if cfg.exists() and cfg.is_file():
+            _load_config_into_settings(settings, cfg)
+    except Exception:
+        pass
+    _enforce_fixed_runtime_defaults(settings)
 
 
 def _warno_log(settings: Any, message: str, level: str = "INFO", stage: str = "") -> None:
@@ -484,13 +491,24 @@ def _candidate_tgv_converter_from_modding_suite(settings: "WARNOImporterSettings
     return None
 
 
+def _iter_scenes_safe() -> List[Any]:
+    data = getattr(bpy, "data", None)
+    if data is None:
+        return []
+    scenes = getattr(data, "scenes", None)
+    if scenes is None:
+        return []
+    try:
+        return list(scenes)
+    except Exception:
+        return []
+
+
 def _prepare_zz_runtime_sources(
     extractor_mod,
     settings: "WARNOImporterSettings",
     force_rebuild: bool = False,
 ) -> Dict[str, Any]:
-    if not bool(settings.use_zz_dat_source):
-        return {}
     project_root = _project_root(settings)
     warno_raw = str(settings.warno_root or "").strip()
     if not warno_raw:
@@ -516,9 +534,7 @@ def _prepare_zz_runtime_sources(
 
     info = extractor_mod.prepare_runtime_sources_from_zz(warno_root=warno_root, runtime_root=runtime_root)
     info["runtime_root"] = str(runtime_root)
-    cand_tgv = _candidate_tgv_converter_from_modding_suite(settings)
-    if cand_tgv is not None:
-        info["tgv_converter"] = str(cand_tgv)
+    info["source_policy"] = "zz_runtime_only"
 
     try:
         resolver = extractor_mod.get_zz_runtime_resolver(warno_root)
@@ -591,13 +607,9 @@ def _resolve_mesh_spk_paths(
     settings: "WARNOImporterSettings",
     runtime_info: Dict[str, Any] | None = None,
 ) -> List[Path]:
+    _ = project_root, settings
     runtime_info = runtime_info or {}
-    if bool(settings.use_zz_dat_source):
-        out = _spk_paths_from_runtime_info(runtime_info, "mesh_spk_files", "mesh_spk", "mesh_spk_dir")
-        out = [p for p in out if "skeleton" not in p.name.lower()]
-        if out:
-            return out
-    out = _dedupe_paths(_expand_spk_source_paths(project_root, settings.spk_path))
+    out = _spk_paths_from_runtime_info(runtime_info, "mesh_spk_files", "mesh_spk", "mesh_spk_dir")
     return [p for p in out if "skeleton" not in p.name.lower()]
 
 
@@ -606,13 +618,9 @@ def _resolve_skeleton_spk_paths(
     settings: "WARNOImporterSettings",
     runtime_info: Dict[str, Any] | None = None,
 ) -> List[Path]:
+    _ = project_root, settings
     runtime_info = runtime_info or {}
-    if bool(settings.use_zz_dat_source):
-        out = _spk_paths_from_runtime_info(runtime_info, "skeleton_spk_files", "skeleton_spk", "skeleton_spk_dir")
-        out = [p for p in out if "skeleton" in p.name.lower()]
-        if out:
-            return out
-    out = _dedupe_paths(_expand_spk_source_paths(project_root, settings.skeleton_spk))
+    out = _spk_paths_from_runtime_info(runtime_info, "skeleton_spk_files", "skeleton_spk", "skeleton_spk_dir")
     return [p for p in out if "skeleton" in p.name.lower()]
 
 
@@ -652,20 +660,179 @@ def _pick_best_asset_spk_path(
     return out_path, out_asset
 
 
-def _asset_enum_items(self: "WARNOImporterSettings", _context):
-    raw = str(self.match_cache_json or "").strip()
-    if not raw:
-        return [("__none__", "<scan assets first>", "No scanned assets", 0)]
+def _picker_view_cache_key(settings: "WARNOImporterSettings") -> str:
     try:
-        assets = json.loads(raw)
+        return f"ptr:{int(settings.as_pointer())}"
     except Exception:
-        assets = []
+        return f"id:{id(settings)}"
+
+
+def _get_picker_view_cache(settings: "WARNOImporterSettings") -> Dict[str, Any]:
+    return ASSET_PICKER_VIEW_CACHE.get(_picker_view_cache_key(settings), {})
+
+
+def _set_picker_view_cache(
+    settings: "WARNOImporterSettings",
+    *,
+    assets: Sequence[str],
+    groups: Sequence[Dict[str, Any]],
+    folders: Sequence[Dict[str, Any]],
+    folder_tree: Sequence[Dict[str, Any]],
+    source: str,
+    query: str,
+) -> None:
+    key = _picker_view_cache_key(settings)
+    ASSET_PICKER_VIEW_CACHE[key] = {
+        "assets": [str(a).strip() for a in assets if str(a).strip()],
+        "groups": [dict(g) for g in groups if isinstance(g, dict)],
+        "folders": [dict(f) for f in folders if isinstance(f, dict)],
+        "folder_tree": [dict(n) for n in folder_tree if isinstance(n, dict)],
+        "source": str(source or "").strip(),
+        "query": str(query or "").strip(),
+    }
+    # Keep legacy Scene-string caches lightweight for backward compatibility.
+    settings.match_cache_json = "[]"
+    settings.asset_group_cache_json = "[]"
+    settings.asset_folder_cache_json = "[]"
+
+
+def _enum_keys(items: Sequence[Any]) -> List[str]:
+    out: List[str] = []
+    for it in items:
+        if isinstance(it, (tuple, list)) and len(it) >= 1:
+            out.append(str(it[0]))
+    return out
+
+
+def _safe_set_selected_asset(settings: "WARNOImporterSettings", value: str) -> str:
+    wanted = str(value or "").strip()
+    settings.selected_asset = wanted
+    return wanted
+
+
+def _safe_set_selected_asset_group(settings: "WARNOImporterSettings", value: str) -> str:
+    wanted = str(value or "").strip()
+    settings.selected_asset_group = wanted
+    return wanted
+
+
+def _safe_set_selected_asset_lod(settings: "WARNOImporterSettings", value: str) -> str:
+    wanted = str(value or "").strip() or "__base__"
+    settings.selected_asset_lod = wanted
+    return wanted
+
+
+def _asset_index_path(settings: "WARNOImporterSettings") -> Path:
+    project_root = _project_root(settings)
+    cache_raw = str(settings.cache_dir or "").strip()
+    cache_base = _resolve_path(project_root, cache_raw) if cache_raw else (project_root / "output_blender")
+    return cache_base / "asset_index" / "mesh_assets_index.v2.json"
+
+
+def _asset_index_signature(runtime_info: Dict[str, Any], mesh_spk_paths: Sequence[Path]) -> Dict[str, Any]:
+    runtime_root = str(runtime_info.get("runtime_root", "") or "").strip()
+    runtime_root_norm = ""
+    if runtime_root:
+        try:
+            runtime_root_norm = str(Path(runtime_root).resolve()).lower()
+        except Exception:
+            runtime_root_norm = str(runtime_root).lower()
+
+    spk_rows: List[Dict[str, Any]] = []
+    for p in mesh_spk_paths:
+        try:
+            st = p.stat()
+            path_key = str(p.resolve()).lower()
+            spk_rows.append({"path": path_key, "mtime_ns": int(st.st_mtime_ns), "size": int(st.st_size)})
+        except Exception:
+            continue
+    spk_rows.sort(key=lambda r: str(r.get("path", "")))
+
+    zz_rows: List[Dict[str, Any]] = []
+    raw_dats = runtime_info.get("zz_dat_files", [])
+    if isinstance(raw_dats, list):
+        for raw in raw_dats:
+            p = Path(str(raw))
+            try:
+                st = p.stat()
+                zz_rows.append(
+                    {
+                        "path": str(p.resolve()).lower(),
+                        "mtime_ns": int(st.st_mtime_ns),
+                        "size": int(st.st_size),
+                    }
+                )
+            except Exception:
+                continue
+    zz_rows.sort(key=lambda r: str(r.get("path", "")))
+    return {
+        "runtime_root": runtime_root_norm,
+        "mesh_spk": spk_rows,
+        "zz_dat": zz_rows,
+    }
+
+
+def _asset_index_signature_matches(index_data: Dict[str, Any], signature: Dict[str, Any]) -> bool:
+    if not isinstance(index_data, dict):
+        return False
+    return index_data.get("signature", {}) == signature
+
+
+def _load_asset_index_file(index_path: Path) -> Dict[str, Any] | None:
+    try:
+        if not index_path.exists() or not index_path.is_file():
+            return None
+        st = index_path.stat()
+        key = str(index_path.resolve()).lower()
+        cached = ASSET_INDEX_SESSION_CACHE.get(key)
+        if isinstance(cached, dict) and int(cached.get("mtime_ns", -1)) == int(st.st_mtime_ns):
+            data = cached.get("data")
+            if isinstance(data, dict):
+                return data
+        data = json.loads(index_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(data, dict):
+            return None
+        if int(data.get("schema_version", 0) or 0) != 2:
+            return None
+        ASSET_INDEX_SESSION_CACHE[key] = {"mtime_ns": int(st.st_mtime_ns), "data": data}
+        return data
+    except Exception:
+        return None
+
+
+def _save_asset_index_file(index_path: Path, payload: Dict[str, Any]) -> None:
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    temp = index_path.with_suffix(index_path.suffix + ".tmp")
+    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp.replace(index_path)
+    try:
+        st = index_path.stat()
+        key = str(index_path.resolve()).lower()
+        ASSET_INDEX_SESSION_CACHE[key] = {"mtime_ns": int(st.st_mtime_ns), "data": payload}
+    except Exception:
+        pass
+
+
+def _asset_enum_items(self: "WARNOImporterSettings", _context):
+    view = _get_picker_view_cache(self)
+    assets = view.get("assets", []) if isinstance(view, dict) else []
+    if not isinstance(assets, list) or not assets:
+        raw = str(self.match_cache_json or "").strip()
+        if raw:
+            try:
+                assets = json.loads(raw)
+            except Exception:
+                assets = []
     if not isinstance(assets, list) or not assets:
         return [("__none__", "<no matches>", "No matches", 0)]
 
-    labels = _unique_asset_labels([str(a) for a in assets])
+    out_assets = [str(a) for a in assets if str(a).strip()]
+    selected = str(getattr(self, "selected_asset", "") or "").strip()
+    if selected and selected != "__none__" and selected not in out_assets:
+        out_assets.insert(0, selected)
+    labels = _unique_asset_labels(out_assets)
     out = []
-    for i, asset in enumerate(assets):
+    for i, asset in enumerate(out_assets):
         asset_txt = str(asset)
         label = labels.get(asset_txt, _asset_display_name(asset_txt))
         out.append((asset_txt, label, asset_txt, i))
@@ -680,6 +847,15 @@ def _asset_popup_enum_items(self, context):
 
 
 def _asset_groups_from_cache(settings: "WARNOImporterSettings") -> List[Dict[str, Any]]:
+    view = _get_picker_view_cache(settings)
+    groups_view = view.get("groups", []) if isinstance(view, dict) else []
+    if isinstance(groups_view, list) and groups_view:
+        out_view: List[Dict[str, Any]] = []
+        for g in groups_view:
+            if isinstance(g, dict):
+                out_view.append(dict(g))
+        if out_view:
+            return out_view
     raw = str(getattr(settings, "asset_group_cache_json", "") or "").strip()
     if not raw:
         return []
@@ -709,6 +885,15 @@ def _asset_groups_from_cache(settings: "WARNOImporterSettings") -> List[Dict[str
 
 
 def _asset_folders_from_cache(settings: "WARNOImporterSettings") -> List[Dict[str, Any]]:
+    view = _get_picker_view_cache(settings)
+    folders_view = view.get("folders", []) if isinstance(view, dict) else []
+    if isinstance(folders_view, list) and folders_view:
+        out_view: List[Dict[str, Any]] = []
+        for f in folders_view:
+            if isinstance(f, dict):
+                out_view.append(dict(f))
+        if out_view:
+            return out_view
     raw = str(getattr(settings, "asset_folder_cache_json", "") or "").strip()
     if not raw:
         # Backward compatibility: derive folders from group cache if folder cache is absent.
@@ -730,7 +915,7 @@ def _asset_folders_from_cache(settings: "WARNOImporterSettings") -> List[Dict[st
             label = "/".join([str(p) for p in parts]) if parts else "."
             item = buckets.get(key)
             if item is None:
-                item = {"key": key, "label": label, "models": []}
+                item = {"key": key, "label": label, "category": _asset_category_from_folder_key(key), "models": []}
                 buckets[key] = item
             lods = [str(v).strip() for v in g.get("lods", []) if str(v).strip()]
             item["models"].append({"primary": primary, "lods": lods})
@@ -747,6 +932,7 @@ def _asset_folders_from_cache(settings: "WARNOImporterSettings") -> List[Dict[st
             continue
         key = str(f.get("key", "")).strip()
         label = str(f.get("label", "")).strip() or key
+        category = str(f.get("category", "")).strip() or _asset_category_from_folder_key(key)
         models_raw = f.get("models", [])
         models: List[Dict[str, Any]] = []
         if isinstance(models_raw, list):
@@ -763,7 +949,7 @@ def _asset_folders_from_cache(settings: "WARNOImporterSettings") -> List[Dict[st
                 models.append({"primary": primary, "lods": lods})
         if not key:
             continue
-        out.append({"key": key, "label": label, "models": models})
+        out.append({"key": key, "label": label, "category": category, "models": models})
     return out
 
 
@@ -774,11 +960,40 @@ def _browser_folder_items(self, context):
     folders = _asset_folders_from_cache(settings)
     if not folders:
         return [("__none__", "<scan assets first>", "No folders", 0)]
+    root_key = str(getattr(self, "root_key", "") or "").strip().lower()
+    category_key = str(getattr(self, "category_key", "") or "").strip().lower()
     out = []
-    for i, folder in enumerate(folders):
+    idx = 0
+    filtered = []
+    for folder in folders:
+        key = str(folder.get("key", "")).strip().lower()
+        if not key:
+            continue
+        if root_key and root_key != "__none__":
+            if key != root_key and not key.startswith(root_key + "/"):
+                continue
+        folder_cat = str(folder.get("category", "")).strip().lower() or _asset_category_from_folder_key(key).lower()
+        if category_key and category_key not in {"__all__", "__none__"} and folder_cat != category_key:
+            continue
+        filtered.append(folder)
+    filtered.sort(key=lambda f: str(f.get("key", "")).lower())
+    for folder in filtered:
         key = str(folder.get("key", "")).strip()
-        label = str(folder.get("label", "")).strip() or key
-        out.append((key, label, key, i))
+        key_low = key.lower()
+        if root_key and root_key != "__none__" and key_low.startswith(root_key):
+            rel = key_low[len(root_key) :].lstrip("/")
+        else:
+            rel = key_low
+        parts = [p for p in rel.split("/") if p]
+        if not parts:
+            label = _folder_root_label(root_key if root_key and root_key != "__none__" else key)
+        else:
+            indent = "  " * max(0, len(parts) - 1)
+            label = f"{indent}{parts[-1]}"
+        out.append((key, label, key, idx))
+        idx += 1
+    if not out:
+        return [("__none__", "<no folders>", "No folders for this root", 0)]
     return out
 
 
@@ -790,25 +1005,42 @@ def _browser_model_items(self, context):
     if not folders:
         return [("__none__", "<scan assets first>", "No models", 0)]
     folder_key = str(getattr(self, "folder_key", "") or "").strip()
-    target = None
+    root_key = str(getattr(self, "root_key", "") or "").strip().lower()
+    category_key = str(getattr(self, "category_key", "") or "").strip().lower()
+    filtered_folders: List[Dict[str, Any]] = []
     for f in folders:
+        key = str(f.get("key", "")).strip().lower()
+        if not key:
+            continue
+        if root_key and root_key != "__none__":
+            if key != root_key and not key.startswith(root_key + "/"):
+                continue
+        folder_cat = str(f.get("category", "")).strip().lower() or _asset_category_from_folder_key(key).lower()
+        if category_key and category_key not in {"__all__", "__none__"} and folder_cat != category_key:
+            continue
+        filtered_folders.append(f)
+    if not filtered_folders:
+        filtered_folders = folders
+
+    target = None
+    for f in filtered_folders:
         if str(f.get("key", "")).strip() == folder_key:
             target = f
             break
     if target is None:
-        target = folders[0]
+        target = filtered_folders[0]
     models = target.get("models", [])
     if not isinstance(models, list):
         models = []
 
-    search = str(getattr(self, "search_text", "") or "").strip().lower()
+    tokens = _normalize_search_tokens(str(getattr(self, "search_text", "") or ""))
     primaries: List[str] = []
     for m in models:
         p = str(m.get("primary", "")).strip()
         if not p:
             continue
-        name = _asset_display_name(p).lower()
-        if search and search not in name:
+        blob = f"{p.lower()} {_asset_display_name(p).lower()}"
+        if tokens and not all(tok in blob for tok in tokens):
             continue
         primaries.append(p)
     if not primaries:
@@ -939,6 +1171,55 @@ def _asset_folder_key_for_group(extractor_mod, primary_asset: str) -> tuple[str,
     return key, display
 
 
+def _asset_category_from_folder_key(folder_key: str) -> str:
+    parts = [p for p in str(folder_key or "").strip().lower().split("/") if p]
+    if not parts:
+        return "Other"
+
+    domain = ""
+    if len(parts) >= 3 and parts[0] == "assets" and parts[1] == "3d":
+        domain = parts[2]
+    else:
+        domain = parts[0]
+
+    if domain == "units":
+        branch = parts[4] if len(parts) >= 5 else ""
+        if branch in {"char", "veh", "vehicle", "tank", "ifv", "apc"}:
+            return "Tanks & Vehicles"
+        if branch in {"inf", "infantry", "soldier"}:
+            return "Infantry"
+        if branch in {"heli", "helo", "helicopter", "air", "plane"}:
+            return "Air"
+        if branch in {"art", "artillery"}:
+            return "Artillery"
+        return "Units Other"
+    if domain == "decors":
+        return "Decor"
+    if domain in {"props", "prop"}:
+        return "Props"
+    if domain == "ammo":
+        return "Ammo"
+    if domain in {"fx", "effects"}:
+        return "FX"
+    return domain.replace("_", " ").title() or "Other"
+
+
+def _asset_category_sort_key(name: str) -> tuple[int, str]:
+    low = str(name or "").strip().lower()
+    rank = {
+        "tanks & vehicles": 0,
+        "infantry": 1,
+        "air": 2,
+        "artillery": 3,
+        "decor": 4,
+        "props": 5,
+        "ammo": 6,
+        "fx": 7,
+        "units other": 8,
+    }.get(low, 50)
+    return (rank, low)
+
+
 def _build_asset_folders_cache(extractor_mod, groups: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     buckets: Dict[str, Dict[str, Any]] = {}
     for g in groups:
@@ -952,6 +1233,7 @@ def _build_asset_folders_cache(extractor_mod, groups: Sequence[Dict[str, Any]]) 
             bucket = {
                 "key": folder_key,
                 "label": folder_display,
+                "category": _asset_category_from_folder_key(folder_key),
                 "models": [],
             }
             buckets[folder_key] = bucket
@@ -969,6 +1251,368 @@ def _build_asset_folders_cache(extractor_mod, groups: Sequence[Dict[str, Any]]) 
         if isinstance(models, list):
             models.sort(key=lambda m: _asset_picker_sort_key(extractor_mod, str(m.get("primary", ""))))
     return out
+
+
+def _build_folder_tree_from_folders(folders: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    node_by_key: Dict[str, Dict[str, Any]] = {}
+    roots: List[Dict[str, Any]] = []
+
+    def ensure_node(key: str, name: str) -> Dict[str, Any]:
+        node = node_by_key.get(key)
+        if node is None:
+            node = {"name": name, "key": key, "children": [], "models": []}
+            node_by_key[key] = node
+        return node
+
+    for f in folders:
+        if not isinstance(f, dict):
+            continue
+        key = str(f.get("key", "")).strip().lower()
+        if not key:
+            continue
+        models = f.get("models", [])
+        if not isinstance(models, list):
+            models = []
+        parts = [p for p in key.split("/") if p]
+        parent: Dict[str, Any] | None = None
+        for i, part in enumerate(parts):
+            cur_key = "/".join(parts[: i + 1])
+            cur = ensure_node(cur_key, part)
+            if parent is None:
+                if cur not in roots:
+                    roots.append(cur)
+            else:
+                children = parent.get("children", [])
+                if isinstance(children, list) and cur not in children:
+                    children.append(cur)
+            parent = cur
+        if parent is not None:
+            parent["models"] = [
+                {"primary": str(m.get("primary", "")).strip(), "lods": [str(v).strip() for v in m.get("lods", []) if str(v).strip()]}
+                for m in models
+                if isinstance(m, dict) and str(m.get("primary", "")).strip()
+            ]
+
+    def norm_node(node: Dict[str, Any]) -> Dict[str, Any]:
+        children_raw = node.get("children", [])
+        children: List[Dict[str, Any]] = []
+        if isinstance(children_raw, list):
+            children = [norm_node(ch) for ch in children_raw if isinstance(ch, dict)]
+            children.sort(key=lambda x: str(x.get("key", "")))
+        models_raw = node.get("models", [])
+        models: List[Dict[str, Any]] = []
+        if isinstance(models_raw, list):
+            for m in models_raw:
+                if not isinstance(m, dict):
+                    continue
+                p = str(m.get("primary", "")).strip()
+                if not p:
+                    continue
+                lods = [str(v).strip() for v in m.get("lods", []) if str(v).strip()]
+                models.append({"primary": p, "lods": lods})
+            models.sort(key=lambda m: str(m.get("primary", "")).lower())
+        return {
+            "name": str(node.get("name", "")).strip(),
+            "key": str(node.get("key", "")).strip(),
+            "children": children,
+            "models": models,
+        }
+
+    out = [norm_node(n) for n in roots if isinstance(n, dict)]
+    out.sort(key=lambda n: str(n.get("key", "")))
+    return out
+
+
+def _scan_assets_from_spk_paths(extractor_mod, spk_paths: Sequence[Path], query: str | None) -> List[str]:
+    query_val = str(query or "").strip()
+    query_for_scan = query_val if query_val else None
+    seen_assets: set[str] = set()
+    out: List[str] = []
+    for spk_path in spk_paths:
+        try:
+            with extractor_mod.SpkMeshExtractor(spk_path) as spk:
+                for asset, _meta in spk.find_matches(query_for_scan, None):
+                    txt = str(asset).strip()
+                    key = txt.lower()
+                    if not txt or key in seen_assets:
+                        continue
+                    seen_assets.add(key)
+                    out.append(txt)
+        except Exception:
+            continue
+    out.sort(key=lambda a: _asset_picker_sort_key(extractor_mod, a))
+    return out
+
+
+def _build_asset_index_payload(extractor_mod, assets: Sequence[str], signature: Dict[str, Any], spk_count: int) -> Dict[str, Any]:
+    groups = _build_asset_groups(extractor_mod, assets)
+    folders = _build_asset_folders_cache(extractor_mod, groups)
+    folder_tree = _build_folder_tree_from_folders(folders)
+    return {
+        "schema_version": 2,
+        "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "signature": signature,
+        "assets": [str(a).strip() for a in assets if str(a).strip()],
+        "groups": groups,
+        "folders": folders,
+        "folder_tree": folder_tree,
+        "counts": {
+            "assets": len([a for a in assets if str(a).strip()]),
+            "groups": len(groups),
+            "folders": len(folders),
+            "spk_count": int(spk_count),
+        },
+    }
+
+
+def _normalize_search_tokens(query: str) -> List[str]:
+    cleaned = CONTROL_CHAR_RX.sub(" ", str(query or "").strip().lower())
+    cleaned = cleaned.replace("\\", "/")
+    tokens = [t for t in re.split(r"[^a-z0-9]+", cleaned) if t]
+    return tokens
+
+
+def _filter_assets_from_index(index_data: Dict[str, Any], query: str) -> List[str]:
+    assets_raw = index_data.get("assets", []) if isinstance(index_data, dict) else []
+    assets = [str(a).strip() for a in assets_raw if str(a).strip()]
+    tokens = _normalize_search_tokens(query)
+    if not tokens:
+        return assets
+    out: List[str] = []
+    for asset in assets:
+        blob = f"{str(asset).lower()} {_asset_display_name(asset).lower()}"
+        if all(tok in blob for tok in tokens):
+            out.append(asset)
+    return out
+
+
+def _apply_picker_view_from_assets(
+    settings: "WARNOImporterSettings",
+    extractor_mod,
+    assets: Sequence[str],
+    *,
+    source: str,
+    query: str,
+) -> None:
+    groups = _build_asset_groups(extractor_mod, assets)
+    folders = _build_asset_folders_cache(extractor_mod, groups)
+    folder_tree = _build_folder_tree_from_folders(folders)
+    _set_picker_view_cache(
+        settings,
+        assets=assets,
+        groups=groups,
+        folders=folders,
+        folder_tree=folder_tree,
+        source=source,
+        query=query,
+    )
+    settings.asset_sync_lock = True
+    try:
+        if groups:
+            primary = str(groups[0].get("primary", "")).strip()
+            _safe_set_selected_asset_group(settings, primary)
+            _safe_set_selected_asset_lod(settings, "__base__")
+            _safe_set_selected_asset(settings, primary)
+        elif assets:
+            _safe_set_selected_asset(settings, str(assets[0]).strip())
+            _safe_set_selected_asset_group(settings, "__none__")
+            _safe_set_selected_asset_lod(settings, "__base__")
+        else:
+            _safe_set_selected_asset(settings, "")
+            _safe_set_selected_asset_group(settings, "__none__")
+            _safe_set_selected_asset_lod(settings, "__base__")
+    finally:
+        settings.asset_sync_lock = False
+    _sync_group_lod_from_selected(settings)
+
+
+def _apply_picker_view_from_index(
+    settings: "WARNOImporterSettings",
+    extractor_mod,
+    index_data: Dict[str, Any],
+    *,
+    source: str,
+    query: str,
+) -> List[str]:
+    assets_all = [str(a).strip() for a in index_data.get("assets", []) if str(a).strip()]
+    filtered_assets = _filter_assets_from_index(index_data, query)
+    tokens = _normalize_search_tokens(query)
+    if not tokens:
+        groups = index_data.get("groups", []) if isinstance(index_data.get("groups", []), list) else []
+        folders = index_data.get("folders", []) if isinstance(index_data.get("folders", []), list) else []
+        folder_tree = index_data.get("folder_tree", []) if isinstance(index_data.get("folder_tree", []), list) else []
+        if not groups:
+            groups = _build_asset_groups(extractor_mod, assets_all)
+        if not folders:
+            folders = _build_asset_folders_cache(extractor_mod, groups)
+        if not folder_tree:
+            folder_tree = _build_folder_tree_from_folders(folders)
+        _set_picker_view_cache(
+            settings,
+            assets=assets_all,
+            groups=groups,
+            folders=folders,
+            folder_tree=folder_tree,
+            source=source,
+            query="",
+        )
+    else:
+        _apply_picker_view_from_assets(
+            settings,
+            extractor_mod,
+            filtered_assets,
+            source=source,
+            query=query,
+        )
+    settings.asset_sync_lock = True
+    try:
+        if filtered_assets:
+            if str(settings.selected_asset or "").strip() not in set(filtered_assets):
+                _safe_set_selected_asset(settings, str(filtered_assets[0]).strip())
+        elif assets_all:
+            _safe_set_selected_asset(settings, str(assets_all[0]).strip())
+        else:
+            _safe_set_selected_asset(settings, "")
+            _safe_set_selected_asset_group(settings, "__none__")
+            _safe_set_selected_asset_lod(settings, "__base__")
+    finally:
+        settings.asset_sync_lock = False
+    _sync_group_lod_from_selected(settings)
+    return filtered_assets
+
+
+def _ensure_asset_index_sync(
+    settings: "WARNOImporterSettings",
+    *,
+    force_rebuild: bool = False,
+) -> tuple[Dict[str, Any], str, Dict[str, Any], List[Path]]:
+    extractor_mod = _extractor_module(settings)
+    runtime_info = _prepare_zz_runtime_sources(extractor_mod, settings)
+    project_root = _project_root(settings)
+    mesh_spk_paths = _resolve_mesh_spk_paths(project_root, settings, runtime_info)
+    if not mesh_spk_paths:
+        raise RuntimeError("No mesh SPK files found in prepared ZZ runtime.")
+
+    signature = _asset_index_signature(runtime_info, mesh_spk_paths)
+    index_path = _asset_index_path(settings)
+    if not force_rebuild:
+        cached = _load_asset_index_file(index_path)
+        if cached is not None and _asset_index_signature_matches(cached, signature):
+            return cached, "cache", runtime_info, mesh_spk_paths
+
+    assets = _scan_assets_from_spk_paths(extractor_mod, mesh_spk_paths, query=None)
+    payload = _build_asset_index_payload(extractor_mod, assets, signature, len(mesh_spk_paths))
+    _save_asset_index_file(index_path, payload)
+    return payload, "rebuilt", runtime_info, mesh_spk_paths
+
+
+def _folder_root_key(folder_key: str) -> str:
+    parts = [p for p in str(folder_key or "").strip().lower().split("/") if p]
+    if len(parts) >= 3 and parts[0] == "assets" and parts[1] == "3d":
+        return "/".join(parts[:3])
+    if parts:
+        return parts[0]
+    return "__none__"
+
+
+def _folder_root_label(root_key: str) -> str:
+    parts = [p for p in str(root_key or "").split("/") if p]
+    if not parts:
+        return "<root>"
+    tail = parts[-1]
+    return tail.replace("_", " ").title()
+
+
+def _browser_root_items(self, context):
+    settings = getattr(getattr(context, "scene", None), "warno_import", None)
+    if settings is None:
+        return [("__none__", "<scan assets first>", "No roots", 0)]
+    folders = _asset_folders_from_cache(settings)
+    if not folders:
+        return [("__none__", "<scan assets first>", "No roots", 0)]
+    roots: List[str] = []
+    seen: set[str] = set()
+    for f in folders:
+        key = _folder_root_key(str(f.get("key", "")).strip())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        roots.append(key)
+    roots.sort()
+    out = []
+    for i, root in enumerate(roots):
+        out.append((root, _folder_root_label(root), root, i))
+    return out or [("__none__", "<scan assets first>", "No roots", 0)]
+
+
+def _browser_category_items(self, context):
+    settings = getattr(getattr(context, "scene", None), "warno_import", None)
+    if settings is None:
+        return [("__all__", "<all categories>", "No categories", 0)]
+    folders = _asset_folders_from_cache(settings)
+    if not folders:
+        return [("__all__", "<all categories>", "No categories", 0)]
+    root_key = str(getattr(self, "root_key", "") or "").strip().lower()
+    categories: List[str] = []
+    seen: set[str] = set()
+    for folder in folders:
+        key = str(folder.get("key", "")).strip().lower()
+        if not key:
+            continue
+        if root_key and root_key != "__none__":
+            if key != root_key and not key.startswith(root_key + "/"):
+                continue
+        cat = str(folder.get("category", "")).strip() or _asset_category_from_folder_key(key)
+        if not cat:
+            continue
+        cat_low = cat.lower()
+        if cat_low in seen:
+            continue
+        seen.add(cat_low)
+        categories.append(cat)
+    categories.sort(key=_asset_category_sort_key)
+    out = [("__all__", "<all categories>", "Show all categories", 0)]
+    for i, cat in enumerate(categories, start=1):
+        out.append((cat, cat, cat, i))
+    return out
+
+
+def _update_browser_root_key(self, context):
+    cat_items = _browser_category_items(self, context)
+    cat_valid = {str(it[0]) for it in cat_items if isinstance(it, (tuple, list)) and len(it) >= 1}
+    if str(getattr(self, "category_key", "") or "").strip() not in cat_valid:
+        self.category_key = "__all__"
+    items = _browser_folder_items(self, context)
+    if not items:
+        self.folder_key = "__none__"
+        return
+    valid = {str(it[0]) for it in items if isinstance(it, (tuple, list)) and len(it) >= 1}
+    if str(getattr(self, "folder_key", "") or "").strip() not in valid:
+        self.folder_key = str(items[0][0])
+
+
+def _update_browser_category_key(self, context):
+    items = _browser_folder_items(self, context)
+    if not items:
+        self.folder_key = "__none__"
+        return
+    valid = {str(it[0]) for it in items if isinstance(it, (tuple, list)) and len(it) >= 1}
+    if str(getattr(self, "folder_key", "") or "").strip() not in valid:
+        self.folder_key = str(items[0][0])
+
+
+def _update_browser_folder_key(self, context):
+    items = _browser_model_items(self, context)
+    if not items:
+        self.model_key = "__none__"
+        return
+    valid = {str(it[0]) for it in items if isinstance(it, (tuple, list)) and len(it) >= 1}
+    if str(getattr(self, "model_key", "") or "").strip() not in valid:
+        self.model_key = str(items[0][0])
+
+
+def _update_browser_search_text(self, context):
+    _update_browser_folder_key(self, context)
 
 
 def _asset_group_enum_items(self: "WARNOImporterSettings", _context):
@@ -1019,15 +1663,15 @@ def _sync_group_lod_from_selected(settings: "WARNOImporterSettings"):
         primary = str(g.get("primary", "")).strip()
         lods = [str(v).strip() for v in g.get("lods", []) if str(v).strip()]
         if sel == primary:
-            settings.selected_asset_group = primary
-            settings.selected_asset_lod = "__base__"
+            _safe_set_selected_asset_group(settings, primary)
+            _safe_set_selected_asset_lod(settings, "__base__")
             return
         if sel in lods:
-            settings.selected_asset_group = primary
-            settings.selected_asset_lod = sel
+            _safe_set_selected_asset_group(settings, primary)
+            _safe_set_selected_asset_lod(settings, sel)
             return
-    settings.selected_asset_group = str(groups[0].get("primary", "")).strip()
-    settings.selected_asset_lod = "__base__"
+    _safe_set_selected_asset_group(settings, str(groups[0].get("primary", "")).strip())
+    _safe_set_selected_asset_lod(settings, "__base__")
 
 
 def _update_selected_asset(self: "WARNOImporterSettings", _context):
@@ -1047,8 +1691,8 @@ def _update_selected_asset_group(self: "WARNOImporterSettings", _context):
     try:
         primary = str(self.selected_asset_group or "").strip()
         if primary and primary != "__none__":
-            self.selected_asset = primary
-            self.selected_asset_lod = "__base__"
+            _safe_set_selected_asset(self, primary)
+            _safe_set_selected_asset_lod(self, "__base__")
     finally:
         self.asset_sync_lock = False
 
@@ -1061,44 +1705,11 @@ def _update_selected_asset_lod(self: "WARNOImporterSettings", _context):
         lod = str(self.selected_asset_lod or "").strip()
         primary = str(self.selected_asset_group or "").strip()
         if lod and lod != "__base__":
-            self.selected_asset = lod
+            _safe_set_selected_asset(self, lod)
         elif primary and primary != "__none__":
-            self.selected_asset = primary
+            _safe_set_selected_asset(self, primary)
     finally:
         self.asset_sync_lock = False
-
-
-def _wheel_preset_enum_items(self: "WARNOImporterSettings", _context):
-    raw = str(self.track_preset_cache_json or "").strip()
-    if not raw:
-        return [("__none__", "<no presets>", "No saved presets", 0)]
-    try:
-        names = json.loads(raw)
-    except Exception:
-        names = []
-    if not isinstance(names, list) or not names:
-        return [("__none__", "<no presets>", "No saved presets", 0)]
-    out = []
-    for i, name in enumerate(names):
-        txt = str(name).strip()
-        if not txt:
-            continue
-        out.append((txt, txt, f"Track/wheel preset: {txt}", i))
-    if not out:
-        return [("__none__", "<no presets>", "No saved presets", 0)]
-    return out
-
-
-def _wheel_default_tuning() -> Dict[str, float]:
-    return {
-        "pair_dist_scale": 0.42,
-        "pair_edge_scale": 1.08,
-        "pair_target_ratio": 0.97,
-        "pair_min_pool_ratio": 0.60,
-        "pair_axial_scale": 1.15,
-        "pair_ring_min": 0.08,
-        "pair_ring_max": 1.08,
-    }
 
 
 class WARNOImporterSettings(PropertyGroup):
@@ -1124,16 +1735,32 @@ class WARNOImporterSettings(PropertyGroup):
     unit_ndfbin: StringProperty(name="Unit NDF", subtype="FILE_PATH", default="", options={"HIDDEN"})
     atlas_assets_dir: StringProperty(name="Atlas Assets", subtype="DIR_PATH", default="")
     tgv_converter: StringProperty(name="TGV Converter", subtype="FILE_PATH", default="tgv_to_png.py")
-    manual_texture_tool: StringProperty(
-        name="Manual Texture Tool",
+    modding_suite_atlas_wrapper: StringProperty(
+        name="ModdingSuite Atlas Wrapper",
         subtype="FILE_PATH",
-        default="manual_texture_corrector_cpp/build/Release/manual_texture_corrector.exe",
-        description="Path to external C++ manual texture correction tool",
+        default="modding_suite_atlas_export.py",
+        description="Wrapper script that exports Atlas metadata JSON via ModdingSuite",
     )
-    use_source_folder_for_textures: BoolProperty(
-        name="Use source folder for textures",
-        default=False,
-        description="For manual texture tool, use textures/<asset-path> source folder when available",
+    modding_suite_atlas_cli: StringProperty(
+        name="ModdingSuite Atlas CLI",
+        subtype="FILE_PATH",
+        default="moddingSuite/atlas_cli/moddingSuite.AtlasCli.exe",
+        description="Path to headless Atlas CLI executable (moddingSuite.AtlasCli.exe)",
+    )
+    use_atlas_json_mapping: BoolProperty(
+        name="Use Atlas JSON (ModdingSuite)",
+        default=True,
+        description="Resolve crop + naming from Atlas JSON exported by ModdingSuite wrapper",
+    )
+    atlas_json_strict: BoolProperty(
+        name="Atlas JSON strict mode",
+        default=True,
+        description="If enabled, unresolved Atlas JSON mappings fail without fallback guessing",
+    )
+    atlas_json_cache_subdir: StringProperty(
+        name="Atlas JSON cache",
+        default="atlas_json_cache",
+        description="Subfolder inside cache dir to store atlas JSON maps",
     )
     texture_subdir: StringProperty(name="Texture Subdir", default="textures")
     cache_dir: StringProperty(name="Cache Dir", subtype="DIR_PATH", default="output_blender")
@@ -1167,22 +1794,22 @@ class WARNOImporterSettings(PropertyGroup):
     asset_group_cache_json: StringProperty(default="[]", options={"HIDDEN"})
     asset_folder_cache_json: StringProperty(default="[]", options={"HIDDEN"})
     asset_sync_lock: BoolProperty(default=False, options={"HIDDEN"})
-    selected_asset: EnumProperty(
+    selected_asset: StringProperty(
         name="Asset",
         description="Asset path to import",
-        items=_asset_enum_items,
+        default="",
         update=_update_selected_asset,
     )
-    selected_asset_group: EnumProperty(
+    selected_asset_group: StringProperty(
         name="Main Asset",
         description="Main (base) asset",
-        items=_asset_group_enum_items,
+        default="__none__",
         update=_update_selected_asset_group,
     )
-    selected_asset_lod: EnumProperty(
+    selected_asset_lod: StringProperty(
         name="LOD Asset",
         description="LOD variant for selected main asset",
-        items=_asset_lod_enum_items,
+        default="__base__",
         update=_update_selected_asset_lod,
     )
     show_asset_lods: BoolProperty(
@@ -1194,6 +1821,21 @@ class WARNOImporterSettings(PropertyGroup):
         name="First Setup / Logs",
         default=False,
         description="Show initial setup (sources/deps) and logging controls",
+    )
+    show_project_section: BoolProperty(
+        name="Project",
+        default=True,
+        description="Show/hide project settings section",
+    )
+    show_textures_section: BoolProperty(
+        name="Textures",
+        default=True,
+        description="Show/hide textures section",
+    )
+    show_asset_picker_section: BoolProperty(
+        name="Asset Picker",
+        default=True,
+        description="Show/hide asset picker section",
     )
     show_import_options: BoolProperty(
         name="Import Options",
@@ -1207,17 +1849,19 @@ class WARNOImporterSettings(PropertyGroup):
         default=True,
         description="Resolve only exact refs and exact companion maps (faster, avoids long folder scans)",
     )
-    allow_group_texture_convert: BoolProperty(
-        name="Allow group texture convert",
-        default=False,
-        description="Allow folder-wide TGV conversion for ambiguous cases (slower)",
-    )
     texture_process_timeout_sec: IntProperty(
         name="Converter timeout (sec)",
         default=120,
         min=10,
         max=1800,
         description="Timeout for each converter process",
+    )
+    atlas_cli_timeout_sec: IntProperty(
+        name="Atlas CLI timeout (sec)",
+        default=45,
+        min=5,
+        max=600,
+        description="Timeout for headless atlas metadata export",
     )
     texture_stage_timeout_sec: IntProperty(
         name="Texture stage timeout (sec)",
@@ -1240,84 +1884,7 @@ class WARNOImporterSettings(PropertyGroup):
     auto_split_main_parts: BoolProperty(
         name="Auto split main parts",
         default=True,
-        description="Split chassis/track/turret/weapon (without road wheels)",
-    )
-    auto_split_wheels: BoolProperty(
-        name="Auto split wheels",
-        default=True,
-        description="Split road wheels into Roue_* objects",
-    )
-    auto_track_wheel_correction: BoolProperty(
-        name="Auto track/wheel correction",
-        default=True,
-        description="Auto-fix glued wheel faces using mirrored wheel heuristics",
-    )
-    track_fix_distance_scale: FloatProperty(
-        name="Distance scale",
-        default=0.42,
-        min=0.15,
-        max=1.25,
-        precision=3,
-        description="How far mirrored candidates can be from target wheel",
-    )
-    track_fix_edge_scale: FloatProperty(
-        name="Edge scale",
-        default=1.08,
-        min=1.0,
-        max=1.8,
-        precision=3,
-        description="Max allowed triangle edge size for correction candidates",
-    )
-    track_fix_target_ratio: FloatProperty(
-        name="Target fill",
-        default=0.97,
-        min=0.75,
-        max=1.0,
-        precision=3,
-        description="Desired wheel face count ratio versus mirrored side",
-    )
-    track_fix_min_pool_ratio: FloatProperty(
-        name="Min pool ratio",
-        default=0.60,
-        min=0.10,
-        max=1.0,
-        precision=3,
-        description="Minimum fraction of candidate faces required to apply correction",
-    )
-    track_fix_axial_scale: FloatProperty(
-        name="Axial limit",
-        default=1.15,
-        min=0.80,
-        max=2.0,
-        precision=3,
-        description="Thickness tolerance for moved faces around wheel axis",
-    )
-    track_fix_ring_min: FloatProperty(
-        name="Ring min",
-        default=0.08,
-        min=0.0,
-        max=0.6,
-        precision=3,
-        description="Minimum radial ratio (blocks hull-center wedges)",
-    )
-    track_fix_ring_max: FloatProperty(
-        name="Ring max",
-        default=1.08,
-        min=0.8,
-        max=1.5,
-        precision=3,
-        description="Maximum radial ratio for moved faces",
-    )
-    track_preset_name: StringProperty(
-        name="Preset Name",
-        default="LeopardFix",
-        description="Name for saving current track/wheel correction preset",
-    )
-    track_preset_cache_json: StringProperty(default="[]", options={"HIDDEN"})
-    selected_track_preset: EnumProperty(
-        name="Preset",
-        description="Saved track/wheel correction preset",
-        items=_wheel_preset_enum_items,
+        description="Split model by top-level bone groups, including wheels",
     )
     auto_name_parts: BoolProperty(
         name="Auto part naming",
@@ -1326,27 +1893,13 @@ class WARNOImporterSettings(PropertyGroup):
     )
     auto_name_materials: BoolProperty(name="Auto material naming", default=True)
     auto_pull_bones: BoolProperty(
-        name="Auto pull bones",
+        name="Auto pull bones (experimental)",
         default=False,
         description="Build helper armature from parsed bone names and parent imported parts to bones",
     )
 
-    tgv_split_mode: EnumProperty(
-        name="TGV split",
-        items=(
-            ("auto", "Auto", "Auto split channels"),
-            ("all", "All", "Save all channels"),
-            ("none", "None (better use with manual correcting)", "No channel split"),
-        ),
-        default="auto",
-    )
     # Deprecated: TGV mirroring is always OFF.
     tgv_mirror: BoolProperty(name="Mirror TGV", default=False, options={"HIDDEN"})
-    tgv_aggressive_split: BoolProperty(
-        name="Aggressive split",
-        default=False,
-        description="Use stronger packed-part split detection (can over-split track strips)",
-    )
     auto_rename_textures: BoolProperty(
         name="Auto texture naming",
         default=True,
@@ -1356,6 +1909,15 @@ class WARNOImporterSettings(PropertyGroup):
         name="AO multiply with diffuse",
         default=True,
         description="If enabled, AO is multiplied into Base Color; otherwise AO texture stays unconnected",
+    )
+    normal_invert_mode: EnumProperty(
+        name="Normal invert",
+        items=(
+            ("none", "None", "Use normal map as-is"),
+            ("invert_green", "Invert Green (Y)", "Invert green channel before Normal Map node"),
+            ("invert_rgb", "Invert RGB", "Invert all RGB channels before Normal Map node"),
+        ),
+        default="none",
     )
     log_to_file: BoolProperty(
         name="Log to file",
@@ -1367,12 +1929,6 @@ class WARNOImporterSettings(PropertyGroup):
         default="warno_import.log",
         description="Log file name in project root",
     )
-    open_console_on_import: BoolProperty(
-        name="Open System Console on import",
-        default=False,
-        description="Open Blender system console before import to watch live logs",
-    )
-
     # Deprecated: rotations are fixed to zero in import flow.
     rotate_x: FloatProperty(name="Rotate X", default=0.0, options={"HIDDEN"})
     rotate_y: FloatProperty(name="Rotate Y", default=0.0, options={"HIDDEN"})
@@ -1385,8 +1941,27 @@ class WARNOImporterSettings(PropertyGroup):
     auto_smooth_angle: FloatProperty(name="Smooth angle", default=30.0, min=0.0, max=180.0)
     last_texture_dir: StringProperty(name="Last texture dir", subtype="DIR_PATH", default="", options={"HIDDEN"})
     last_import_collection: StringProperty(name="Last import collection", default="", options={"HIDDEN"})
+    startup_state_restored: BoolProperty(default=False, options={"HIDDEN"})
 
     status: StringProperty(name="Status", default="")
+
+
+FIXED_MERGE_DISTANCE = 0.0001
+FIXED_AUTO_SMOOTH_ANGLE = 30.0
+
+
+def _enforce_fixed_runtime_defaults(settings: WARNOImporterSettings) -> None:
+    settings.use_atlas_json_mapping = True
+    settings.atlas_json_strict = True
+    settings.auto_textures = True
+    settings.auto_rename_textures = True
+    settings.fast_exact_texture_resolve = True
+    settings.use_zz_dat_source = True
+    settings.use_merge_by_distance = True
+    settings.use_ao_multiply = False
+    settings.normal_invert_mode = "none"
+    settings.merge_distance = float(FIXED_MERGE_DISTANCE)
+    settings.auto_smooth_angle = float(FIXED_AUTO_SMOOTH_ANGLE)
 
 
 def _load_config_into_settings(settings: WARNOImporterSettings, path: Path) -> tuple[bool, str]:
@@ -1427,10 +2002,18 @@ def _load_config_into_settings(settings: WARNOImporterSettings, path: Path) -> t
     settings.project_root = get_text("project_root", settings.project_root) or settings.project_root
     settings.atlas_assets_dir = get_text("atlas_assets_dir", settings.atlas_assets_dir)
     settings.tgv_converter = get_text("tgv_converter", settings.tgv_converter) or "tgv_to_png.py"
-    settings.manual_texture_tool = get_text("manual_texture_tool", settings.manual_texture_tool) or settings.manual_texture_tool
-    settings.use_source_folder_for_textures = get_bool(
-        "use_source_folder_for_textures",
-        settings.use_source_folder_for_textures,
+    settings.modding_suite_atlas_wrapper = get_text(
+        "modding_suite_atlas_wrapper",
+        settings.modding_suite_atlas_wrapper,
+    ) or "modding_suite_atlas_export.py"
+    settings.modding_suite_atlas_cli = get_text(
+        "modding_suite_atlas_cli",
+        settings.modding_suite_atlas_cli,
+    ) or "moddingSuite/atlas_cli/moddingSuite.AtlasCli.exe"
+    settings.use_atlas_json_mapping = get_bool("use_atlas_json_mapping", settings.use_atlas_json_mapping)
+    settings.atlas_json_strict = get_bool("atlas_json_strict", settings.atlas_json_strict)
+    settings.atlas_json_cache_subdir = (
+        get_text("atlas_json_cache_subdir", settings.atlas_json_cache_subdir) or "atlas_json_cache"
     )
     settings.texture_subdir = "textures"
     settings.cache_dir = get_text("cache_dir", settings.cache_dir) or settings.cache_dir
@@ -1441,9 +2024,12 @@ def _load_config_into_settings(settings: WARNOImporterSettings, path: Path) -> t
 
     settings.auto_textures = get_bool("auto_textures", settings.auto_textures)
     settings.fast_exact_texture_resolve = get_bool("fast_exact_texture_resolve", settings.fast_exact_texture_resolve)
-    settings.allow_group_texture_convert = get_bool("allow_group_texture_convert", settings.allow_group_texture_convert)
     try:
         settings.texture_process_timeout_sec = int(raw.get("texture_process_timeout_sec", settings.texture_process_timeout_sec))
+    except Exception:
+        pass
+    try:
+        settings.atlas_cli_timeout_sec = int(raw.get("atlas_cli_timeout_sec", settings.atlas_cli_timeout_sec))
     except Exception:
         pass
     try:
@@ -1453,48 +2039,30 @@ def _load_config_into_settings(settings: WARNOImporterSettings, path: Path) -> t
     settings.auto_install_tgv_deps = get_bool("auto_install_tgv_deps", settings.auto_install_tgv_deps)
     settings.tgv_deps_dir = get_text("tgv_deps_dir", settings.tgv_deps_dir) or ".warno_pydeps"
     settings.auto_split_main_parts = get_bool("auto_split_main_parts", get_bool("split_bone_parts", settings.auto_split_main_parts))
-    settings.auto_split_wheels = get_bool("auto_split_wheels", settings.auto_split_wheels)
-    settings.auto_track_wheel_correction = get_bool("auto_track_wheel_correction", settings.auto_track_wheel_correction)
-    settings.track_fix_distance_scale = get_float("track_fix_distance_scale", settings.track_fix_distance_scale)
-    settings.track_fix_edge_scale = get_float("track_fix_edge_scale", settings.track_fix_edge_scale)
-    settings.track_fix_target_ratio = get_float("track_fix_target_ratio", settings.track_fix_target_ratio)
-    settings.track_fix_min_pool_ratio = get_float("track_fix_min_pool_ratio", settings.track_fix_min_pool_ratio)
-    settings.track_fix_axial_scale = get_float("track_fix_axial_scale", settings.track_fix_axial_scale)
-    settings.track_fix_ring_min = get_float("track_fix_ring_min", settings.track_fix_ring_min)
-    settings.track_fix_ring_max = get_float("track_fix_ring_max", settings.track_fix_ring_max)
-    settings.track_preset_name = get_text("track_preset_name", settings.track_preset_name) or settings.track_preset_name
-    selected_preset = get_text("track_selected_preset", settings.selected_track_preset)
-    if selected_preset:
-        try:
-            settings.selected_track_preset = selected_preset
-        except Exception:
-            pass
     settings.auto_name_parts = get_bool("auto_name_parts", settings.auto_name_parts)
     settings.auto_name_materials = get_bool("auto_name_materials", settings.auto_name_materials)
     settings.auto_pull_bones = get_bool("auto_pull_bones", settings.auto_pull_bones)
     settings.use_merge_by_distance = get_bool("fbx_use_merge_by_distance", settings.use_merge_by_distance)
     settings.merge_distance = get_float("fbx_merge_distance", settings.merge_distance)
     settings.auto_smooth_angle = get_float("fbx_auto_smooth_angle", settings.auto_smooth_angle)
-
-    settings.tgv_split_mode = get_text("tgv_split_mode", settings.tgv_split_mode) or settings.tgv_split_mode
-    if settings.tgv_split_mode not in {"auto", "all", "none"}:
-        settings.tgv_split_mode = "auto"
     settings.tgv_mirror = False
-    settings.tgv_aggressive_split = get_bool("tgv_aggressive_split", settings.tgv_aggressive_split)
     settings.auto_rename_textures = get_bool("auto_rename_textures", settings.auto_rename_textures)
     settings.use_ao_multiply = get_bool("ao_multiply_diffuse", settings.use_ao_multiply)
+    settings.normal_invert_mode = get_text("normal_invert_mode", settings.normal_invert_mode) or settings.normal_invert_mode
+    if settings.normal_invert_mode not in {"none", "invert_green", "invert_rgb"}:
+        settings.normal_invert_mode = "none"
     settings.log_to_file = get_bool("log_to_file", settings.log_to_file)
     settings.log_file_name = get_text("log_file_name", settings.log_file_name) or "warno_import.log"
-    settings.open_console_on_import = get_bool("open_console_on_import", settings.open_console_on_import)
-
     settings.rotate_x = 0.0
     settings.rotate_y = 0.0
     settings.rotate_z = 0.0
     settings.mirror_y = True
+    _enforce_fixed_runtime_defaults(settings)
     return True, f"Loaded: {path}"
 
 
 def _save_settings_to_config(settings: WARNOImporterSettings, path: Path) -> tuple[bool, str]:
+    _enforce_fixed_runtime_defaults(settings)
     raw: dict[str, Any] = {}
     if path.exists() and path.is_file():
         try:
@@ -1509,8 +2077,11 @@ def _save_settings_to_config(settings: WARNOImporterSettings, path: Path) -> tup
     raw["skeleton_spk"] = settings.skeleton_spk
     raw["atlas_assets_dir"] = settings.atlas_assets_dir
     raw["tgv_converter"] = str(settings.tgv_converter or "tgv_to_png.py")
-    raw["manual_texture_tool"] = settings.manual_texture_tool
-    raw["use_source_folder_for_textures"] = bool(settings.use_source_folder_for_textures)
+    raw["modding_suite_atlas_wrapper"] = str(settings.modding_suite_atlas_wrapper or "modding_suite_atlas_export.py")
+    raw["modding_suite_atlas_cli"] = str(settings.modding_suite_atlas_cli or "moddingSuite/atlas_cli/moddingSuite.AtlasCli.exe")
+    raw["use_atlas_json_mapping"] = bool(settings.use_atlas_json_mapping)
+    raw["atlas_json_strict"] = bool(settings.atlas_json_strict)
+    raw["atlas_json_cache_subdir"] = str(settings.atlas_json_cache_subdir or "atlas_json_cache")
     raw["texture_subdir"] = "textures"
     raw["cache_dir"] = settings.cache_dir
     raw["use_zz_dat_source"] = bool(settings.use_zz_dat_source)
@@ -1520,40 +2091,24 @@ def _save_settings_to_config(settings: WARNOImporterSettings, path: Path) -> tup
 
     raw["auto_textures"] = bool(settings.auto_textures)
     raw["fast_exact_texture_resolve"] = bool(settings.fast_exact_texture_resolve)
-    raw["allow_group_texture_convert"] = bool(settings.allow_group_texture_convert)
     raw["texture_process_timeout_sec"] = int(settings.texture_process_timeout_sec)
+    raw["atlas_cli_timeout_sec"] = int(settings.atlas_cli_timeout_sec)
     raw["texture_stage_timeout_sec"] = int(settings.texture_stage_timeout_sec)
     raw["auto_install_tgv_deps"] = bool(settings.auto_install_tgv_deps)
     raw["tgv_deps_dir"] = str(settings.tgv_deps_dir or ".warno_pydeps")
     raw["auto_split_main_parts"] = bool(settings.auto_split_main_parts)
-    raw["auto_split_wheels"] = bool(settings.auto_split_wheels)
-    raw["auto_track_wheel_correction"] = bool(settings.auto_track_wheel_correction)
-    raw["track_fix_distance_scale"] = float(settings.track_fix_distance_scale)
-    raw["track_fix_edge_scale"] = float(settings.track_fix_edge_scale)
-    raw["track_fix_target_ratio"] = float(settings.track_fix_target_ratio)
-    raw["track_fix_min_pool_ratio"] = float(settings.track_fix_min_pool_ratio)
-    raw["track_fix_axial_scale"] = float(settings.track_fix_axial_scale)
-    raw["track_fix_ring_min"] = float(settings.track_fix_ring_min)
-    raw["track_fix_ring_max"] = float(settings.track_fix_ring_max)
-    raw["track_preset_name"] = str(settings.track_preset_name or "").strip()
-    raw["track_selected_preset"] = str(settings.selected_track_preset or "").strip()
     raw["auto_name_parts"] = bool(settings.auto_name_parts)
     raw["auto_name_materials"] = bool(settings.auto_name_materials)
     raw["auto_pull_bones"] = bool(settings.auto_pull_bones)
-    raw["tgv_split_mode"] = str(settings.tgv_split_mode)
-    raw.pop("tgv_mirror", None)
-    raw["tgv_aggressive_split"] = bool(settings.tgv_aggressive_split)
     raw["auto_rename_textures"] = bool(settings.auto_rename_textures)
     raw["ao_multiply_diffuse"] = bool(settings.use_ao_multiply)
+    raw["normal_invert_mode"] = str(settings.normal_invert_mode or "none")
     raw["log_to_file"] = bool(settings.log_to_file)
     raw["log_file_name"] = str(settings.log_file_name or "warno_import.log")
-    raw["open_console_on_import"] = bool(settings.open_console_on_import)
-
     raw["rotate_x"] = 0.0
     raw["rotate_y"] = 0.0
     raw["rotate_z"] = 0.0
     raw["mirror_y"] = True
-    raw.pop("unit_ndfbin", None)
     raw["fbx_use_merge_by_distance"] = bool(settings.use_merge_by_distance)
     raw["fbx_merge_distance"] = float(settings.merge_distance)
     raw["fbx_auto_smooth_angle"] = float(settings.auto_smooth_angle)
@@ -1575,123 +2130,6 @@ def _all_tris(indices: Sequence[int]) -> List[Tuple[int, int, int]]:
     return out
 
 
-def _is_wheel_name(name: str) -> bool:
-    return _norm_low(name).startswith("roue_")
-
-
-def _split_groups_for_options(
-    groups: Sequence[Tuple[str, List[Tuple[int, int, int]]]],
-    fallback_name: str,
-    split_main_parts: bool,
-    split_wheels: bool,
-) -> List[Tuple[str, List[Tuple[int, int, int]]]]:
-    merged: Dict[str, List[Tuple[int, int, int]]] = {}
-
-    if not groups:
-        return [(fallback_name, [])]
-    if not split_main_parts and not split_wheels:
-        all_faces: List[Tuple[int, int, int]] = []
-        for _, tris in groups:
-            all_faces.extend(tris)
-        return [("MainBody", all_faces)]
-
-    for raw_name, tris in groups:
-        if not tris:
-            continue
-        name = str(raw_name or fallback_name).strip() or fallback_name
-        wheel = _is_wheel_name(name)
-        target = name
-        if split_main_parts and not split_wheels and wheel:
-            target = "Chassis"
-        elif split_wheels and not split_main_parts and not wheel:
-            target = "MainBody"
-        merged.setdefault(target, []).extend(tris)
-
-    if not merged:
-        return [(fallback_name, [])]
-    return sorted(merged.items(), key=lambda kv: kv[0].lower())
-
-
-def _wheel_tuning_payload(settings: WARNOImporterSettings) -> Dict[str, Any]:
-    return {
-        "enabled": bool(settings.auto_track_wheel_correction),
-        "pair_dist_scale": float(settings.track_fix_distance_scale),
-        "pair_edge_scale": float(settings.track_fix_edge_scale),
-        "pair_target_ratio": float(settings.track_fix_target_ratio),
-        "pair_min_pool_ratio": float(settings.track_fix_min_pool_ratio),
-        "pair_axial_scale": float(settings.track_fix_axial_scale),
-        "pair_ring_min": float(settings.track_fix_ring_min),
-        "pair_ring_max": float(settings.track_fix_ring_max),
-    }
-
-
-def _apply_wheel_tuning_to_settings(settings: WARNOImporterSettings, tuning: Dict[str, Any]) -> None:
-    defaults = _wheel_default_tuning()
-    settings.track_fix_distance_scale = float(tuning.get("pair_dist_scale", defaults["pair_dist_scale"]))
-    settings.track_fix_edge_scale = float(tuning.get("pair_edge_scale", defaults["pair_edge_scale"]))
-    settings.track_fix_target_ratio = float(tuning.get("pair_target_ratio", defaults["pair_target_ratio"]))
-    settings.track_fix_min_pool_ratio = float(tuning.get("pair_min_pool_ratio", defaults["pair_min_pool_ratio"]))
-    settings.track_fix_axial_scale = float(tuning.get("pair_axial_scale", defaults["pair_axial_scale"]))
-    settings.track_fix_ring_min = float(tuning.get("pair_ring_min", defaults["pair_ring_min"]))
-    settings.track_fix_ring_max = float(tuning.get("pair_ring_max", defaults["pair_ring_max"]))
-
-
-def _read_wheel_presets(settings: WARNOImporterSettings) -> Dict[str, Dict[str, float]]:
-    path = _wheel_preset_path(settings)
-    if not path.exists() or not path.is_file():
-        return {}
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8-sig"))
-    except Exception:
-        return {}
-    if not isinstance(raw, dict):
-        return {}
-    presets = raw.get("presets", raw)
-    if not isinstance(presets, dict):
-        return {}
-    out: Dict[str, Dict[str, float]] = {}
-    for key, val in presets.items():
-        name = str(key).strip()
-        if not name or not isinstance(val, dict):
-            continue
-        out[name] = {
-            "pair_dist_scale": float(val.get("pair_dist_scale", _wheel_default_tuning()["pair_dist_scale"])),
-            "pair_edge_scale": float(val.get("pair_edge_scale", _wheel_default_tuning()["pair_edge_scale"])),
-            "pair_target_ratio": float(val.get("pair_target_ratio", _wheel_default_tuning()["pair_target_ratio"])),
-            "pair_min_pool_ratio": float(val.get("pair_min_pool_ratio", _wheel_default_tuning()["pair_min_pool_ratio"])),
-            "pair_axial_scale": float(val.get("pair_axial_scale", _wheel_default_tuning()["pair_axial_scale"])),
-            "pair_ring_min": float(val.get("pair_ring_min", _wheel_default_tuning()["pair_ring_min"])),
-            "pair_ring_max": float(val.get("pair_ring_max", _wheel_default_tuning()["pair_ring_max"])),
-        }
-    return out
-
-
-def _write_wheel_presets(settings: WARNOImporterSettings, presets: Dict[str, Dict[str, float]]) -> tuple[bool, str]:
-    path = _wheel_preset_path(settings)
-    payload = {
-        "version": 1,
-        "presets": presets,
-    }
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as exc:
-        return False, f"Preset save failed: {exc}"
-    return True, f"Presets saved: {path}"
-
-
-def _refresh_wheel_preset_cache(settings: WARNOImporterSettings) -> None:
-    presets = _read_wheel_presets(settings)
-    names = sorted(presets.keys(), key=lambda x: x.lower())
-    settings.track_preset_cache_json = json.dumps(names, ensure_ascii=False)
-    cur = str(settings.selected_track_preset or "").strip()
-    if names:
-        if cur not in names:
-            settings.selected_track_preset = names[0]
-    else:
-        settings.selected_track_preset = "__none__"
-
-
 def _build_bone_payload(
     extractor_mod,
     spk,
@@ -1703,26 +2141,46 @@ def _build_bone_payload(
     skeleton_spks,
     unit_ndf_hints,
 ) -> dict[str, Any]:
+    _ = unit_ndf_hints
     mesh_node_index = int(meta.get("nodeIndex", -1))
     mesh_bone_names: List[str] = []
     external_bone_names: List[str] = []
-    source_name_lists: Dict[str, List[str]] = {}
-    external_sets: List[Tuple[str, List[str]]] = []
     bone_names: List[str] = []
-    inferred_wheel_names: List[str] = []
     bone_name_by_index: Dict[int, str] = {}
+    bone_parent_by_index: Dict[int, int] = {}
     bone_name_source = "none"
-    ndf_hint_bones: List[str] = []
-    ndf_hint_source = "none"
-    ndf_hint_error = ""
+
+    candidates: List[Dict[str, Any]] = []
+
+    def _add_candidate(source: str, parser_obj: Any, node_idx: int) -> None:
+        if int(node_idx) < 0:
+            return
+        try:
+            names = list(parser_obj.parse_node_names(int(node_idx)))
+        except Exception:
+            names = []
+        if not names:
+            return
+        try:
+            parents = list(parser_obj.parse_node_parent_indices(int(node_idx)))
+        except Exception:
+            parents = []
+        if len(parents) < len(names):
+            parents = [int(x) for x in parents] + [-1] * (len(names) - len(parents))
+        elif len(parents) > len(names):
+            parents = [int(x) for x in parents[: len(names)]]
+        candidates.append(
+            {
+                "source": str(source),
+                "names": [str(x) for x in names],
+                "parents": [int(x) for x in parents],
+            }
+        )
 
     if mesh_node_index >= 0:
-        try:
-            mesh_bone_names = spk.parse_node_names(mesh_node_index)
-        except Exception:
-            mesh_bone_names = []
-    if mesh_bone_names:
-        source_name_lists["mesh"] = list(mesh_bone_names)
+        _add_candidate("mesh", spk, mesh_node_index)
+    if candidates:
+        mesh_bone_names = list(candidates[0].get("names", []))
 
     if skeleton_spks is None:
         skeleton_spk_list: List[Any] = []
@@ -1731,136 +2189,99 @@ def _build_bone_payload(
     else:
         skeleton_spk_list = [skeleton_spks]
 
-    if skeleton_spk_list:
-        used_ext_indices: set[str] = set()
-        used_ext_signatures: set[tuple[str, str]] = set()
-
-        def add_external_set(source_name: str, spk_key: str, node_idx: int, skeleton_spk) -> None:
-            if node_idx < 0:
-                return
-            nidx = int(node_idx)
-            uniq_idx = f"{spk_key}:{nidx}"
-            if uniq_idx in used_ext_indices:
-                return
-            used_ext_indices.add(uniq_idx)
-            try:
-                names = skeleton_spk.parse_node_names(nidx)
-            except Exception:
-                names = []
-            if not names:
-                return
-            sig = "\x1f".join(str(n).strip().lower() for n in names if str(n).strip())
-            sig_key = (spk_key, sig)
-            if not sig or sig_key in used_ext_signatures:
-                return
-            used_ext_signatures.add(sig_key)
-            external_sets.append((source_name, list(names)))
-            source_name_lists[source_name] = list(names)
-
-        for sk_i, skeleton_spk in enumerate(skeleton_spk_list):
-            try:
-                spk_key = str(getattr(skeleton_spk, "path", f"skeleton_{sk_i}")).lower()
-            except Exception:
-                spk_key = f"skeleton_{sk_i}"
-
-            # Primary: same hierarchical node index from mesh dictionary.
-            add_external_set(f"external_same_index_{sk_i}", spk_key, mesh_node_index, skeleton_spk)
-
-            # Secondary fallback: best path match in external Skeleton SPK FAT.
-            skeleton_hit = skeleton_spk.find_best_fat_entry_for_asset(asset)
-            if skeleton_hit is not None:
-                _, sk_meta = skeleton_hit
-                sk_node_idx = int(sk_meta.get("nodeIndex", -1))
-                add_external_set(f"external_asset_match_{sk_i}", spk_key, sk_node_idx, skeleton_spk)
-
-        for _, names in external_sets:
-            external_bone_names.extend([str(n) for n in names if str(n).strip()])
-        if external_bone_names:
-            external_bone_names = extractor_mod.unique_keep_order(external_bone_names)
-
-    candidates: List[Tuple[str, Dict[int, str]]] = []
-    if mesh_bone_names:
-        candidates.append(("mesh", extractor_mod.map_bone_index_names(mesh_bone_names)))
-    for src_name, names in external_sets:
-        if names:
-            candidates.append((src_name, extractor_mod.map_bone_index_names(names)))
-
-    best_score = -10_000
-    for src, cmap in candidates:
+    for sk_i, skeleton_spk in enumerate(skeleton_spk_list):
         try:
-            score = extractor_mod.score_bone_name_map(model, cmap, material_role_by_id)
+            sk_hit = skeleton_spk.find_best_fat_entry_for_asset(asset)
         except Exception:
-            score = -10_000
-        if score > best_score:
-            best_score = score
-            bone_name_source = src
-            bone_name_by_index = dict(cmap)
+            sk_hit = None
+        if sk_hit is not None:
+            _, sk_meta = sk_hit
+            _add_candidate(f"external_asset_match_{sk_i}", skeleton_spk, int(sk_meta.get("nodeIndex", -1)))
+        _add_candidate(f"external_same_index_{sk_i}", skeleton_spk, mesh_node_index)
 
-    if bone_name_by_index and candidates:
-        merged = dict(bone_name_by_index)
-        for src, cmap in candidates:
-            if src == bone_name_source:
+    if len(candidates) > 1:
+        ext_vals: List[str] = []
+        for cand in candidates[1:]:
+            ext_vals.extend([str(n) for n in cand.get("names", []) if str(n).strip()])
+        if ext_vals:
+            external_bone_names = extractor_mod.unique_keep_order(ext_vals)
+
+    selected: Dict[str, Any] | None = None
+    for cand in candidates:
+        names = [str(n) for n in cand.get("names", [])]
+        if any(str(n).strip() for n in names):
+            selected = cand
+            break
+
+    if selected is not None:
+        bone_name_source = str(selected.get("source", "none"))
+        primary_raw_names = [str(n) for n in selected.get("names", [])]
+        raw_names = list(primary_raw_names)
+        bone_names = [str(n).strip() for n in primary_raw_names if str(n).strip()]
+        for bidx, raw_name in enumerate(raw_names):
+            name_text = str(raw_name or "").strip()
+            if not name_text:
                 continue
-            for bidx, nm in cmap.items():
-                if bidx not in merged and nm:
-                    merged[int(bidx)] = str(nm)
-        bone_name_by_index = merged
+            if hasattr(extractor_mod, "sanitize_material_name"):
+                try:
+                    safe_name = str(extractor_mod.sanitize_material_name(name_text) or name_text).strip()
+                except Exception:
+                    safe_name = name_text
+            else:
+                safe_name = name_text
+            if not safe_name:
+                continue
+            bone_name_by_index[int(bidx)] = safe_name
+        primary_parents = [int(x) for x in selected.get("parents", [])]
 
-    if bone_name_by_index:
-        try:
-            inferred = extractor_mod.infer_missing_wheel_bone_names(model, bone_name_by_index, rot)
-        except Exception:
-            inferred = {}
-        if inferred:
-            bone_name_by_index.update(inferred)
-            inferred_wheel_names = extractor_mod.unique_keep_order([str(v) for v in inferred.values() if str(v).strip()])
+        # Secondary source merge: fill only missing names/parents on same indices.
+        for cand in candidates:
+            if cand is selected:
+                continue
+            cand_names = [str(n) for n in cand.get("names", [])]
+            for bidx, raw_name in enumerate(cand_names):
+                if int(bidx) in bone_name_by_index:
+                    continue
+                name_text = str(raw_name or "").strip()
+                if not name_text:
+                    continue
+                if hasattr(extractor_mod, "sanitize_material_name"):
+                    try:
+                        safe_name = str(extractor_mod.sanitize_material_name(name_text) or name_text).strip()
+                    except Exception:
+                        safe_name = name_text
+                else:
+                    safe_name = name_text
+                if not safe_name:
+                    continue
+                bone_name_by_index[int(bidx)] = safe_name
+                bone_names.append(name_text)
 
-    if bone_name_source == "mesh":
-        bone_names = list(mesh_bone_names)
-    elif bone_name_source in source_name_lists:
-        bone_names = list(source_name_lists[bone_name_source])
-    else:
-        bone_names = extractor_mod.unique_keep_order([*mesh_bone_names, *external_bone_names])
-    if inferred_wheel_names:
-        bone_names = extractor_mod.unique_keep_order([*bone_names, *inferred_wheel_names])
+        def _parent_for_index(bidx: int) -> int:
+            if 0 <= int(bidx) < len(primary_parents):
+                parent_idx = int(primary_parents[int(bidx)])
+                if parent_idx >= 0:
+                    return parent_idx
+            for cand in candidates:
+                if cand is selected:
+                    continue
+                cand_parents = [int(x) for x in cand.get("parents", [])]
+                if 0 <= int(bidx) < len(cand_parents):
+                    parent_idx = int(cand_parents[int(bidx)])
+                    if parent_idx >= 0:
+                        return parent_idx
+            return -1
 
-    if unit_ndf_hints is not None:
-        try:
-            hint_payload = unit_ndf_hints.hints_for_asset(asset)
-        except Exception as exc:
-            hint_payload = {"source": "none", "error": str(exc), "bones": []}
-        ndf_hint_source = str(hint_payload.get("source", "none")).strip() or "none"
-        ndf_hint_error = str(hint_payload.get("error", "")).strip()
-        raw_hint_bones = hint_payload.get("bones", [])
-        if isinstance(raw_hint_bones, list):
-            for raw_hint in raw_hint_bones:
-                nm = extractor_mod.normalize_bone_label(str(raw_hint))
-                if nm:
-                    ndf_hint_bones.append(extractor_mod.sanitize_material_name(nm))
-        ndf_hint_bones = extractor_mod.unique_keep_order(ndf_hint_bones)
+        for bidx in bone_name_by_index.keys():
+            bone_parent_by_index[int(bidx)] = _parent_for_index(int(bidx))
 
-        if ndf_hint_bones and not bone_names:
-            bone_names = ndf_hint_bones
-            bone_name_source = "ndf"
-        elif ndf_hint_bones:
-            critical = [
-                n
-                for n in ndf_hint_bones
-                if (
-                    n.lower() in {"chassis", "hull"}
-                    or n.lower().startswith("base_tourelle")
-                    or n.lower().startswith("fx_tourelle")
-                )
-            ]
-            if critical:
-                bone_names = extractor_mod.unique_keep_order([*bone_names, *critical])
+        if hasattr(extractor_mod, "unique_keep_order"):
+            try:
+                bone_names = [str(x) for x in extractor_mod.unique_keep_order(bone_names)]
+            except Exception:
+                pass
 
     bone_centers_by_index = extractor_mod.estimate_bone_centers_by_index(model, bone_name_by_index, rot)
-    raw_names_for_centers = (
-        list(source_name_lists.get(bone_name_source, []))
-        if source_name_lists.get(bone_name_source, [])
-        else bone_names
-    )
     bone_positions: Dict[str, List[float]] = {}
 
     def register(name: str, pos: Tuple[float, float, float]) -> None:
@@ -1877,26 +2298,18 @@ def _build_bone_payload(
         mapped_name = bone_name_by_index.get(int(bidx))
         if mapped_name:
             register(mapped_name, pos)
-        if 0 <= int(bidx) < len(raw_names_for_centers):
-            register(raw_names_for_centers[int(bidx)], pos)
-
-    if ndf_hint_bones and "chassis" in {n.lower() for n in ndf_hint_bones} and "chassis" not in bone_positions:
-        for alias in ("chassisfake", "chassisarmaturefake", "base"):
-            hit = bone_positions.get(alias)
-            if hit:
-                bone_positions["chassis"] = list(hit)
-                break
 
     return {
         "bone_name_by_index": bone_name_by_index,
+        "bone_parent_by_index": bone_parent_by_index,
         "bone_names": bone_names,
         "bone_positions": bone_positions,
         "bone_name_source": bone_name_source,
         "mesh_bone_names": mesh_bone_names,
         "external_bone_names": external_bone_names,
-        "ndf_hint_bones": ndf_hint_bones,
-        "ndf_hint_source": ndf_hint_source,
-        "ndf_hint_error": ndf_hint_error,
+        "ndf_hint_bones": [],
+        "ndf_hint_source": "disabled",
+        "ndf_hint_error": "",
     }
 
 
@@ -1912,7 +2325,7 @@ def _channel_hint_from_stem(stem: str) -> str | None:
         return None
     if "normal_reconstructed" in low or low.endswith("_nm") or "normal" in low:
         return "normal"
-    if low.endswith("_ao") or "occlusion" in low:
+    if low.endswith("_o") or low.endswith("_ao") or "occlusion" in low:
         return "occlusion"
     if low.endswith("_roughness") or low.endswith("_r") or "roughness" in low:
         return "roughness"
@@ -1942,6 +2355,110 @@ def _asset_atlas_ref_dir_candidates(extractor_mod, asset: str) -> List[str]:
         if parent2:
             out.append(parent2)
     return list(dict.fromkeys(out))
+
+
+def _atlas_map_no_entries_error(text: str) -> bool:
+    low = _norm_low(text)
+    if not low:
+        return False
+    return ("atlas_cli_no_entries" in low) or ("no entries for asset" in low)
+
+
+def _atlas_asset_variant_candidates(asset: str) -> List[str]:
+    raw = str(asset or "").replace("\\", "/").strip()
+    if not raw:
+        return []
+    p = PurePosixPath(raw)
+    parent = str(p.parent).strip("/")
+    stem = str(p.stem or "").strip()
+    suffix = str(p.suffix or ".fbx")
+    if not stem:
+        return [raw]
+    tokens = [t for t in stem.split("_") if t]
+    if not tokens:
+        return [raw]
+
+    candidates: List[str] = [raw]
+    known_tail = {"l", "r", "left", "right", "dest", "destroyed", "damaged", "wreck"}
+    cur = list(tokens)
+    while len(cur) > 1 and _norm_low(cur[-1]) in known_tail:
+        cur = cur[:-1]
+        cand_stem = "_".join(cur)
+        if parent:
+            candidates.append(f"{parent}/{cand_stem}{suffix}")
+        else:
+            candidates.append(f"{cand_stem}{suffix}")
+
+    return list(dict.fromkeys(candidates))
+
+
+def _build_strict_grouped_maps(
+    resolved_items: Sequence[Dict[str, Any]],
+    extractor_mod: Any | None = None,
+) -> Dict[str, Dict[str, Any]]:
+    wanted = {"diffuse", "normal", "roughness", "metallic", "occlusion", "alpha", "orm"}
+    groups: Dict[str, Dict[str, Any]] = {}
+
+    def _group_key(item: Dict[str, Any], out_png: Path) -> str:
+        raw = str(item.get("atlas_target_basename", "") or "").strip() or out_png.stem
+        return _norm_low(_strip_texture_channel_suffix(raw) or raw)
+
+    def _add(group: Dict[str, Any], channel: str, path: Path | None, score: float) -> None:
+        if channel not in wanted or path is None:
+            return
+        if not path.exists() or not path.is_file():
+            return
+        best = group.setdefault("best", {})
+        cur = best.get(channel)
+        if cur is None or float(score) > float(cur[0]):
+            best[channel] = (float(score), path)
+
+    for idx, item in enumerate(resolved_items):
+        out_raw = item.get("out_png")
+        out_png = Path(out_raw) if out_raw else None
+        if out_png is None:
+            continue
+        gk = _group_key(item, out_png)
+        if not gk:
+            continue
+        group = groups.setdefault(
+            gk,
+            {
+                "is_track": _strict_atlas_item_is_track(item, extractor_mod=extractor_mod),
+                "best": {},
+                "count": 0,
+                "sample_name": str(item.get("atlas_target_basename", "") or out_png.stem),
+            },
+        )
+        group["count"] = int(group.get("count", 0)) + 1
+        channel = _strict_atlas_item_channel(item, extractor_mod=extractor_mod)
+        base_score = 1000.0 - float(idx)
+        _add(group, channel, out_png, base_score)
+        extras = item.get("extras", {})
+        if isinstance(extras, dict):
+            for ek, ev in extras.items():
+                p = Path(ev)
+                token = f"{str(ek or '')} {p.stem}"
+                hint = _channel_hint_from_stem(token)
+                if hint is None and extractor_mod is not None and hasattr(extractor_mod, "channel_from_token"):
+                    try:
+                        ext_hint = extractor_mod.channel_from_token(token)
+                    except Exception:
+                        ext_hint = None
+                    hint = _canonical_map_channel_name(str(ext_hint)) if ext_hint else None
+                ch = _canonical_map_channel_name(str(hint or ""))
+                _add(group, ch, p, base_score - 5.0)
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for key, payload in groups.items():
+        best = payload.get("best", {})
+        out[key] = {
+            "is_track": bool(payload.get("is_track", False)),
+            "count": int(payload.get("count", 0)),
+            "sample_name": str(payload.get("sample_name", key)),
+            "maps": {ch: src for ch, (_score, src) in best.items()},
+        }
+    return out
 
 
 def _norm_ref_like(ref: str) -> str:
@@ -2085,6 +2602,211 @@ def _augment_maps_from_existing_files(
         if channel not in out:
             out[channel] = pair[1]
     return out
+
+
+def _cleanup_strict_legacy_alias_pngs(model_dir: Path, asset: str) -> int:
+    stem = str(Path(str(asset or "")).stem or "").strip()
+    if not stem:
+        return 0
+    removed = 0
+    patterns = [f"{stem}.png", f"{stem}_*.png"]
+    for pat in patterns:
+        for p in model_dir.glob(pat):
+            if not p.exists() or not p.is_file():
+                continue
+            try:
+                p.unlink()
+                removed += 1
+            except OSError:
+                continue
+    return removed
+
+
+def _canonical_map_channel_name(value: str) -> str:
+    low = _norm_low(value)
+    if not low:
+        return "generic"
+    if low in {"d", "diff", "albedo", "basecolor", "base_color", "diffuse"}:
+        return "diffuse"
+    if low in {"a", "alpha", "opacity"}:
+        return "alpha"
+    if low in {"nm", "normal", "normalmap"}:
+        return "normal"
+    if low in {"orm", "rma", "mrao"}:
+        return "orm"
+    if low in {"ao", "o", "occlusion", "ambientocclusion"}:
+        return "occlusion"
+    if low in {"r", "rough", "roughness"}:
+        return "roughness"
+    if low in {"m", "metal", "metallic", "metalness"}:
+        return "metallic"
+    return low
+
+
+def _strict_atlas_item_is_track(item: Dict[str, Any], extractor_mod: Any | None = None) -> bool:
+    parts = [
+        str(item.get("atlas_target_basename", "") or ""),
+        str(item.get("atlas_target_logical_rel", "") or ""),
+        str(item.get("atlas_ref", "") or ""),
+    ]
+    out_raw = str(item.get("out_png", "") or "").strip()
+    if out_raw:
+        parts.append(Path(out_raw).stem)
+    text = " ".join(parts)
+    low = _norm_low(text)
+    if "tracks" in low or "_trk" in low or "chenille" in low:
+        return True
+    if extractor_mod is not None and hasattr(extractor_mod, "is_track_token"):
+        try:
+            if bool(extractor_mod.is_track_token(text)):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _strict_atlas_item_channel(item: Dict[str, Any], extractor_mod: Any | None = None) -> str:
+    channel = _canonical_map_channel_name(str(item.get("atlas_target_channel", "")))
+    guesses: List[str] = []
+    if channel == "generic":
+        role_guess = _canonical_map_channel_name(str(item.get("role", "")))
+        if role_guess != "generic":
+            guesses.append(role_guess)
+
+    tokens = [
+        str(item.get("atlas_target_basename", "") or ""),
+        str(item.get("atlas_target_logical_rel", "") or ""),
+        str(item.get("atlas_ref", "") or ""),
+    ]
+    out_raw = str(item.get("out_png", "") or "").strip()
+    if out_raw:
+        tokens.append(Path(out_raw).stem)
+
+    for tok in tokens:
+        stem = Path(str(tok)).stem
+        hint = _channel_hint_from_stem(stem) or _channel_hint_from_stem(str(tok))
+        if hint:
+            guesses.append(_canonical_map_channel_name(hint))
+    if extractor_mod is not None and hasattr(extractor_mod, "channel_from_token"):
+        merged = " ".join(tokens)
+        try:
+            ext_hint = extractor_mod.channel_from_token(merged)
+            if ext_hint:
+                guesses.append(_canonical_map_channel_name(str(ext_hint)))
+        except Exception:
+            pass
+
+    for g in guesses:
+        if g != "generic":
+            if channel == "generic":
+                channel = g
+            elif channel == "diffuse" and g in {"alpha", "normal", "roughness", "metallic", "occlusion", "orm"}:
+                channel = g
+    return channel
+
+
+def _pick_maps_for_material_strict_local(
+    resolved_items: Sequence[Dict[str, Any]],
+    material_role: str,
+    asset_stem: str,
+    extractor_mod: Any | None = None,
+) -> Dict[str, Path]:
+    wanted = {"diffuse", "normal", "roughness", "metallic", "occlusion", "alpha", "orm"}
+    role_low = _norm_low(material_role)
+    want_track = role_low.startswith("track")
+    stem_low = _norm_low(asset_stem)
+    best_explicit: Dict[str, tuple[float, Path]] = {}
+    best_extra: Dict[str, tuple[float, Path]] = {}
+
+    def _prefer_occlusion_short_o(path: Path) -> Path:
+        try:
+            p = Path(path)
+        except Exception:
+            return path
+        stem = p.stem
+        if stem.upper().endswith("_AO"):
+            alt = p.with_name(f"{stem[:-3]}_O{p.suffix}")
+            if alt.exists() and alt.is_file():
+                return alt
+        return p
+
+    def _add(bucket: Dict[str, tuple[float, Path]], channel: str, path: Path | None, score: float) -> None:
+        if path is None or channel not in wanted:
+            return
+        if channel == "occlusion":
+            path = _prefer_occlusion_short_o(path)
+        if not path.exists() or not path.is_file():
+            return
+        cur = bucket.get(channel)
+        if cur is None or float(score) > cur[0]:
+            bucket[channel] = (float(score), path)
+
+    for idx, item in enumerate(resolved_items):
+        out_raw = item.get("out_png")
+        out_png = Path(out_raw) if out_raw else None
+        if out_png is None:
+            continue
+        is_track = _strict_atlas_item_is_track(item, extractor_mod=extractor_mod)
+        if is_track != want_track:
+            continue
+        channel = _strict_atlas_item_channel(item, extractor_mod=extractor_mod)
+        if channel not in wanted:
+            continue
+        score = 1000.0 - float(idx)
+        base = _norm_low(str(item.get("atlas_target_basename", "") or ""))
+        if stem_low:
+            if base.startswith(f"{stem_low}_"):
+                score += 25.0
+            elif base == stem_low:
+                score += 20.0
+        _add(best_explicit, channel, out_png, score)
+
+        extras = item.get("extras", {})
+        if not isinstance(extras, dict):
+            continue
+        for ek, ev in extras.items():
+            p = Path(ev)
+            token = f"{str(ek or '')} {p.stem}"
+            hint = _channel_hint_from_stem(token)
+            if hint is None and extractor_mod is not None and hasattr(extractor_mod, "channel_from_token"):
+                try:
+                    ext_hint = extractor_mod.channel_from_token(token)
+                except Exception:
+                    ext_hint = None
+                hint = _canonical_map_channel_name(str(ext_hint)) if ext_hint else None
+            ch = _canonical_map_channel_name(str(hint or ""))
+            if ch in wanted:
+                _add(best_extra, ch, p, score - 5.0)
+
+    merged: Dict[str, Path] = {ch: src for ch, (_score, src) in best_explicit.items()}
+    for ch, (_score, src) in best_extra.items():
+        merged.setdefault(ch, src)
+    return merged
+
+
+def _ensure_occlusion_from_same_stem(maps: Dict[str, Path]) -> Dict[str, Path]:
+    if not isinstance(maps, dict):
+        return {}
+    if maps.get("occlusion") is not None:
+        return maps
+    for key in ("orm", "roughness", "metallic", "normal", "diffuse"):
+        src = maps.get(key)
+        if src is None:
+            continue
+        try:
+            p = Path(src)
+        except Exception:
+            continue
+        base = _strip_texture_channel_suffix(p.stem) or p.stem
+        cand_o = p.with_name(f"{base}_O{p.suffix}")
+        if cand_o.exists() and cand_o.is_file():
+            maps["occlusion"] = cand_o
+            return maps
+        cand_ao = p.with_name(f"{base}_AO{p.suffix}")
+        if cand_ao.exists() and cand_ao.is_file():
+            maps["occlusion"] = cand_ao
+            return maps
+    return maps
 
 
 def _atlas_ref_exact_exists(
@@ -2334,116 +3056,6 @@ def _collect_zz_candidates_for_ref(zz_resolver, ref: str) -> List[str]:
     return list(dict.fromkeys(out))
 
 
-def _pick_zz_generic_tsc_parent(extractor_mod, refs: Sequence[str], zz_resolver) -> str | None:
-    if zz_resolver is None or not refs:
-        return None
-    try:
-        zz_resolver.all_asset_keys()
-    except Exception:
-        return None
-
-    parent_score: Dict[str, float] = defaultdict(float)
-    parent_roles: Dict[str, set[str]] = defaultdict(set)
-    need_roles: set[str] = set()
-
-    for ref in refs:
-        role = str(getattr(extractor_mod, "classify_texture_role")(ref))
-        if role in {"combined_da"}:
-            need_roles.add("diffuse")
-        elif role in {"diffuse", "normal", "orm"}:
-            need_roles.add(role)
-        cands = _collect_zz_candidates_for_ref(zz_resolver, ref)
-        for key in cands:
-            low = str(key).lower()
-            if "/units_tests/" in low or "/units_tests_autos/" in low or "/editor/" in low:
-                continue
-            if "/fx/" in low:
-                continue
-            parent = str(PurePosixPath(low).parent)
-            role_weight = 20.0
-            if role == "diffuse":
-                role_weight = 40.0
-            elif role == "normal":
-                role_weight = 32.0
-            elif role == "orm":
-                role_weight = 34.0
-            size = 0
-            try:
-                size = int(zz_resolver._assets.get(low, {}).get("size", 0) or 0)
-            except Exception:
-                size = 0
-            size_bonus = min(30.0, float(size) / 120000.0)
-            parent_score[parent] += role_weight + size_bonus
-            if role == "combined_da":
-                parent_roles[parent].add("diffuse")
-            elif role in {"diffuse", "normal", "orm"}:
-                parent_roles[parent].add(role)
-
-    ranked = sorted(parent_score.items(), key=lambda kv: kv[1], reverse=True)
-    if not ranked:
-        return None
-    for parent, _score in ranked:
-        roles = parent_roles.get(parent, set())
-        if need_roles and not need_roles.issubset(roles):
-            continue
-        return parent
-    return ranked[0][0]
-
-
-def _fallback_convert_zz_parent_folder(
-    extractor_mod,
-    refs: Sequence[str],
-    zz_resolver,
-    runtime_root: Path,
-    converter: Path,
-    model_dir: Path,
-    texture_subdir: str,
-    tgv_split_mode: str,
-    tgv_aggressive_split: bool,
-    auto_install_deps: bool,
-    deps_dir: Path | None,
-) -> int:
-    parent = _pick_zz_generic_tsc_parent(extractor_mod, refs, zz_resolver)
-    if not parent:
-        return 0
-    all_keys = zz_resolver.all_asset_keys()
-    src_keys = [k for k in all_keys if str(k).startswith(parent + "/") and (str(k).endswith(".tgv") or str(k).endswith(".png"))]
-    if not src_keys:
-        return 0
-    extracted = 0
-    for key in src_keys:
-        try:
-            if str(key).endswith(".tgv"):
-                zz_resolver.extract_asset_to_runtime(key, runtime_root)
-                extracted += 1
-        except Exception:
-            continue
-    if extracted <= 0:
-        return 0
-
-    src_dir = runtime_root / Path(*parent.split("/"))
-    if not src_dir.exists() or not src_dir.is_dir():
-        return 0
-
-    first_ref = str(refs[0])
-    rel_parent = extractor_mod.atlas_ref_to_rel_under_assets(first_ref).parent
-    dst_dir = model_dir / (texture_subdir or "textures") / rel_parent
-    dst_dir.mkdir(parents=True, exist_ok=True)
-
-    extractor_mod.run_tgv_converter_for_folder_once(
-        converter=converter,
-        src_dir=src_dir,
-        dst_dir=dst_dir,
-        split_mode=tgv_split_mode,
-        mirror=False,
-        aggressive_split=bool(tgv_aggressive_split),
-        auto_naming=False,
-        auto_install_deps=bool(auto_install_deps),
-        deps_dir=deps_dir,
-    )
-    return extracted
-
-
 def _resolve_material_maps(
     extractor_mod,
     spk,
@@ -2467,6 +3079,11 @@ def _resolve_material_maps(
         "atlas_source": "",
         "converter_source": "",
         "deps_auto_installed": False,
+        "atlas_mode": "legacy",
+        "atlas_map_entries": 0,
+        "atlas_map_targets": 0,
+        "exact_hits": 0,
+        "strict_misses": 0,
     }
     if not settings.auto_textures:
         return maps_by_name, report
@@ -2476,53 +3093,25 @@ def _resolve_material_maps(
     project_root = _project_root(settings)
     runtime_info = runtime_info or {}
     atlas_override = str(runtime_info.get("atlas_assets_root", "")).strip()
-    converter_override = str(runtime_info.get("tgv_converter", "")).strip()
     zz_resolver = runtime_info.get("zz_resolver")
     zz_runtime_root_text = str(runtime_info.get("runtime_root", "")).strip()
     warno_root_text = str(runtime_info.get("warno_root", "")).strip()
 
     atlas_raw_text = atlas_override or str(settings.atlas_assets_dir or "").strip()
-    converter_text = converter_override or str(settings.tgv_converter or "").strip()
     atlas_source = "zz_runtime" if atlas_override else "manual_path"
     report["atlas_source"] = atlas_source
-    converter = Path()
-    converter_source = "custom"
-    if converter_text:
-        converter = _resolve_path(project_root, converter_text)
     bundled_converter = project_root / "tgv_to_png.py"
-    if converter_text and bundled_converter.exists():
-        try:
-            if converter.resolve() == bundled_converter.resolve():
-                converter_source = "bundled"
-        except Exception:
-            pass
-    modsuite_root = _resolve_path(project_root, str(settings.modding_suite_root or "").strip()) if str(settings.modding_suite_root or "").strip() else None
-    if converter_text and converter_source != "bundled" and modsuite_root is not None:
-        try:
-            if str(converter.resolve()).lower().startswith(str(modsuite_root.resolve()).lower()):
-                converter_source = "moddingSuite"
-        except Exception:
-            pass
-    if (not converter_text or not converter.exists() or not converter.is_file()) and bool(settings.use_zz_dat_source):
-        cand = _candidate_tgv_converter_from_modding_suite(settings)
-        if cand is not None:
-            converter = cand
-            converter_text = str(cand)
-            converter_source = "moddingSuite"
-    if (not converter_text or not converter.exists() or not converter.is_file()) and bundled_converter.exists() and bundled_converter.is_file():
-        converter = bundled_converter
-        converter_text = str(bundled_converter)
-        converter_source = "bundled"
+    converter = bundled_converter
+    converter_text = str(bundled_converter)
+    converter_source = "bundled"
 
     if not atlas_raw_text:
         raise RuntimeError("Atlas Assets path is empty.")
-    if not converter_text:
-        raise RuntimeError("TGV converter path is empty.")
     atlas_raw = _resolve_path(project_root, atlas_raw_text)
     if not atlas_raw.exists() or not atlas_raw.is_dir():
         raise RuntimeError(f"Atlas Assets folder not found: {atlas_raw}")
     if not converter.exists() or not converter.is_file():
-        raise RuntimeError(f"TGV converter not found: {converter}")
+        raise RuntimeError(f"Bundled TGV converter not found: {converter}")
     report["converter_source"] = converter_source
 
     atlas_root = extractor_mod.resolve_atlas_assets_root(atlas_raw)
@@ -2551,6 +3140,86 @@ def _resolve_material_maps(
     except Exception:
         refs_by_material = {}
 
+    atlas_map_index: Dict[str, List[Dict[str, Any]]] | None = None
+    atlas_map_path: Path | None = None
+    atlas_map_targets: List[str] = []
+    atlas_map_asset_path = str(asset)
+    atlas_init_error = ""
+    if bool(settings.use_atlas_json_mapping):
+        _warno_log(settings, "stage: atlas_map_build", stage="atlas_map_build")
+        report["atlas_mode"] = "json_export"
+        warno_root_for_atlas = Path(warno_root_text) if warno_root_text else _resolve_path(project_root, str(settings.warno_root or "").strip())
+        modsuite_root = _resolve_path(project_root, str(settings.modding_suite_root or "").strip())
+        wrapper_path = _resolve_path(project_root, str(settings.modding_suite_atlas_wrapper or "").strip() or "modding_suite_atlas_export.py")
+        atlas_cli_path_text = str(settings.modding_suite_atlas_cli or "").strip()
+        atlas_cli_path = _resolve_path(project_root, atlas_cli_path_text) if atlas_cli_path_text else None
+        atlas_cache_root = _atlas_json_cache_root(settings)
+        atlas_candidates = _atlas_asset_variant_candidates(asset)
+        if not warno_root_for_atlas.exists() or not warno_root_for_atlas.is_dir():
+            atlas_init_error = f"WARNO folder for Atlas JSON not found: {warno_root_for_atlas}"
+        elif not modsuite_root.exists() or not modsuite_root.is_dir():
+            atlas_init_error = f"moddingSuite root for Atlas JSON not found: {modsuite_root}"
+        else:
+            for idx, atlas_asset_candidate in enumerate(atlas_candidates):
+                try:
+                    atlas_map_info = extractor_mod.build_or_load_atlas_texture_map(
+                        warno_root=warno_root_for_atlas,
+                        modding_suite_root=modsuite_root,
+                        asset_path=atlas_asset_candidate,
+                        cache_dir=atlas_cache_root,
+                        wrapper_path=wrapper_path,
+                        atlas_cli_path=atlas_cli_path,
+                        force_rebuild=False,
+                        timeout_sec=max(5, int(settings.atlas_cli_timeout_sec)),
+                    )
+                    atlas_map_path_text = str(atlas_map_info.get("atlas_map_path", "")).strip()
+                    atlas_map_path = Path(atlas_map_path_text) if atlas_map_path_text else None
+                    atlas_map_index_raw = atlas_map_info.get("atlas_map_index")
+                    if isinstance(atlas_map_index_raw, dict):
+                        atlas_map_index = atlas_map_index_raw
+                    atlas_targets_raw = atlas_map_info.get("atlas_map_targets")
+                    if isinstance(atlas_targets_raw, list):
+                        atlas_map_targets = [str(x).strip() for x in atlas_targets_raw if str(x).strip()]
+                    atlas_map_asset_path = str(atlas_asset_candidate or asset)
+                    report["atlas_map_entries"] = int(atlas_map_info.get("atlas_map_entries", 0) or 0)
+                    report["atlas_map_targets"] = len(atlas_map_targets)
+                    extra_note = ""
+                    if _norm_ref_like(atlas_map_asset_path) != _norm_ref_like(asset):
+                        extra_note = f" asset_fallback={atlas_map_asset_path}"
+                    _warno_log(
+                        settings,
+                        f"atlas map ready entries={report['atlas_map_entries']} path={atlas_map_path_text}{extra_note}",
+                        stage="atlas_map_build",
+                    )
+                    atlas_init_error = ""
+                    break
+                except Exception as exc:
+                    atlas_init_error = str(exc)
+                    if (
+                        idx + 1 < len(atlas_candidates)
+                        and _atlas_map_no_entries_error(atlas_init_error)
+                    ):
+                        _warno_log(
+                            settings,
+                            f"atlas map no entries for {atlas_asset_candidate}; trying variant fallback",
+                            level="WARNING",
+                            stage="atlas_map_build",
+                        )
+                        continue
+                    break
+        if atlas_init_error:
+            _warno_log(settings, f"atlas map build failed: {atlas_init_error}", level="ERROR", stage="atlas_map_build")
+            report["errors"].append(
+                {
+                    "atlas_ref": "__atlas_json__",
+                    "error": f"missing_source: atlas json mapping unavailable: {atlas_init_error}",
+                }
+            )
+            report["atlas_mode"] = "json_export_failed"
+            if bool(settings.atlas_json_strict):
+                _warno_log(settings, f"atlas json strict stop: {atlas_init_error}", level="WARNING", stage="texture")
+                return maps_by_name, report
+
     refs: List[str] = []
     for mid in material_ids:
         refs.extend(refs_by_material.get(int(mid), []))
@@ -2559,61 +3228,91 @@ def _resolve_material_maps(
         refs = spk.find_texture_refs_for_asset(asset, material_ids=material_ids)
     refs = extractor_mod.unique_keep_order(refs) if hasattr(extractor_mod, "unique_keep_order") else list(dict.fromkeys(refs))
 
+    atlas_json_enabled = bool(settings.use_atlas_json_mapping and atlas_map_index)
+    strict_atlas_mode = bool(atlas_json_enabled and settings.atlas_json_strict)
+    if strict_atlas_mode:
+        removed_legacy = _cleanup_strict_legacy_alias_pngs(model_dir=model_dir, asset=asset)
+        if removed_legacy > 0:
+            _warno_log(
+                settings,
+                f"strict atlas cleanup removed legacy top-level png: {removed_legacy}",
+                stage="texture",
+            )
+        if atlas_map_targets:
+            refs_before = len(refs)
+            refs = extractor_mod.unique_keep_order([*refs, *atlas_map_targets]) if hasattr(extractor_mod, "unique_keep_order") else list(dict.fromkeys([*refs, *atlas_map_targets]))
+            refs_added = len(refs) - refs_before
+            if refs_added > 0:
+                _warno_log(
+                    settings,
+                    f"strict atlas refs extended from atlas targets: +{refs_added}",
+                    stage="refs_resolve",
+                )
+    if atlas_json_enabled and not refs:
+        refs = list(atlas_map_targets)
+        if refs:
+            _warno_log(
+                settings,
+                f"refs fallback from atlas map targets: {len(refs)}",
+                stage="refs_resolve",
+            )
     guessed_refs: List[str] = []
-    if refs and bool(settings.use_zz_dat_source) and bool(settings.fast_exact_texture_resolve):
-        companion = _build_fast_companion_refs(extractor_mod, refs, cap=24)
-        companion_exact = [
-            ref
-            for ref in companion
-            if _atlas_ref_exact_exists(
-                extractor_mod=extractor_mod,
-                ref=ref,
-                atlas_root=atlas_root,
-                fallback_roots=fallback_atlas_roots,
-                zz_resolver=zz_resolver,
-            )
-        ]
-        if companion_exact:
-            refs = extractor_mod.unique_keep_order(list(refs) + list(companion_exact)) if hasattr(extractor_mod, "unique_keep_order") else list(dict.fromkeys(list(refs) + list(companion_exact)))
-    elif refs:
-        try:
-            guessed_refs = _guess_texture_refs_for_asset(
-                extractor_mod=extractor_mod,
-                asset=asset,
-                atlas_assets_root=atlas_root,
-                runtime_info=runtime_info,
-                max_refs=48,
-                include_zz_scan=bool(settings.use_zz_dat_source),
-            )
-        except Exception:
-            guessed_refs = []
-        if guessed_refs:
-            low_refs = [str(r).lower() for r in refs]
-            has_nm = any(("normaltexture" in r) or ("_nm" in r) or ("/tscnm_" in r) for r in low_refs)
-            has_orm = any(
-                ("combinedorm" in r)
-                or ("combinedrm" in r)
-                or ("roughnesstexture" in r)
-                or ("singlechannellinearmap_roughness" in r)
-                or ("singlechannellinearmap_metallic" in r)
-                for r in low_refs
-            )
-            if (not has_nm) or (not has_orm) or len(refs) <= 2:
-                refs = extractor_mod.unique_keep_order(list(refs) + list(guessed_refs)) if hasattr(extractor_mod, "unique_keep_order") else list(dict.fromkeys(list(refs) + list(guessed_refs)))
-    elif not refs:
-        try:
-            guessed_refs = _guess_texture_refs_for_asset(
-                extractor_mod=extractor_mod,
-                asset=asset,
-                atlas_assets_root=atlas_root,
-                runtime_info=runtime_info,
-                max_refs=24,
-                include_zz_scan=bool(settings.use_zz_dat_source),
-            )
-        except Exception:
-            guessed_refs = []
-        refs = guessed_refs
+    if not atlas_json_enabled:
+        if refs and bool(settings.use_zz_dat_source) and bool(settings.fast_exact_texture_resolve):
+            companion = _build_fast_companion_refs(extractor_mod, refs, cap=24)
+            companion_exact = [
+                ref
+                for ref in companion
+                if _atlas_ref_exact_exists(
+                    extractor_mod=extractor_mod,
+                    ref=ref,
+                    atlas_root=atlas_root,
+                    fallback_roots=fallback_atlas_roots,
+                    zz_resolver=zz_resolver,
+                )
+            ]
+            if companion_exact:
+                refs = extractor_mod.unique_keep_order(list(refs) + list(companion_exact)) if hasattr(extractor_mod, "unique_keep_order") else list(dict.fromkeys(list(refs) + list(companion_exact)))
+        elif refs:
+            try:
+                guessed_refs = _guess_texture_refs_for_asset(
+                    extractor_mod=extractor_mod,
+                    asset=asset,
+                    atlas_assets_root=atlas_root,
+                    runtime_info=runtime_info,
+                    max_refs=48,
+                    include_zz_scan=bool(settings.use_zz_dat_source),
+                )
+            except Exception:
+                guessed_refs = []
+            if guessed_refs:
+                low_refs = [str(r).lower() for r in refs]
+                has_nm = any(("normaltexture" in r) or ("_nm" in r) or ("/tscnm_" in r) for r in low_refs)
+                has_orm = any(
+                    ("combinedorm" in r)
+                    or ("combinedrm" in r)
+                    or ("roughnesstexture" in r)
+                    or ("singlechannellinearmap_roughness" in r)
+                    or ("singlechannellinearmap_metallic" in r)
+                    for r in low_refs
+                )
+                if (not has_nm) or (not has_orm) or len(refs) <= 2:
+                    refs = extractor_mod.unique_keep_order(list(refs) + list(guessed_refs)) if hasattr(extractor_mod, "unique_keep_order") else list(dict.fromkeys(list(refs) + list(guessed_refs)))
+        elif not refs:
+            try:
+                guessed_refs = _guess_texture_refs_for_asset(
+                    extractor_mod=extractor_mod,
+                    asset=asset,
+                    atlas_assets_root=atlas_root,
+                    runtime_info=runtime_info,
+                    max_refs=24,
+                    include_zz_scan=bool(settings.use_zz_dat_source),
+                )
+            except Exception:
+                guessed_refs = []
+            refs = guessed_refs
 
+    _warno_log(settings, f"stage: refs_resolve refs={len(refs)}", stage="refs_resolve")
     report["refs"] = list(refs)
     report["refs_by_material"] = {
         str(int(mid)): list(refs_by_material.get(int(mid), []))
@@ -2665,20 +3364,24 @@ def _resolve_material_maps(
                 out_model_dir=model_dir,
                 converter=conv_path,
                 texture_subdir="textures",
-                tgv_split_mode=settings.tgv_split_mode,
-                tgv_mirror=False,
-                tgv_aggressive_split=bool(settings.tgv_aggressive_split),
                 zz_resolver=zz_resolver,
                 zz_runtime_root=Path(zz_runtime_root_text) if zz_runtime_root_text else None,
                 fallback_atlas_roots=fallback_atlas_roots,
                 auto_install_deps=bool(settings.auto_install_tgv_deps),
                 deps_dir=deps_dir,
-                allow_group_convert=bool(settings.allow_group_texture_convert),
-                allow_inprocess=False,
                 subprocess_timeout_sec=process_timeout_sec,
+                atlas_map_path=atlas_map_path,
+                atlas_map_index=atlas_map_index,
+                asset_path=atlas_map_asset_path,
+                atlas_json_strict=bool(settings.atlas_json_strict),
             )
 
         try:
+            _warno_log(
+                settings,
+                f"converter ref {idx}/{total_refs}: {ref}",
+                stage="converter",
+            )
             item = _resolve_with_converter(converter)
             resolved.append(item)
             resolved_by_ref[str(item.get("atlas_ref", ""))] = item
@@ -2700,82 +3403,310 @@ def _resolve_material_maps(
     if used_bundled_fallback:
         report["converter_source"] = "bundled"
 
-    chosen_maps = extractor_mod.pick_material_maps_from_textures(resolved)
-    chosen_maps = _augment_maps_from_existing_files(model_dir=model_dir, asset=asset, chosen_maps=chosen_maps)
-    report["channels"] = sorted(chosen_maps.keys())
+    strict_picker = None
+    if strict_atlas_mode:
+        if hasattr(extractor_mod, "pick_maps_for_material_from_atlas_resolved"):
+            strict_picker = lambda items, role: extractor_mod.pick_maps_for_material_from_atlas_resolved(
+                resolved_items=items,
+                material_role=role,
+                asset_stem=Path(asset).stem,
+            )
+        else:
+            _warno_log(
+                settings,
+                "strict atlas picker fallback: extractor helper missing, using local deterministic picker",
+                level="WARNING",
+                stage="texture",
+            )
+            strict_picker = lambda items, role: _pick_maps_for_material_strict_local(
+                resolved_items=items,
+                material_role=role,
+                asset_stem=Path(asset).stem,
+                extractor_mod=extractor_mod,
+            )
+
+    if strict_atlas_mode and strict_picker is not None:
+        chosen_maps = strict_picker(resolved, "other")
+    else:
+        chosen_maps = extractor_mod.pick_material_maps_from_textures(resolved)
+        chosen_maps = _augment_maps_from_existing_files(model_dir=model_dir, asset=asset, chosen_maps=chosen_maps)
     named_maps: Dict[str, Path] = {}
     named_files: list[dict[str, str]] = []
     if chosen_maps:
-        if settings.auto_rename_textures:
-            named_maps, named_files = extractor_mod.build_named_texture_aliases(
-                asset=asset,
-                model_dir=model_dir,
-                resolved=resolved,
-                chosen_maps=chosen_maps,
-            )
-        map_for_materials = named_maps or chosen_maps
-        track_named_maps = extractor_mod.track_maps_from_named(named_files) if named_files else {"generic": {}, "left": {}, "right": {}}
-        for mid in material_ids:
-            mname = material_name_by_id.get(int(mid), f"Material_{int(mid):03d}")
-            role = str(material_role_by_id.get(int(mid), "other"))
-            refs_mid = refs_by_material.get(int(mid), [])
-            resolved_mid = [resolved_by_ref[ref] for ref in refs_mid if ref in resolved_by_ref]
-            maps = extractor_mod.pick_material_maps_from_textures(resolved_mid) if resolved_mid else {}
-            is_track_role = role.startswith("track")
-            if maps and named_files:
-                if hasattr(extractor_mod, "remap_maps_to_named_sources"):
-                    maps = extractor_mod.remap_maps_to_named_sources(maps, named_files)
-                else:
-                    def _path_key(path_value: Path) -> str:
-                        try:
-                            return str(path_value.resolve()).lower()
-                        except Exception:
-                            return str(path_value).lower()
+        if strict_atlas_mode and strict_picker is not None:
+            strict_groups = _build_strict_grouped_maps(resolved, extractor_mod=extractor_mod)
+            asset_stem_low = _norm_low(Path(asset).stem)
+            non_track_groups = [(k, v) for k, v in strict_groups.items() if not bool(v.get("is_track", False))]
+            track_groups = [(k, v) for k, v in strict_groups.items() if bool(v.get("is_track", False))]
 
-                    src_to_named: Dict[str, Path] = {}
-                    for item in named_files:
-                        src_raw = str(item.get("source", "")).strip()
-                        named_raw = str(item.get("named", "")).strip()
-                        if not src_raw or not named_raw:
-                            continue
-                        src_to_named[_path_key(Path(src_raw))] = Path(named_raw)
-                    remapped: Dict[str, Path] = {}
-                    for ch, src in maps.items():
-                        p = Path(src) if not isinstance(src, Path) else src
-                        remapped[ch] = src_to_named.get(_path_key(p), p)
-                    maps = remapped
+            def _pick_primary_non_track() -> str:
+                if not non_track_groups:
+                    return ""
+                asset_tokens = [t for t in re.split(r"[^a-z0-9]+", asset_stem_low) if t]
+                best_key = ""
+                best_score = float("-inf")
+                for key, payload in non_track_groups:
+                    maps_count = len(payload.get("maps", {}))
+                    score = float(maps_count) * 20.0 + float(payload.get("count", 0))
+                    if asset_stem_low and (key == asset_stem_low or key.startswith(f"{asset_stem_low}_")):
+                        score += 200.0
+                    if asset_tokens:
+                        key_tokens = [t for t in re.split(r"[^a-z0-9]+", _norm_low(key)) if t]
+                        overlap = len(set(asset_tokens).intersection(set(key_tokens)))
+                        score += float(overlap) * 35.0
+                    if score > best_score:
+                        best_score = score
+                        best_key = key
+                return best_key
 
-            if not maps:
-                maps = {}
-                for ch, src in map_for_materials.items():
-                    if is_track_role and ch == "diffuse":
-                        continue
-                    maps[ch] = src
-            else:
-                for ch, src in map_for_materials.items():
-                    if is_track_role and ch == "diffuse":
-                        continue
-                    maps.setdefault(ch, src)
+            def _pick_primary_track() -> str:
+                if not track_groups:
+                    return ""
+                best_key = ""
+                best_score = float("-inf")
+                for key, payload in track_groups:
+                    maps_count = len(payload.get("maps", {}))
+                    score = float(maps_count) * 20.0 + float(payload.get("count", 0))
+                    k_low = _norm_low(key)
+                    if "tracks" in k_low or "_trk" in k_low or "chenille" in k_low:
+                        score += 60.0
+                    if score > best_score:
+                        best_score = score
+                        best_key = key
+                return best_key
 
-            if role == "track_left":
-                maps.update(track_named_maps.get("left", {}))
-            elif role == "track_right":
-                maps.update(track_named_maps.get("right", {}))
-            elif role.startswith("track"):
-                maps.update(track_named_maps.get("generic", {}))
-
-            if is_track_role:
-                override = _pick_track_diffuse_override(
-                    extractor_mod=extractor_mod,
-                    resolved_items=resolved_mid or resolved,
-                    current_diffuse=maps.get("diffuse"),
+            primary_non_track_key = _pick_primary_non_track()
+            primary_track_key = _pick_primary_track()
+            secondary_non_track_keys = [
+                key
+                for key, payload in sorted(
+                    non_track_groups,
+                    key=lambda kv: (
+                        len(kv[1].get("maps", {})),
+                        int(kv[1].get("count", 0)),
+                        kv[0],
+                    ),
+                    reverse=True,
                 )
-                if override is not None:
-                    maps["diffuse"] = override
-                elif "diffuse" not in maps and "diffuse" in map_for_materials:
-                    # Last-resort fallback to avoid untextured tracks.
-                    maps["diffuse"] = map_for_materials["diffuse"]
-            maps_by_name[mname] = maps
+                if key != primary_non_track_key
+            ]
+            used_non_track_group_keys: set[str] = set()
+            raw_slot_hints_by_mid = getattr(spk, "material_texture_names_by_id", {}) or {}
+
+            def _maps_from_group_key(group_key: str, want_track: bool) -> tuple[Dict[str, Path], str]:
+                key = _norm_low(group_key)
+                if not key:
+                    return {}, ""
+                payload = strict_groups.get(key)
+                if not isinstance(payload, dict):
+                    return {}, ""
+                if bool(payload.get("is_track", False)) != bool(want_track):
+                    return {}, ""
+                maps = payload.get("maps", {})
+                if isinstance(maps, dict) and maps:
+                    return dict(maps), key
+                return {}, ""
+
+            def _exact_material_key(raw_name: str) -> str:
+                name = str(raw_name or "").strip()
+                if not name:
+                    return ""
+                # Blender may append .001/.002 for duplicated material names.
+                name = re.sub(r"\.\d{3}$", "", name)
+                base = _strip_texture_channel_suffix(name) or name
+                key = _norm_low(base)
+                return key
+
+            def _is_autogen_material_name(raw_name: str) -> bool:
+                low = _norm_low(raw_name)
+                if not low:
+                    return True
+                return (
+                    low.startswith("material_")
+                    or low.startswith("element_")
+                    or low.startswith("part_")
+                    or low in {"corps_principal", "body", "other"}
+                )
+
+            def _slot_priority(slot_name: str) -> int:
+                low = _norm_low(slot_name).replace(" ", "")
+                if "diffusetexturenoalpha" in low or "diffusetexture" in low:
+                    return 0
+                if "opacitytexture" in low or low.endswith("alpha"):
+                    return 1
+                if "normaltexture" in low or "normal" in low:
+                    return 2
+                if "roughnesstexture" in low or "roughness" in low:
+                    return 3
+                if "metallictexture" in low or "metallic" in low:
+                    return 4
+                if "ambientocclusiontexture" in low or "occlusion" in low:
+                    return 5
+                return 10
+
+            def _maps_from_material_name_or_slot_hints(mid: int, material_name: str, want_track: bool) -> tuple[Dict[str, Path], str]:
+                by_name, by_name_key = _maps_from_group_key(_exact_material_key(material_name), want_track)
+                if by_name:
+                    return by_name, by_name_key
+
+                slot_map = raw_slot_hints_by_mid.get(int(mid), {})
+                if isinstance(slot_map, dict) and slot_map:
+                    slot_items = sorted(slot_map.items(), key=lambda kv: (_slot_priority(str(kv[0])), str(kv[0]).lower()))
+                    for _slot_name, raw_value in slot_items:
+                        stem = Path(str(raw_value or "")).stem
+                        key = _exact_material_key(stem)
+                        if not key:
+                            continue
+                        by_slot, by_slot_key = _maps_from_group_key(key, want_track)
+                        if by_slot:
+                            return by_slot, by_slot_key
+                return {}, ""
+
+            for mid in material_ids:
+                mname = material_name_by_id.get(int(mid), f"Material_{int(mid):03d}")
+                role = str(material_role_by_id.get(int(mid), "other"))
+                role_for_pick = role
+                if not role_for_pick.startswith("track"):
+                    try:
+                        if extractor_mod.is_track_token(str(mname)):
+                            role_for_pick = "track"
+                    except Exception:
+                        pass
+                if not role_for_pick.startswith("track"):
+                    slot_map_probe = raw_slot_hints_by_mid.get(int(mid), {})
+                    if isinstance(slot_map_probe, dict):
+                        for raw_slot_value in slot_map_probe.values():
+                            stem_low = _norm_low(Path(str(raw_slot_value or "")).stem)
+                            if "tracks" in stem_low or "_trk" in stem_low or "chenille" in stem_low:
+                                role_for_pick = "track"
+                                break
+                refs_mid = refs_by_material.get(int(mid), [])
+                resolved_mid = [resolved_by_ref[ref] for ref in refs_mid if ref in resolved_by_ref]
+                basis = resolved_mid if resolved_mid else resolved
+                maps: Dict[str, Path] = {}
+                used_group_key = ""
+                want_track = role_for_pick.startswith("track")
+
+                maps, used_group_key = _maps_from_material_name_or_slot_hints(int(mid), str(mname), want_track)
+                if used_group_key and not want_track:
+                    used_non_track_group_keys.add(used_group_key)
+
+                if not refs_mid:
+                    if not maps and role_for_pick.startswith("track") and primary_track_key:
+                        maps, used_group_key = _maps_from_group_key(primary_track_key, True)
+                    elif not maps and role_for_pick == "body" and primary_non_track_key:
+                        maps, used_group_key = _maps_from_group_key(primary_non_track_key, False)
+                        if used_group_key:
+                            used_non_track_group_keys.add(used_group_key)
+                    elif (
+                        not maps
+                        and role_for_pick == "other"
+                        and _is_autogen_material_name(str(mname))
+                    ):
+                        for group_key in secondary_non_track_keys:
+                            if group_key in used_non_track_group_keys:
+                                continue
+                            maps, used_group_key = _maps_from_group_key(group_key, False)
+                            if maps:
+                                used_non_track_group_keys.add(group_key)
+                                break
+
+                if not maps:
+                    maps = strict_picker(basis, role_for_pick)
+                if not maps and basis is not resolved:
+                    maps = strict_picker(resolved, role_for_pick)
+                if not isinstance(maps, dict):
+                    maps = {}
+                # Only use broad strict role fill when we do not have an exact
+                # atlas group match from material name/slot hints. This prevents
+                # cross-group contamination (e.g. foreign diffuse/alpha on HLM).
+                if not used_group_key:
+                    fill = strict_picker(basis, role_for_pick)
+                    if isinstance(fill, dict):
+                        for ch, src in fill.items():
+                            maps.setdefault(ch, src)
+                    if basis is not resolved:
+                        fill_all = strict_picker(resolved, role_for_pick)
+                        if isinstance(fill_all, dict):
+                            for ch, src in fill_all.items():
+                                maps.setdefault(ch, src)
+                maps_by_name[mname] = _ensure_occlusion_from_same_stem(maps)
+        else:
+            if settings.auto_rename_textures:
+                named_maps, named_files = extractor_mod.build_named_texture_aliases(
+                    asset=asset,
+                    model_dir=model_dir,
+                    resolved=resolved,
+                    chosen_maps=chosen_maps,
+                )
+            map_for_materials = named_maps or chosen_maps
+            track_named_maps = extractor_mod.track_maps_from_named(named_files) if named_files else {"generic": {}, "left": {}, "right": {}}
+            for mid in material_ids:
+                mname = material_name_by_id.get(int(mid), f"Material_{int(mid):03d}")
+                role = str(material_role_by_id.get(int(mid), "other"))
+                refs_mid = refs_by_material.get(int(mid), [])
+                resolved_mid = [resolved_by_ref[ref] for ref in refs_mid if ref in resolved_by_ref]
+                maps = extractor_mod.pick_material_maps_from_textures(resolved_mid) if resolved_mid else {}
+                is_track_role = role.startswith("track")
+                if maps and named_files:
+                    if hasattr(extractor_mod, "remap_maps_to_named_sources"):
+                        maps = extractor_mod.remap_maps_to_named_sources(maps, named_files)
+                    else:
+                        def _path_key(path_value: Path) -> str:
+                            try:
+                                return str(path_value.resolve()).lower()
+                            except Exception:
+                                return str(path_value).lower()
+
+                        src_to_named: Dict[str, Path] = {}
+                        for item in named_files:
+                            src_raw = str(item.get("source", "")).strip()
+                            named_raw = str(item.get("named", "")).strip()
+                            if not src_raw or not named_raw:
+                                continue
+                            src_to_named[_path_key(Path(src_raw))] = Path(named_raw)
+                        remapped: Dict[str, Path] = {}
+                        for ch, src in maps.items():
+                            p = Path(src) if not isinstance(src, Path) else src
+                            remapped[ch] = src_to_named.get(_path_key(p), p)
+                        maps = remapped
+
+                if not maps:
+                    maps = {}
+                    for ch, src in map_for_materials.items():
+                        if is_track_role and ch == "diffuse":
+                            continue
+                        maps[ch] = src
+                else:
+                    for ch, src in map_for_materials.items():
+                        if is_track_role and ch == "diffuse":
+                            continue
+                        maps.setdefault(ch, src)
+
+                if role == "track_left":
+                    maps.update(track_named_maps.get("left", {}))
+                elif role == "track_right":
+                    maps.update(track_named_maps.get("right", {}))
+                elif role.startswith("track"):
+                    maps.update(track_named_maps.get("generic", {}))
+
+                if is_track_role:
+                    override = _pick_track_diffuse_override(
+                        extractor_mod=extractor_mod,
+                        resolved_items=resolved_mid or resolved,
+                        current_diffuse=maps.get("diffuse"),
+                    )
+                    if override is not None:
+                        maps["diffuse"] = override
+                    elif "diffuse" not in maps and "diffuse" in map_for_materials:
+                        # Last-resort fallback to avoid untextured tracks.
+                        maps["diffuse"] = map_for_materials["diffuse"]
+                maps_by_name[mname] = _ensure_occlusion_from_same_stem(maps)
+
+    channel_set: set[str] = set(chosen_maps.keys())
+    for mm in maps_by_name.values():
+        channel_set.update(mm.keys())
+    report["channels"] = sorted(channel_set)
 
     report["resolved"] = [
         {
@@ -2783,14 +3714,25 @@ def _resolve_material_maps(
             "role": item["role"],
             "atlas_source": str(item.get("atlas_source", "")),
             "source_type": item["source_type"],
+            "cache_hit": bool(item.get("cache_hit", False)),
             "source_tgv": item["source_tgv"],
             "source_png": item["source_png"],
             "out_png": str(item["out_png"]),
             "extras": {k: str(v) for k, v in item.get("extras", {}).items()},
             "deps_auto_installed": bool(item.get("deps_auto_installed", False)),
+            "atlas_mode": str(item.get("atlas_mode", "")),
+            "atlas_target_channel": str(item.get("atlas_target_channel", "")),
         }
         for item in resolved
     ]
+    report["exact_hits"] = sum(1 for item in resolved if str(item.get("atlas_mode", "")).strip().lower() == "json_export")
+    report["strict_misses"] = sum(
+        1
+        for err in errors
+        if "atlas_json_strict" in str(err.get("error", "")).lower()
+        or str(err.get("error", "")).lower().startswith("missing_source")
+    )
+    report["cache_hits"] = sum(1 for item in resolved if bool(item.get("cache_hit", False)))
     if any(str(item.get("atlas_source", "")).strip().lower() == "fallback" for item in resolved):
         report["atlas_source"] = "fallback"
     report["deps_auto_installed"] = any(bool(item.get("deps_auto_installed", False)) for item in resolved)
@@ -2800,6 +3742,7 @@ def _resolve_material_maps(
         (
             f"texture resolve done refs={len(report.get('refs', []))} "
             f"resolved={len(report.get('resolved', []))} errors={len(report.get('errors', []))} "
+            f"cache_hits={int(report.get('cache_hits', 0) or 0)} "
             f"channels={','.join(report.get('channels', [])) if report.get('channels') else '-'} "
             f"elapsed={time.monotonic()-stage_t0:.1f}s"
         ),
@@ -2815,12 +3758,22 @@ def _collect_mesh_buckets(
     material_name_by_id: Dict[int, str],
     material_role_by_id: Dict[int, str],
     bone_name_by_index: Dict[int, str],
+    bone_parent_by_index: Dict[int, int],
     split_main_parts: bool,
-    split_wheels: bool,
-    wheel_tuning: Dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     buckets: Dict[str, dict[str, Any]] = {}
     order: List[str] = []
+    default_root_bone_index = -1
+    if bone_name_by_index:
+        root_candidates = [
+            int(i)
+            for i in bone_name_by_index.keys()
+            if int(bone_parent_by_index.get(int(i), -1)) < 0
+        ]
+        if root_candidates:
+            default_root_bone_index = min(root_candidates)
+        else:
+            default_root_bone_index = min(int(i) for i in bone_name_by_index.keys())
 
     for part_i, part in enumerate(model.get("parts", [])):
         indices = part.get("indices", [])
@@ -2850,33 +3803,56 @@ def _collect_mesh_buckets(
         mat_name = material_name_by_id.get(mid, f"Material_{mid:03d}")
         fallback = f"Part_{part_i:03d}"
 
-        if split_main_parts or split_wheels:
-            if bone_name_by_index:
-                groups = extractor_mod.split_faces_by_bone(
-                    part,
-                    fallback,
-                    bone_name_by_index,
-                    material_role=role,
-                    material_name=mat_name,
-                    wheel_tuning=wheel_tuning or None,
-                )
-            else:
-                groups = [(fallback, _all_tris(indices))]
-            groups = _split_groups_for_options(
-                groups=groups,
-                fallback_name=fallback,
-                split_main_parts=split_main_parts,
-                split_wheels=split_wheels,
-            )
+        group_payloads: List[Dict[str, Any]] = []
+        if split_main_parts:
+            if bone_name_by_index and hasattr(extractor_mod, "split_faces_by_bone_deterministic"):
+                try:
+                    group_payloads = extractor_mod.split_faces_by_bone_deterministic(
+                        part=part,
+                        bone_name_by_index=bone_name_by_index,
+                        bone_parent_by_index=bone_parent_by_index or {},
+                        material_role=role,
+                        material_name=mat_name,
+                    )
+                except Exception:
+                    group_payloads = []
+            elif bone_name_by_index and hasattr(extractor_mod, "split_faces_by_bone_top_level"):
+                # Backward compatibility with older extractor builds.
+                try:
+                    group_payloads = extractor_mod.split_faces_by_bone_top_level(
+                        part=part,
+                        bone_name_by_index=bone_name_by_index,
+                        bone_parent_by_index=bone_parent_by_index or {},
+                        material_role=role,
+                        material_name=mat_name,
+                    )
+                except Exception:
+                    group_payloads = []
+            if not group_payloads:
+                group_payloads = [{
+                    "group_name_raw": fallback,
+                    "group_name_sanitized": fallback,
+                    "group_bone_index": int(default_root_bone_index),
+                    "tris": _all_tris(indices),
+                }]
         else:
-            groups = [("MainBody", _all_tris(indices))]
+            group_payloads = [{
+                "group_name_raw": "MainBody",
+                "group_name_sanitized": "MainBody",
+                "group_bone_index": int(default_root_bone_index),
+                "tris": _all_tris(indices),
+            }]
 
-        for group_name, tris in groups:
+        for group in group_payloads:
+            group_name = str(group.get("group_name_raw", "") or group.get("group_name_sanitized", "") or fallback)
+            tris = group.get("tris", [])
+            group_bone_index = int(group.get("group_bone_index", -1))
             key = _norm_low(group_name) or "mainbody"
             bucket = buckets.get(key)
             if bucket is None:
                 bucket = {
                     "group_name": str(group_name),
+                    "group_bone_index": int(group_bone_index),
                     "vertices": [],
                     "uvs": [],
                     "faces": [],
@@ -2885,6 +3861,8 @@ def _collect_mesh_buckets(
                 }
                 buckets[key] = bucket
                 order.append(key)
+            elif int(bucket.get("group_bone_index", -1)) < 0 and int(group_bone_index) >= 0:
+                bucket["group_bone_index"] = int(group_bone_index)
 
             vmap: Dict[Tuple[int, int], int] = bucket["map"]
             for a, b, c in tris:
@@ -2940,11 +3918,59 @@ def _texture_node(nodes, path: Path, x: int, y: int, non_color: bool = False):
     return node
 
 
+def _normal_invert_mode_text(value: str) -> str:
+    mode = str(value or "").strip().lower()
+    if mode not in {"none", "invert_green", "invert_rgb"}:
+        return "none"
+    return mode
+
+
+def _effective_normal_invert_mode(settings: WARNOImporterSettings) -> str:
+    # Atlas JSON conversion already writes inverted normal textures on disk.
+    if bool(getattr(settings, "use_atlas_json_mapping", False)):
+        return "none"
+    return _normal_invert_mode_text(str(getattr(settings, "normal_invert_mode", "none") or "none"))
+
+
+def _wire_normal_color_to_normal_map(nodes, links, color_socket, normal_map_node, invert_mode: str) -> None:
+    mode = _normal_invert_mode_text(invert_mode)
+    try:
+        while normal_map_node.inputs["Color"].is_linked:
+            links.remove(normal_map_node.inputs["Color"].links[0])
+    except Exception:
+        pass
+
+    if mode == "invert_rgb":
+        inv = nodes.new("ShaderNodeInvert")
+        inv.location = (normal_map_node.location.x - 190, normal_map_node.location.y)
+        links.new(color_socket, inv.inputs["Color"])
+        links.new(inv.outputs["Color"], normal_map_node.inputs["Color"])
+        return
+
+    if mode == "invert_green":
+        sep = nodes.new("ShaderNodeSeparateRGB")
+        sep.location = (normal_map_node.location.x - 300, normal_map_node.location.y)
+        inv_g = nodes.new("ShaderNodeInvert")
+        inv_g.location = (normal_map_node.location.x - 80, normal_map_node.location.y - 130)
+        comb = nodes.new("ShaderNodeCombineRGB")
+        comb.location = (normal_map_node.location.x + 120, normal_map_node.location.y)
+        links.new(color_socket, sep.inputs["Image"])
+        links.new(sep.outputs["R"], comb.inputs["R"])
+        links.new(sep.outputs["B"], comb.inputs["B"])
+        links.new(sep.outputs["G"], inv_g.inputs["Color"])
+        links.new(inv_g.outputs["Color"], comb.inputs["G"])
+        links.new(comb.outputs["Image"], normal_map_node.inputs["Color"])
+        return
+
+    links.new(color_socket, normal_map_node.inputs["Color"])
+
+
 def _apply_material_nodes(
     mat: bpy.types.Material,
     maps: dict[str, Path],
     role: str,
     ao_multiply_diffuse: bool = True,
+    normal_invert_mode: str = "none",
 ) -> None:
     alpha = maps.get("alpha")
     alpha_track_like = False
@@ -3011,7 +4037,13 @@ def _apply_material_nodes(
         if normal_node is not None:
             nm = nodes.new("ShaderNodeNormalMap")
             nm.location = (-670, -340)
-            links.new(normal_node.outputs["Color"], nm.inputs["Color"])
+            _wire_normal_color_to_normal_map(
+                nodes=nodes,
+                links=links,
+                color_socket=normal_node.outputs["Color"],
+                normal_map_node=nm,
+                invert_mode=normal_invert_mode,
+            )
             links.new(nm.outputs["Normal"], bsdf.inputs["Normal"])
 
     if roughness is not None:
@@ -3090,15 +4122,6 @@ def _apply_auto_smooth_modifier(objects: Sequence[bpy.types.Object], angle_deg: 
     return count
 
 
-def _object_world_center(obj: bpy.types.Object) -> Vector:
-    if obj.type != "MESH" or not obj.bound_box:
-        return obj.matrix_world.translation.copy()
-    acc = Vector((0.0, 0.0, 0.0))
-    for c in obj.bound_box:
-        acc += Vector((c[0], c[1], c[2]))
-    return obj.matrix_world @ (acc / 8.0)
-
-
 def _mesh_bounds(objects: Sequence[bpy.types.Object]) -> tuple[Vector, float]:
     pts: list[Vector] = []
     for obj in objects:
@@ -3118,49 +4141,12 @@ def _mesh_bounds(objects: Sequence[bpy.types.Object]) -> tuple[Vector, float]:
     return center, diag
 
 
-def _pick_root_bone_name(bones: Sequence[str]) -> str:
-    for name in bones:
-        low = _norm_low(name)
-        if "chassis" in low or "hull" in low or low.startswith("base"):
-            return name
-    return bones[0] if bones else "Chassis"
-
-
-def _match_object_for_bone(raw_name: str, objects: Sequence[bpy.types.Object]) -> bpy.types.Object | None:
-    low = _norm_low(raw_name)
-    tok = _norm_token(raw_name)
-    if not low:
-        return None
-    by_low = {_norm_low(o.get("warno_group", o.name)): o for o in objects}
-    if low in by_low:
-        return by_low[low]
-    for obj in objects:
-        if _norm_token(str(obj.get("warno_group", obj.name))) == tok:
-            return obj
-    if low.startswith("roue_elev_"):
-        alt = low.replace("roue_elev_", "roue_")
-        if alt in by_low:
-            return by_low[alt]
-    if "chassis" in low:
-        for obj in objects:
-            if "chassis" in _norm_low(str(obj.get("warno_group", obj.name))):
-                return obj
-    return None
-
-
-def _pick_position_for_bone(
+def _pick_position_from_payload(
     raw_name: str,
     bone_positions: dict[str, list[float]],
-    objects: Sequence[bpy.types.Object],
-    scene_center: Vector,
-) -> Vector:
+) -> Vector | None:
     low = _norm_low(raw_name)
     keys = [low, _norm_token(low)]
-    if low.startswith("fx_"):
-        keys.append(low[3:])
-        keys.append(_norm_token(low[3:]))
-    if low.startswith("bone_"):
-        keys.append("chassis")
     for key in keys:
         if not key:
             continue
@@ -3170,52 +4156,7 @@ def _pick_position_for_bone(
                 return Vector((float(hit[0]), float(hit[1]), float(hit[2])))
             except Exception:
                 pass
-    src_obj = _match_object_for_bone(raw_name, objects)
-    if src_obj is not None:
-        return _object_world_center(src_obj)
-    return scene_center.copy()
-
-
-def _pick_parent_name(raw_name: str, root_name: str, present_low: set[str]) -> str | None:
-    low = _norm_low(raw_name)
-    root_low = _norm_low(root_name)
-    if not low or low == root_low:
-        return None
-
-    turret = next((n for n in sorted(present_low) if ("tourelle" in n or "turret" in n) and not n.startswith("fx_")), None)
-    axe = next((n for n in sorted(present_low) if ("axe_canon" in n or n == "axe" or n.startswith("axe_")) and not n.startswith("fx_")), None)
-
-    if "canon" in low or "gun" in low or "barrel" in low:
-        if axe:
-            return axe
-        if turret:
-            return turret
-        return root_low
-    if "axe_canon" in low or low == "axe" or low.startswith("axe_"):
-        if turret:
-            return turret
-        return root_low
-    if "tourelle" in low or "turret" in low:
-        return root_low
-    if low.startswith("roue_") or low.startswith("chenille_") or low.startswith("fx_"):
-        return root_low
-    return root_low
-
-
-def _pick_bone_for_object(obj: bpy.types.Object, bone_map_low_to_actual: dict[str, str], root_low: str) -> str | None:
-    names = [str(obj.get("warno_group", "")), obj.name]
-    for nm in names:
-        low = _norm_low(nm)
-        tok = _norm_token(nm)
-        if low in bone_map_low_to_actual:
-            return low
-        for raw_low in bone_map_low_to_actual.keys():
-            if _norm_token(raw_low) == tok:
-                return raw_low
-    group_low = _norm_low(str(obj.get("warno_group", obj.name)))
-    if "chassis" in group_low:
-        return root_low
-    return root_low if root_low in bone_map_low_to_actual else next(iter(bone_map_low_to_actual.keys()), None)
+    return None
 
 
 def _set_object_origin_world(obj: bpy.types.Object, world_point: Vector) -> None:
@@ -3232,95 +4173,515 @@ def _build_helper_armature(
     imported_objects: Sequence[bpy.types.Object],
     bone_payload: dict[str, Any],
     collection: bpy.types.Collection,
+    settings: WARNOImporterSettings | None = None,
 ) -> bpy.types.Object | None:
-    bone_names = [str(x).strip() for x in bone_payload.get("bone_names", []) if str(x).strip()]
-    if not bone_names:
+    bone_name_by_index_raw = bone_payload.get("bone_name_by_index", {}) or {}
+    if not isinstance(bone_name_by_index_raw, dict) or not bone_name_by_index_raw:
         return None
+    bone_name_by_index: Dict[int, str] = {}
+    for k, v in bone_name_by_index_raw.items():
+        try:
+            idx = int(k)
+        except Exception:
+            continue
+        name = str(v or "").strip()
+        if not name:
+            continue
+        bone_name_by_index[idx] = name
+    if not bone_name_by_index:
+        return None
+    bone_parent_by_index_raw = bone_payload.get("bone_parent_by_index", {}) or {}
+    bone_parent_by_index: Dict[int, int] = {}
+    if isinstance(bone_parent_by_index_raw, dict):
+        for k, v in bone_parent_by_index_raw.items():
+            try:
+                bone_parent_by_index[int(k)] = int(v)
+            except Exception:
+                continue
 
-    scene_center, diag = _mesh_bounds(imported_objects)
+    _scene_center, diag = _mesh_bounds(imported_objects)
     bone_positions = bone_payload.get("bone_positions", {}) or {}
-    root_name = _pick_root_bone_name(bone_names)
-    ordered = [root_name] + [n for n in bone_names if _norm_low(n) != _norm_low(root_name)]
-
-    arm_data = bpy.data.armatures.new("Armature")
-    arm_obj = bpy.data.objects.new("Armature", arm_data)
-    collection.objects.link(arm_obj)
-    if hasattr(arm_obj, "show_in_front"):
-        arm_obj.show_in_front = True
-    if hasattr(arm_data, "display_type"):
-        arm_data.display_type = "BBONE"
-    if hasattr(arm_obj, "display_type"):
-        arm_obj.display_type = "WIRE"
-    if hasattr(arm_obj, "color"):
-        arm_obj.color = (0.55, 0.85, 1.0, 0.35)
-
-    for o in bpy.context.scene.objects:
-        o.select_set(False)
-    arm_obj.select_set(True)
-    bpy.context.view_layer.objects.active = arm_obj
-    bpy.ops.object.mode_set(mode="EDIT")
+    ordered_indices = sorted(int(i) for i in bone_name_by_index.keys())
 
     bone_len = max(0.003, diag * 0.00035) if diag > 0.0 else 0.003
     bone_len = min(bone_len, 0.03)
-    by_raw_low: dict[str, str] = {}
-    used_actual_low: set[str] = set()
 
-    for raw in ordered:
-        base = raw[:63] if raw else "Bone"
-        if not base:
-            base = "Bone"
-        actual = base
-        suffix = 2
-        while _norm_low(actual) in used_actual_low:
-            cut = max(1, 63 - len(str(suffix)) - 1)
-            actual = f"{base[:cut]}_{suffix}"
-            suffix += 1
-        used_actual_low.add(_norm_low(actual))
-
-        eb = arm_data.edit_bones.new(actual)
-        pos = _pick_position_for_bone(raw, bone_positions, imported_objects, scene_center)
-        eb.head = pos
-        eb.tail = pos + Vector((0.0, 0.0, bone_len))
-        by_raw_low[_norm_low(raw)] = actual
-
-    present = set(by_raw_low.keys())
-    for raw in ordered:
-        raw_low = _norm_low(raw)
-        parent_low = _pick_parent_name(raw, root_name, present)
-        if parent_low is None:
+    weighted_positions_by_index: Dict[int, Vector] = {}
+    for bidx in ordered_indices:
+        raw = str(bone_name_by_index.get(int(bidx), "")).strip()
+        if not raw:
             continue
-        child_name = by_raw_low.get(raw_low)
-        parent_name = by_raw_low.get(_norm_low(parent_low))
-        if not child_name or not parent_name:
+        pos = _pick_position_from_payload(raw, bone_positions)
+        if pos is None:
             continue
-        child = arm_data.edit_bones.get(child_name)
-        parent = arm_data.edit_bones.get(parent_name)
-        if child is not None and parent is not None and child != parent:
-            child.parent = parent
+        weighted_positions_by_index[int(bidx)] = pos
 
-    bpy.ops.object.mode_set(mode="OBJECT")
+    child_by_parent: Dict[int, List[int]] = {}
+    for child_idx, parent_idx_raw in bone_parent_by_index.items():
+        child = int(child_idx)
+        parent = int(parent_idx_raw)
+        if child not in bone_name_by_index:
+            continue
+        child_by_parent.setdefault(parent, []).append(child)
 
-    root_low = _norm_low(root_name)
+    resolved_positions: Dict[int, Vector] = {int(k): v.copy() for k, v in weighted_positions_by_index.items()}
+    pending: set[int] = {int(i) for i in ordered_indices if int(i) not in resolved_positions}
+    fallback_from_children = 0
+    fallback_from_parent = 0
+    fallback_line_placed = 0
+    missing_parent_anchor = 0
+
+    # Fallback A: pull position from already-resolved children.
+    for _ in range(max(1, len(pending) + 1)):
+        if not pending:
+            break
+        changed = False
+        for bidx in list(pending):
+            child_positions: List[Vector] = []
+            for ch in child_by_parent.get(int(bidx), []):
+                pos = resolved_positions.get(int(ch))
+                if pos is not None:
+                    child_positions.append(pos)
+            if not child_positions:
+                continue
+            acc = Vector((0.0, 0.0, 0.0))
+            for pos in child_positions:
+                acc += pos
+            resolved_positions[int(bidx)] = acc / float(len(child_positions))
+            pending.remove(int(bidx))
+            fallback_from_children += 1
+            changed = True
+        if not changed:
+            break
+
+    # Fallback B: parent anchor + deterministic local offset.
+    def _parent_depth(idx: int) -> int:
+        depth = 0
+        cur = int(idx)
+        seen: set[int] = set()
+        while True:
+            if cur in seen:
+                break
+            seen.add(cur)
+            p = int(bone_parent_by_index.get(cur, -1))
+            if p < 0:
+                break
+            depth += 1
+            cur = p
+            if depth > 256:
+                break
+        return depth
+
+    for _ in range(max(1, len(pending) + 1)):
+        if not pending:
+            break
+        changed = False
+        for bidx in sorted(list(pending)):
+            parent_idx = int(bone_parent_by_index.get(int(bidx), -1))
+            parent_pos = resolved_positions.get(parent_idx)
+            if parent_pos is None:
+                continue
+            depth = _parent_depth(int(bidx))
+            name_low = _norm_low(str(bone_name_by_index.get(int(bidx), "")))
+            side_sign = 0.0
+            if re.search(r"(?:^|_)g[0-9]+(?:_|$)", name_low) or "gauche" in name_low:
+                side_sign = -1.0
+            elif re.search(r"(?:^|_)d[0-9]+(?:_|$)", name_low) or "droite" in name_low:
+                side_sign = 1.0
+            offset = Vector((0.003 * side_sign, 0.0, 0.008 + 0.0015 * float(depth % 5)))
+            resolved_positions[int(bidx)] = parent_pos + offset
+            pending.remove(int(bidx))
+            fallback_from_parent += 1
+            changed = True
+        if not changed:
+            break
+
+    # Fallback C: deterministic parking line near roots for unresolved nodes.
+    roots = [
+        int(i)
+        for i in ordered_indices
+        if int(bone_parent_by_index.get(int(i), -1)) < 0
+    ]
+    root_positions = [resolved_positions[int(i)] for i in roots if int(i) in resolved_positions]
+    if root_positions:
+        anchor = Vector((0.0, 0.0, 0.0))
+        for pos in root_positions:
+            anchor += pos
+        anchor = anchor / float(len(root_positions))
+    elif resolved_positions:
+        anchor = Vector((0.0, 0.0, 0.0))
+        for pos in resolved_positions.values():
+            anchor += pos
+        anchor = anchor / float(len(resolved_positions))
+    else:
+        anchor = Vector((0.0, 0.0, 0.0))
+
+    for line_idx, bidx in enumerate(sorted(list(pending))):
+        jitter = -1.0 if (line_idx % 2 == 0) else 1.0
+        resolved_positions[int(bidx)] = anchor + Vector((0.0025 * jitter, 0.0, 0.02 + float(line_idx) * 0.004))
+        pending.remove(int(bidx))
+        fallback_line_placed += 1
+        missing_parent_anchor += 1
+
+    def _to_pretty_name(raw_name: str) -> str:
+        low = _norm_low(raw_name)
+        if not low:
+            return "Empty"
+        m = re.match(r"^roue_(elev_)?([dg])([0-9]+)$", low, flags=re.IGNORECASE)
+        if m:
+            prefix = "Roue_Elev" if m.group(1) else "Roue"
+            side = str(m.group(2)).upper()
+            num = int(m.group(3))
+            return f"{prefix}_{side}{num}"
+        m = re.match(r"^armature_([dg])([0-9]+)$", low, flags=re.IGNORECASE)
+        if m:
+            side = str(m.group(1)).upper()
+            num = int(m.group(2))
+            return f"Armature_{side}{num}"
+        m = re.match(r"^tourelle_([0-9]+)$", low, flags=re.IGNORECASE)
+        if m:
+            return f"Tourelle_{int(m.group(1)):02d}"
+        m = re.match(r"^axe_canon_([0-9]+)$", low, flags=re.IGNORECASE)
+        if m:
+            return f"Axe_Canon_{int(m.group(1)):02d}"
+        m = re.match(r"^canon_([0-9]+)$", low, flags=re.IGNORECASE)
+        if m:
+            return f"Canon_{int(m.group(1)):02d}"
+        m = re.match(r"^blindage_([dg])([0-9]+)$", low, flags=re.IGNORECASE)
+        if m:
+            return f"Blindage_{str(m.group(1)).upper()}{int(m.group(2))}"
+        m = re.match(r"^chenille_(droite|gauche)(?:_([0-9]+))?$", low, flags=re.IGNORECASE)
+        if m:
+            side = "Droite" if m.group(1).lower() == "droite" else "Gauche"
+            n = m.group(2)
+            if n is None:
+                return f"Chenille_{side}"
+            return f"Chenille_{side}_{int(n):02d}"
+        parts = [p for p in re.split(r"_+", str(raw_name or "").strip()) if p]
+        if not parts:
+            return "Empty"
+        out_parts: List[str] = []
+        for token in parts:
+            if token.isdigit():
+                out_parts.append(token)
+            elif len(token) == 1 and token.lower() in {"d", "g"}:
+                out_parts.append(token.upper())
+            else:
+                out_parts.append(token[:1].upper() + token[1:])
+        return "_".join(out_parts)
+
+    def _set_parent_keep_world(child: bpy.types.Object, parent: bpy.types.Object) -> None:
+        wm = child.matrix_world.copy()
+        child.parent = parent
+        child.parent_type = "OBJECT"
+        child.parent_bone = ""
+        child.matrix_parent_inverse = parent.matrix_world.inverted()
+        child.matrix_world = wm
+
+    mesh_by_bone_index: Dict[int, List[bpy.types.Object]] = {}
     for obj in imported_objects:
-        target_low = _pick_bone_for_object(obj, by_raw_low, root_low)
-        if not target_low:
+        try:
+            bidx = int(obj.get("warno_group_bone_index", -1))
+        except Exception:
+            bidx = -1
+        if bidx < 0:
             continue
-        bone_name = by_raw_low.get(target_low)
-        if not bone_name:
-            continue
-        bone = arm_obj.data.bones.get(bone_name)
-        if bone is None:
-            continue
-        head_world = arm_obj.matrix_world @ bone.head_local
-        _set_object_origin_world(obj, head_world)
-        world_matrix = obj.matrix_world.copy()
-        obj.parent = arm_obj
-        obj.parent_type = "BONE"
-        obj.parent_bone = bone_name
-        obj.matrix_parent_inverse = (arm_obj.matrix_world @ bone.matrix_local).inverted()
-        obj.matrix_world = world_matrix
+        mesh_by_bone_index.setdefault(int(bidx), []).append(obj)
 
-    return arm_obj
+    mesh_by_name_low: Dict[str, bpy.types.Object] = {}
+    for obj in imported_objects:
+        key = _norm_low(obj.name)
+        if key and key not in mesh_by_name_low:
+            mesh_by_name_low[key] = obj
+
+    def _bounds_world(obj: bpy.types.Object) -> Tuple[Vector, Vector, Vector]:
+        pts: List[Vector] = []
+        if obj.type == "MESH" and obj.bound_box:
+            for c in obj.bound_box:
+                pts.append(obj.matrix_world @ Vector((c[0], c[1], c[2])))
+        if not pts:
+            p = obj.matrix_world.translation.copy()
+            return p.copy(), p.copy(), p.copy()
+        min_v = Vector((min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts)))
+        max_v = Vector((max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts)))
+        center = (min_v + max_v) * 0.5
+        return min_v, max_v, center
+
+    # Override Roue_Elev anchors from corresponding wheel mesh centers.
+    roue_re = re.compile(r"^roue_elev_([dg])([0-9]+)$", re.IGNORECASE)
+    for bidx, raw_name in bone_name_by_index.items():
+        low = _norm_low(raw_name)
+        m = roue_re.match(low)
+        if not m:
+            continue
+        wheel_name = f"roue_{str(m.group(1)).upper()}{int(m.group(2))}"
+        wheel_obj = mesh_by_name_low.get(_norm_low(wheel_name))
+        if wheel_obj is None:
+            continue
+        _mn, _mx, ctr = _bounds_world(wheel_obj)
+        resolved_positions[int(bidx)] = ctr.copy()
+
+    # Deterministic FX anchors from source names and mesh bounds.
+    chassis_obj = mesh_by_name_low.get("chassis")
+    tourelle_obj = mesh_by_name_low.get("tourelle_01")
+    canon_by_number: Dict[int, bpy.types.Object] = {}
+    for name_low, obj in mesh_by_name_low.items():
+        m = re.match(r"^canon_([0-9]+)$", name_low, re.IGNORECASE)
+        if m:
+            canon_by_number[int(m.group(1))] = obj
+
+    track_right_obj = None
+    track_left_obj = None
+    for obj in imported_objects:
+        low = _norm_low(obj.name)
+        if low.startswith("chenille_droite"):
+            track_right_obj = obj
+        elif low.startswith("chenille_gauche"):
+            track_left_obj = obj
+
+    fx_tir_re = re.compile(r"^fx_tourelle([0-9]+)_tir_([0-9]+)$", re.IGNORECASE)
+    for bidx, raw_name in bone_name_by_index.items():
+        low = _norm_low(raw_name)
+        if not low.startswith("fx_"):
+            continue
+
+        if low.startswith("fx_fumee_chenille_d"):
+            if track_right_obj is not None:
+                mn, mx, _ctr = _bounds_world(track_right_obj)
+                dx = max(0.05, (mx.x - mn.x) * 0.05)
+                dz = (mx.z - mn.z) * 0.18
+                resolved_positions[int(bidx)] = Vector((mn.x - dx, mn.y, mn.z + dz))
+            continue
+        if low.startswith("fx_fumee_chenille_g"):
+            if track_left_obj is not None:
+                mn, mx, _ctr = _bounds_world(track_left_obj)
+                dx = max(0.05, (mx.x - mn.x) * 0.05)
+                dz = (mx.z - mn.z) * 0.18
+                resolved_positions[int(bidx)] = Vector((mn.x - dx, mx.y, mn.z + dz))
+            continue
+
+        mt = fx_tir_re.match(low)
+        if mt:
+            canon_num = int(mt.group(1))
+            tir_num = int(mt.group(2))
+            canon_obj = canon_by_number.get(canon_num)
+            if canon_obj is not None:
+                mn, mx, ctr = _bounds_world(canon_obj)
+                lx = max(0.01, (mx.x - mn.x) * 0.02)
+                y_val = ctr.y
+                if tir_num == 2:
+                    y_val = mn.y
+                elif tir_num == 1:
+                    y_val = mx.y
+                resolved_positions[int(bidx)] = Vector((mx.x + lx, y_val, ctr.z))
+            continue
+
+        if chassis_obj is not None:
+            cmn, cmx, cctr = _bounds_world(chassis_obj)
+            sx = (cmx.x - cmn.x)
+            sy = (cmx.y - cmn.y)
+            sz = (cmx.z - cmn.z)
+            if low == "fx_moteur":
+                resolved_positions[int(bidx)] = Vector((cmn.x + sx * 0.04, cctr.y - sy * 0.06, cmx.z + sz * 0.05))
+            elif low == "fx_chaleur_01":
+                resolved_positions[int(bidx)] = Vector((cmn.x + sx * 0.04, cctr.y + sy * 0.02, cmx.z + sz * 0.05))
+            elif low == "fx_incendie":
+                resolved_positions[int(bidx)] = Vector((cmn.x + sx * 0.10, cctr.y + sy * 0.14, cmx.z + sz * 0.16))
+            elif low == "fx_stress_01":
+                resolved_positions[int(bidx)] = Vector((cmn.x + sx * 0.17, cmx.y - sy * 0.10, cmx.z + sz * 0.07))
+            elif low == "fx_stress_02":
+                resolved_positions[int(bidx)] = Vector((cmn.x + sx * 0.17, cmn.y + sy * 0.10, cmx.z + sz * 0.07))
+            elif low == "fx_munition" and tourelle_obj is not None:
+                tmn, tmx, tctr = _bounds_world(tourelle_obj)
+                resolved_positions[int(bidx)] = Vector((tctr.x, tctr.y, tmx.z + (tmx.z - tmn.z) * 0.12))
+
+    # If one track smoke exists and the mirrored side is unresolved, mirror by Y.
+    def _find_bidx(prefix: str) -> int:
+        for bidx, name in bone_name_by_index.items():
+            if _norm_low(name).startswith(prefix):
+                return int(bidx)
+        return -1
+
+    b_d = _find_bidx("fx_fumee_chenille_d")
+    b_g = _find_bidx("fx_fumee_chenille_g")
+    if b_d >= 0 and b_g >= 0:
+        p_d = resolved_positions.get(int(b_d))
+        p_g = resolved_positions.get(int(b_g))
+        if p_d is not None and p_g is None:
+            resolved_positions[int(b_g)] = Vector((p_d.x, -p_d.y, p_d.z))
+        elif p_g is not None and p_d is None:
+            resolved_positions[int(b_d)] = Vector((p_g.x, -p_g.y, p_g.z))
+
+    used_object_names: set[str] = {_norm_low(o.name) for o in bpy.data.objects}
+    node_by_bone_index: Dict[int, bpy.types.Object] = {}
+    created_empties = 0
+
+    for bidx in ordered_indices:
+        mesh_nodes = mesh_by_bone_index.get(int(bidx), [])
+        if mesh_nodes:
+            node_by_bone_index[int(bidx)] = mesh_nodes[0]
+            continue
+
+        raw = str(bone_name_by_index.get(int(bidx), "")).strip()
+        if not raw:
+            continue
+        raw_low = _norm_low(raw)
+        if re.fullmatch(r"empty(?:\.[0-9]+)?", raw_low):
+            continue
+        if raw_low.startswith("cylinder."):
+            continue
+        if raw_low.startswith("armature_"):
+            continue
+
+        base_name = _to_pretty_name(raw)
+        name = base_name[:63] if base_name else f"Empty_{int(bidx):03d}"
+        if not name:
+            name = f"Empty_{int(bidx):03d}"
+        suffix = 2
+        while _norm_low(name) in used_object_names:
+            tail = f"_{suffix}"
+            cut = max(1, 63 - len(tail))
+            name = f"{base_name[:cut]}{tail}"
+            suffix += 1
+        used_object_names.add(_norm_low(name))
+
+        empty = bpy.data.objects.new(name, None)
+        empty.empty_display_type = "PLAIN_AXES"
+        empty.empty_display_size = 1.0
+        collection.objects.link(empty)
+        node_by_bone_index[int(bidx)] = empty
+        created_empties += 1
+
+    # Place object origins/empties at resolved deterministic positions.
+    for bidx, node in node_by_bone_index.items():
+        pos = resolved_positions.get(int(bidx))
+        if pos is None:
+            continue
+        if node.type == "MESH":
+            _set_object_origin_world(node, pos)
+        else:
+            node.location = pos
+
+    # Build small wheel-elev armatures (dev-like) and bind track meshes to side root armatures.
+    elev_groups: Dict[str, List[int]] = {}
+    elev_pattern = re.compile(r"^roue_elev_([dg])([0-9]+)$", re.IGNORECASE)
+    for bidx in ordered_indices:
+        raw = str(bone_name_by_index.get(int(bidx), "")).strip()
+        m = elev_pattern.match(_norm_low(raw))
+        if not m:
+            continue
+        parent_idx = int(bone_parent_by_index.get(int(bidx), -1))
+        parent_raw = _norm_low(str(bone_name_by_index.get(parent_idx, "")))
+        if parent_raw.startswith("armature_"):
+            grp = parent_raw
+        else:
+            side = str(m.group(1)).lower()
+            num = int(m.group(2))
+            grp_num = 1 if num in {1, 9} else 2
+            grp = f"armature_{side}{grp_num}"
+        elev_groups.setdefault(grp, []).append(int(bidx))
+
+    created_armatures: List[bpy.types.Object] = []
+    armature_by_side: Dict[str, bpy.types.Object] = {}
+
+    for grp_low in sorted(elev_groups.keys()):
+        bone_indices = sorted(elev_groups.get(grp_low, []))
+        if not bone_indices:
+            continue
+        arm_name = _to_pretty_name(grp_low)
+        arm_data = bpy.data.armatures.new(arm_name)
+        arm_obj = bpy.data.objects.new(arm_name, arm_data)
+        collection.objects.link(arm_obj)
+        if hasattr(arm_data, "display_type"):
+            arm_data.display_type = "OCTAHEDRAL"
+        if hasattr(arm_obj, "show_in_front"):
+            arm_obj.show_in_front = False
+        if hasattr(arm_obj, "display_type"):
+            arm_obj.display_type = "TEXTURED"
+
+        for o in bpy.context.scene.objects:
+            o.select_set(False)
+        arm_obj.select_set(True)
+        bpy.context.view_layer.objects.active = arm_obj
+        bpy.ops.object.mode_set(mode="EDIT")
+        for bidx in bone_indices:
+            braw = str(bone_name_by_index.get(int(bidx), "")).strip()
+            bname = _to_pretty_name(braw)[:63] if braw else f"Bone_{int(bidx):03d}"
+            eb = arm_data.edit_bones.new(bname)
+            pos = resolved_positions.get(int(bidx), Vector((0.0, 0.0, 0.0)))
+            eb.head = pos
+            eb.tail = pos + Vector((0.0, 0.0, bone_len))
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+        created_armatures.append(arm_obj)
+        m = re.match(r"^armature_([DG])1$", arm_name, flags=re.IGNORECASE)
+        if m:
+            side = "right" if m.group(1).upper() == "D" else "left"
+            armature_by_side[side] = arm_obj
+
+    # Hierarchical OBJECT parenting from bone tree.
+    parented_nodes = 0
+    for bidx in ordered_indices:
+        child = node_by_bone_index.get(int(bidx))
+        if child is None:
+            continue
+        parent_idx = int(bone_parent_by_index.get(int(bidx), -1))
+        if parent_idx < 0:
+            continue
+        parent_raw = _norm_low(str(bone_name_by_index.get(int(parent_idx), "")))
+        child_raw = _norm_low(str(bone_name_by_index.get(int(bidx), "")))
+        if parent_raw.startswith("armature_"):
+            continue
+        if child_raw.startswith("fx_fumee_chenille_"):
+            continue
+        parent = node_by_bone_index.get(int(parent_idx))
+        if parent is None or parent == child:
+            continue
+        _set_parent_keep_world(child, parent)
+        parented_nodes += 1
+
+    # Track meshes parent to side armature object (dev-like).
+    track_parented = 0
+    for obj in imported_objects:
+        low = _norm_low(obj.name)
+        side = ""
+        if "chenille_gauche" in low:
+            side = "left"
+        elif "chenille_droite" in low:
+            side = "right"
+        if not side:
+            continue
+        arm = armature_by_side.get(side)
+        if arm is None:
+            continue
+        _set_parent_keep_world(obj, arm)
+        track_parented += 1
+
+    if settings is not None:
+        bones_total = len(ordered_indices)
+        weighted_count = len(weighted_positions_by_index)
+        fallback_count = max(0, bones_total - weighted_count)
+        _warno_log(
+            settings,
+            (
+                f"armature bones: total={bones_total} "
+                f"bones_created_weighted={weighted_count} "
+                f"bones_created_fallback={fallback_count} "
+                f"bones_missing_parent_anchor={missing_parent_anchor} "
+                f"(fallback_children={fallback_from_children}, "
+                f"fallback_parent={fallback_from_parent}, "
+                f"fallback_line={fallback_line_placed}) "
+                f"| empties_created={created_empties} "
+                f"| wheel_armatures_created={len(created_armatures)} "
+                f"| object_parent_links={parented_nodes} "
+                f"| track_parent_links={track_parented}"
+            ),
+            stage="armature",
+        )
+
+    if created_armatures:
+        return created_armatures[0]
+    return None
 
 
 class WARNO_OT_LoadConfig(Operator):
@@ -3332,7 +4693,9 @@ class WARNO_OT_LoadConfig(Operator):
         settings = context.scene.warno_import
         path = _config_path(settings)
         ok, msg = _load_config_into_settings(settings, path)
-        _refresh_wheel_preset_cache(settings)
+        _enforce_fixed_runtime_defaults(settings)
+        if ok:
+            _save_project_root_state(settings)
         settings.status = msg
         self.report({"INFO" if ok else "WARNING"}, msg)
         return {"FINISHED" if ok else "CANCELLED"}
@@ -3354,7 +4717,9 @@ class WARNO_OT_LoadExampleConfig(Operator):
             self.report({"WARNING"}, msg)
             return {"CANCELLED"}
         ok, msg = _load_config_into_settings(settings, path)
-        _refresh_wheel_preset_cache(settings)
+        _enforce_fixed_runtime_defaults(settings)
+        if ok:
+            _save_project_root_state(settings)
         settings.status = msg
         self.report({"INFO" if ok else "WARNING"}, msg)
         return {"FINISHED" if ok else "CANCELLED"}
@@ -3369,155 +4734,262 @@ class WARNO_OT_SaveConfig(Operator):
         settings = context.scene.warno_import
         path = _config_path(settings)
         ok, msg = _save_settings_to_config(settings, path)
-        _refresh_wheel_preset_cache(settings)
+        remember_ok, remember_msg = _save_project_root_state(settings)
+        if remember_ok:
+            msg = f"{msg} | {remember_msg}"
+        else:
+            msg = f"{msg} | {remember_msg}"
         settings.status = msg
         self.report({"INFO" if ok else "WARNING"}, msg)
         return {"FINISHED" if ok else "CANCELLED"}
 
 
-class WARNO_OT_ResetTrackTuning(Operator):
-    bl_idname = "warno.reset_track_tuning"
-    bl_label = "Reset Track Params"
-    bl_description = "Reset track/wheel correction sliders to built-in defaults"
+class WARNO_OT_RememberProjectRoot(Operator):
+    bl_idname = "warno.remember_project_root"
+    bl_label = "Remember Project Root"
+    bl_description = "Save Project Root and auto-load this root config on next Blender start"
 
     def execute(self, context):
         settings = context.scene.warno_import
-        _apply_wheel_tuning_to_settings(settings, _wheel_default_tuning())
-        settings.status = "Track/wheel correction params reset to defaults."
-        self.report({"INFO"}, settings.status)
-        return {"FINISHED"}
-
-
-class WARNO_OT_SaveTrackPreset(Operator):
-    bl_idname = "warno.save_track_preset"
-    bl_label = "Save Track Preset"
-    bl_description = "Save current track/wheel correction sliders as named preset"
-
-    def execute(self, context):
-        settings = context.scene.warno_import
-        name = str(settings.track_preset_name or "").strip()
-        if not name:
-            self.report({"WARNING"}, "Preset name is empty.")
-            return {"CANCELLED"}
-
-        presets = _read_wheel_presets(settings)
-        presets[name] = {
-            "pair_dist_scale": float(settings.track_fix_distance_scale),
-            "pair_edge_scale": float(settings.track_fix_edge_scale),
-            "pair_target_ratio": float(settings.track_fix_target_ratio),
-            "pair_min_pool_ratio": float(settings.track_fix_min_pool_ratio),
-            "pair_axial_scale": float(settings.track_fix_axial_scale),
-            "pair_ring_min": float(settings.track_fix_ring_min),
-            "pair_ring_max": float(settings.track_fix_ring_max),
-        }
-        ok, msg = _write_wheel_presets(settings, presets)
+        _enforce_fixed_runtime_defaults(settings)
+        ok, msg = _save_project_root_state(settings)
         if not ok:
             settings.status = msg
             self.report({"ERROR"}, msg)
             return {"CANCELLED"}
-        _refresh_wheel_preset_cache(settings)
-        try:
-            settings.selected_track_preset = name
-        except Exception:
-            pass
-        settings.status = f"Track preset saved: {name}"
-        self.report({"INFO"}, settings.status)
-        return {"FINISHED"}
 
+        cfg = _config_path(settings)
+        if cfg.exists() and cfg.is_file():
+            cfg_ok, cfg_msg = _load_config_into_settings(settings, cfg)
+            _enforce_fixed_runtime_defaults(settings)
+            status = f"{msg} | {cfg_msg}"
+            settings.status = status
+            self.report({"INFO" if cfg_ok else "WARNING"}, status)
+            return {"FINISHED" if cfg_ok else "CANCELLED"}
 
-class WARNO_OT_LoadTrackPreset(Operator):
-    bl_idname = "warno.load_track_preset"
-    bl_label = "Load Track Preset"
-    bl_description = "Load selected track/wheel correction preset to sliders"
-
-    def execute(self, context):
-        settings = context.scene.warno_import
-        _refresh_wheel_preset_cache(settings)
-        key = str(settings.selected_track_preset or "").strip()
-        if not key or key == "__none__":
-            self.report({"WARNING"}, "No preset selected.")
-            return {"CANCELLED"}
-
-        presets = _read_wheel_presets(settings)
-        tuning = presets.get(key)
-        if not tuning:
-            self.report({"WARNING"}, f"Preset not found: {key}")
-            return {"CANCELLED"}
-
-        _apply_wheel_tuning_to_settings(settings, tuning)
-        settings.track_preset_name = key
-        settings.status = f"Track preset loaded: {key}"
-        self.report({"INFO"}, settings.status)
+        settings.status = msg
+        self.report({"INFO"}, msg)
         return {"FINISHED"}
 
 
 def _scan_assets_impl(self, context, scan_all: bool):
     settings = context.scene.warno_import
-    project_root = _project_root(settings)
+    _enforce_fixed_runtime_defaults(settings)
     t0 = time.monotonic()
-    _warno_log(settings, f"scan start mode={'ALL' if scan_all else 'query'} query='{settings.query}'", stage="scan")
+    query = str(settings.query or "").strip()
+    _warno_log(settings, f"scan start mode={'ALL' if scan_all else 'query'} query='{query}'", stage="scan")
+    if scan_all:
+        return bpy.ops.warno.build_asset_index(force_rebuild=False)
 
     try:
+        _warno_log(settings, "stage: asset_index_prepare", stage="asset_index_prepare")
+        index_data, source, _runtime_info, spk_paths = _ensure_asset_index_sync(settings, force_rebuild=False)
         extractor_mod = _extractor_module(settings)
-        runtime_info = _prepare_zz_runtime_sources(extractor_mod, settings) if settings.use_zz_dat_source else {}
-        spk_paths = _resolve_mesh_spk_paths(project_root, settings, runtime_info)
-        if not spk_paths:
-            msg = "No mesh SPK files found. Set Mesh SPK/Folder or prepare ZZ runtime."
-            settings.status = msg
-            self.report({"ERROR"}, msg)
-            return {"CANCELLED"}
-        query = str(settings.query or "").strip()
-        query_for_scan = None if scan_all else (query if query else None)
-        seen_assets: set[str] = set()
-        matches: List[tuple[str, Dict[str, Any]]] = []
-        for spk_path in spk_paths:
-            try:
-                with extractor_mod.SpkMeshExtractor(spk_path) as spk:
-                    for asset, meta in spk.find_matches(query_for_scan, None):
-                        key = str(asset).strip().lower()
-                        if not key or key in seen_assets:
-                            continue
-                        seen_assets.add(key)
-                        matches.append((asset, meta))
-            except Exception:
-                continue
-        matches.sort(key=lambda it: _asset_picker_sort_key(extractor_mod, str(it[0])))
+        filtered_assets = _apply_picker_view_from_index(
+            settings,
+            extractor_mod,
+            index_data,
+            source=source,
+            query=query,
+        )
+        groups = _asset_groups_from_cache(settings)
+        folders = _asset_folders_from_cache(settings)
+        msg = (
+            f"Matches: {len(filtered_assets)} "
+            f"(index source:{source} | groups:{len(groups)} | folders:{len(folders)} | mode:query | spk:{len(spk_paths)}) "
+            f"| elapsed:{time.monotonic()-t0:.1f}s"
+        )
+        settings.status = msg
+        _warno_log(settings, msg, stage="asset_index_query_filter")
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
     except Exception as exc:
         msg = f"Scan failed: {exc}"
         settings.status = msg
+        _warno_log(settings, msg, level="ERROR", stage="scan")
         self.report({"ERROR"}, msg)
         return {"CANCELLED"}
 
-    assets_all = [str(asset) for asset, _ in matches]
-    assets = assets_all if scan_all else assets_all[: int(settings.match_limit)]
-    groups = _build_asset_groups(extractor_mod, assets)
-    folders = _build_asset_folders_cache(extractor_mod, groups)
 
-    settings.match_cache_json = json.dumps(assets, ensure_ascii=False)
-    settings.asset_group_cache_json = json.dumps(groups, ensure_ascii=False)
-    settings.asset_folder_cache_json = json.dumps(folders, ensure_ascii=False)
-    settings.asset_sync_lock = True
-    try:
-        if groups:
-            settings.selected_asset_group = str(groups[0].get("primary", "")).strip()
-            settings.selected_asset_lod = "__base__"
-            settings.selected_asset = settings.selected_asset_group
-        elif assets:
-            settings.selected_asset = assets[0]
-    finally:
-        settings.asset_sync_lock = False
-    _sync_group_lod_from_selected(settings)
+def _load_extractor_module_for_worker(extractor_path: Path):
+    spec = importlib.util.spec_from_file_location(f"warno_asset_index_worker_{time.time_ns()}", str(extractor_path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load extractor module: {extractor_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
-    mode_txt = "ALL" if scan_all else "query"
-    msg = (
-        f"Matches: {len(matches)} "
-        f"(cached: {len(assets)} | groups:{len(groups)} | folders:{len(folders)} | mode:{mode_txt} | spk:{len(spk_paths)})"
-    )
-    msg += f" | elapsed:{time.monotonic()-t0:.1f}s"
-    settings.status = msg
-    _warno_log(settings, msg, stage="scan")
-    self.report({"INFO"}, msg)
-    return {"FINISHED"}
+
+def _build_asset_index_payload_worker(
+    extractor_path: Path,
+    spk_paths: Sequence[Path],
+    signature: Dict[str, Any],
+    index_path: Path,
+) -> Dict[str, Any]:
+    extractor_mod = _load_extractor_module_for_worker(extractor_path)
+    assets = _scan_assets_from_spk_paths(extractor_mod, spk_paths, query=None)
+    payload = _build_asset_index_payload(extractor_mod, assets, signature, len(spk_paths))
+    _save_asset_index_file(index_path, payload)
+    return payload
+
+
+class WARNO_OT_BuildAssetIndex(Operator):
+    bl_idname = "warno.build_asset_index"
+    bl_label = "Build Asset Index"
+    bl_description = "Build full cached asset index from prepared ZZ runtime mesh SPK files"
+    bl_options = {"INTERNAL"}
+
+    force_rebuild: BoolProperty(default=False, options={"HIDDEN"})
+
+    _timer = None
+    _thread = None
+    _job: Dict[str, Any] | None = None
+    _started_at: float = 0.0
+
+    def _cleanup_timer(self, context):
+        if self._timer is not None:
+            try:
+                context.window_manager.event_timer_remove(self._timer)
+            except Exception:
+                pass
+            self._timer = None
+
+    def execute(self, context):
+        settings = context.scene.warno_import
+        _enforce_fixed_runtime_defaults(settings)
+        t0 = time.monotonic()
+        _warno_log(settings, "stage: asset_index_prepare", stage="asset_index_prepare")
+        try:
+            extractor_mod = _extractor_module(settings)
+            runtime_info = _prepare_zz_runtime_sources(extractor_mod, settings)
+            project_root = _project_root(settings)
+            spk_paths = _resolve_mesh_spk_paths(project_root, settings, runtime_info)
+            if not spk_paths:
+                raise RuntimeError("No mesh SPK files found in prepared ZZ runtime.")
+            signature = _asset_index_signature(runtime_info, spk_paths)
+            index_path = _asset_index_path(settings)
+            if not bool(self.force_rebuild):
+                cached = _load_asset_index_file(index_path)
+                if cached is not None and _asset_index_signature_matches(cached, signature):
+                    assets = _apply_picker_view_from_index(
+                        settings,
+                        extractor_mod,
+                        cached,
+                        source="cache",
+                        query="",
+                    )
+                    counts = cached.get("counts", {}) if isinstance(cached.get("counts", {}), dict) else {}
+                    msg = (
+                        "Scan ALL ready from cache: "
+                        f"assets={int(counts.get('assets', len(assets)) or len(assets))} "
+                        f"groups={int(counts.get('groups', len(_asset_groups_from_cache(settings))) or len(_asset_groups_from_cache(settings)))} "
+                        f"folders={int(counts.get('folders', len(_asset_folders_from_cache(settings))) or len(_asset_folders_from_cache(settings)))} "
+                        f"| spk={len(spk_paths)} | elapsed:{time.monotonic()-t0:.1f}s"
+                    )
+                    settings.status = msg
+                    _warno_log(settings, msg, stage="asset_index_load")
+                    self.report({"INFO"}, msg)
+                    return {"FINISHED"}
+
+            extractor_path = project_root / "warno_spk_extract.py"
+            self._job = {
+                "done": False,
+                "error": "",
+                "payload": None,
+                "spk_paths": [Path(p) for p in spk_paths],
+                "index_path": index_path,
+                "signature": signature,
+                "extractor_path": extractor_path,
+            }
+
+            def worker():
+                try:
+                    payload = _build_asset_index_payload_worker(
+                        extractor_path=Path(self._job["extractor_path"]),
+                        spk_paths=[Path(p) for p in self._job["spk_paths"]],
+                        signature=dict(self._job["signature"]),
+                        index_path=Path(self._job["index_path"]),
+                    )
+                    self._job["payload"] = payload
+                except Exception as exc:
+                    self._job["error"] = str(exc)
+                finally:
+                    self._job["done"] = True
+
+            self._thread = threading.Thread(target=worker, name="WARNO_AssetIndexBuilder", daemon=True)
+            self._thread.start()
+            self._started_at = time.monotonic()
+            self._timer = context.window_manager.event_timer_add(0.25, window=context.window)
+            context.window_manager.modal_handler_add(self)
+            settings.status = "Scan ALL started: building index in background..."
+            _warno_log(settings, "Scan ALL started: background index build", stage="asset_index_build")
+            return {"RUNNING_MODAL"}
+        except Exception as exc:
+            msg = f"Scan ALL failed: {exc}"
+            settings.status = msg
+            _warno_log(settings, msg, level="ERROR", stage="asset_index_prepare")
+            self.report({"ERROR"}, msg)
+            return {"CANCELLED"}
+
+    def modal(self, context, event):
+        settings = context.scene.warno_import
+        if event.type != "TIMER":
+            return {"PASS_THROUGH"}
+        if self._thread is not None and self._thread.is_alive():
+            elapsed = time.monotonic() - float(self._started_at or time.monotonic())
+            settings.status = f"Scan ALL running... elapsed:{elapsed:.1f}s"
+            return {"RUNNING_MODAL"}
+
+        self._cleanup_timer(context)
+        if not isinstance(self._job, dict):
+            settings.status = "Scan ALL cancelled: internal job state is missing."
+            self.report({"ERROR"}, settings.status)
+            return {"CANCELLED"}
+
+        err = str(self._job.get("error", "")).strip()
+        if err:
+            msg = f"Scan ALL failed: {err}"
+            settings.status = msg
+            _warno_log(settings, msg, level="ERROR", stage="asset_index_build")
+            self.report({"ERROR"}, msg)
+            return {"CANCELLED"}
+
+        payload = self._job.get("payload")
+        if not isinstance(payload, dict):
+            msg = "Scan ALL failed: index payload is empty."
+            settings.status = msg
+            _warno_log(settings, msg, level="ERROR", stage="asset_index_build")
+            self.report({"ERROR"}, msg)
+            return {"CANCELLED"}
+
+        try:
+            extractor_mod = _extractor_module(settings)
+            assets = _apply_picker_view_from_index(
+                settings,
+                extractor_mod,
+                payload,
+                source="rebuilt",
+                query="",
+            )
+            counts = payload.get("counts", {}) if isinstance(payload.get("counts", {}), dict) else {}
+            msg = (
+                "Scan ALL done: "
+                f"assets={int(counts.get('assets', len(assets)) or len(assets))} "
+                f"groups={int(counts.get('groups', len(_asset_groups_from_cache(settings))) or len(_asset_groups_from_cache(settings)))} "
+                f"folders={int(counts.get('folders', len(_asset_folders_from_cache(settings))) or len(_asset_folders_from_cache(settings)))} "
+                f"| spk={int(counts.get('spk_count', 0) or 0)} "
+                f"| source=rebuilt | elapsed:{time.monotonic()-float(self._started_at or time.monotonic()):.1f}s"
+            )
+            settings.status = msg
+            _warno_log(settings, msg, stage="asset_index_build")
+            self.report({"INFO"}, msg)
+            return {"FINISHED"}
+        except Exception as exc:
+            msg = f"Scan ALL finalize failed: {exc}"
+            settings.status = msg
+            _warno_log(settings, msg, level="ERROR", stage="asset_index_build")
+            self.report({"ERROR"}, msg)
+            return {"CANCELLED"}
 
 
 class WARNO_OT_ScanAssets(Operator):
@@ -3531,8 +5003,8 @@ class WARNO_OT_ScanAssets(Operator):
 
 class WARNO_OT_ScanAssetsAll(Operator):
     bl_idname = "warno.scan_assets_all"
-    bl_label = "Scan ALL Assets (takes a long time)"
-    bl_description = "Scan all assets in all connected Mesh SPK files (can take a long time)"
+    bl_label = "Scan ALL Assets (uses cache)"
+    bl_description = "Load full asset index from cache or rebuild it in background when stale"
 
     def execute(self, context):
         return _scan_assets_impl(self, context, scan_all=True)
@@ -3543,8 +5015,10 @@ class WARNO_OT_PickAssetBrowser(Operator):
     bl_label = "Pick Asset Browser"
     bl_description = "Pick asset by folder/model/LOD in a browser-like dialog"
 
-    folder_key: EnumProperty(name="Folder", items=_browser_folder_items)
-    search_text: StringProperty(name="Search", default="")
+    root_key: EnumProperty(name="Root", items=_browser_root_items, update=_update_browser_root_key)
+    category_key: EnumProperty(name="Category", items=_browser_category_items, update=_update_browser_category_key)
+    folder_key: EnumProperty(name="Folder", items=_browser_folder_items, update=_update_browser_folder_key)
+    search_text: StringProperty(name="Search", default="", update=_update_browser_search_text)
     model_key: EnumProperty(name="Model", items=_browser_model_items)
     lod_key: EnumProperty(name="LOD", items=_browser_lod_items)
 
@@ -3552,7 +5026,21 @@ class WARNO_OT_PickAssetBrowser(Operator):
         settings = context.scene.warno_import
         folders = _asset_folders_from_cache(settings)
         if not folders:
-            self.report({"WARNING"}, "No scanned assets. Run Scan Assets first.")
+            try:
+                index_data, source, _runtime_info, _spk_paths = _ensure_asset_index_sync(settings, force_rebuild=False)
+                extractor_mod = _extractor_module(settings)
+                _apply_picker_view_from_index(
+                    settings,
+                    extractor_mod,
+                    index_data,
+                    source=source,
+                    query="",
+                )
+                folders = _asset_folders_from_cache(settings)
+            except Exception:
+                pass
+        if not folders:
+            self.report({"WARNING"}, "No scanned assets. Run Scan ALL Assets first.")
             return {"CANCELLED"}
 
         selected_primary = str(settings.selected_asset_group or "").strip()
@@ -3580,6 +5068,17 @@ class WARNO_OT_PickAssetBrowser(Operator):
             first_models = first.get("models", []) if isinstance(first.get("models", []), list) else []
             found_model_key = str(first_models[0].get("primary", "")).strip() if first_models else "__none__"
 
+        root_key = _folder_root_key(found_folder_key)
+        self.root_key = root_key
+        found_category = ""
+        found_folder_key_low = str(found_folder_key or "").strip().lower()
+        for folder in folders:
+            fkey = str(folder.get("key", "")).strip().lower()
+            if fkey != found_folder_key_low:
+                continue
+            found_category = str(folder.get("category", "")).strip() or _asset_category_from_folder_key(fkey)
+            break
+        self.category_key = found_category or "__all__"
         self.folder_key = found_folder_key or "__none__"
         self.search_text = ""
         self.model_key = found_model_key or "__none__"
@@ -3588,21 +5087,34 @@ class WARNO_OT_PickAssetBrowser(Operator):
         else:
             self.lod_key = "__base__"
 
-        return context.window_manager.invoke_props_dialog(self, width=760)
+        return context.window_manager.invoke_props_dialog(self, width=1100)
 
     def draw(self, context):
         layout = self.layout
-        col = layout.column(align=True)
-        col.prop(self, "folder_key")
-        col.prop(self, "search_text")
-        col.prop(self, "model_key")
-        col.prop(self, "lod_key")
+        top = layout.row(align=True)
+        top.prop(self, "root_key")
+        top.prop(self, "category_key")
+        top.prop(self, "search_text")
+
+        row = layout.row(align=True)
+        c1 = row.column(align=True)
+        c1.label(text="Folder")
+        c1.prop(self, "folder_key", text="")
+
+        c2 = row.column(align=True)
+        c2.label(text="Model")
+        c2.prop(self, "model_key", text="")
+
+        c3 = row.column(align=True)
+        c3.label(text="LOD")
+        c3.prop(self, "lod_key", text="")
+
         chosen = str(self.model_key or "").strip()
         lod = str(self.lod_key or "").strip()
         if lod and lod != "__base__":
             chosen = lod
-        col.separator()
-        col.label(text=f"Will use: {chosen}", icon="OBJECT_DATA")
+        layout.separator()
+        layout.label(text=f"Will use: {chosen}", icon="OBJECT_DATA")
 
     def execute(self, context):
         settings = context.scene.warno_import
@@ -3614,9 +5126,9 @@ class WARNO_OT_PickAssetBrowser(Operator):
 
         settings.asset_sync_lock = True
         try:
-            settings.selected_asset_group = model
-            settings.selected_asset_lod = lod if lod else "__base__"
-            settings.selected_asset = final_asset
+            _safe_set_selected_asset_group(settings, model)
+            _safe_set_selected_asset_lod(settings, lod if lod else "__base__")
+            _safe_set_selected_asset(settings, final_asset)
         finally:
             settings.asset_sync_lock = False
         _sync_group_lod_from_selected(settings)
@@ -3642,7 +5154,11 @@ class WARNO_OT_PickAssetPopup(Operator):
         pick = str(self.asset_pick or "").strip()
         if not pick or pick == "__none__":
             return {"CANCELLED"}
-        settings.selected_asset = pick
+        settings.asset_sync_lock = True
+        try:
+            _safe_set_selected_asset(settings, pick)
+        finally:
+            settings.asset_sync_lock = False
         _sync_group_lod_from_selected(settings)
         settings.status = f"Picked: {pick}"
         return {"FINISHED"}
@@ -3655,16 +5171,12 @@ class WARNO_OT_PrepareZZRuntime(Operator):
 
     def execute(self, context):
         settings = context.scene.warno_import
+        _enforce_fixed_runtime_defaults(settings)
         t0 = time.monotonic()
         try:
             _set_status(settings, "stage: preparing runtime", stage="runtime")
             extractor_mod = _extractor_module(settings)
             info = _prepare_zz_runtime_sources(extractor_mod, settings, force_rebuild=True)
-            if not info:
-                msg = "ZZ runtime source is disabled."
-                settings.status = msg
-                self.report({"WARNING"}, msg)
-                return {"CANCELLED"}
 
             mesh_spk = str(info.get("mesh_spk", "")).strip()
             mesh_spk_dir = str(info.get("mesh_spk_dir", "")).strip()
@@ -3683,18 +5195,36 @@ class WARNO_OT_PrepareZZRuntime(Operator):
                 settings.skeleton_spk = skeleton_spk_dir
             elif skeleton_spk:
                 settings.skeleton_spk = skeleton_spk
-            if atlas_root and (not str(settings.atlas_assets_dir or "").strip() or settings.use_zz_dat_source):
+            if atlas_root:
                 settings.atlas_assets_dir = atlas_root
-            if bool(settings.use_zz_dat_source):
-                cand = _candidate_tgv_converter_from_modding_suite(settings)
-                if cand is not None:
-                    settings.tgv_converter = str(cand)
+            settings.tgv_converter = "tgv_to_png.py"
+
+            index_note = "asset index: pending"
+            try:
+                project_root = _project_root(settings)
+                spk_paths = _resolve_mesh_spk_paths(project_root, settings, info)
+                signature = _asset_index_signature(info, spk_paths)
+                idx = _load_asset_index_file(_asset_index_path(settings))
+                if idx is not None and _asset_index_signature_matches(idx, signature):
+                    _apply_picker_view_from_index(
+                        settings,
+                        extractor_mod,
+                        idx,
+                        source="cache",
+                        query="",
+                    )
+                    index_note = "asset index: cache"
+                else:
+                    index_note = "asset index: stale or missing (run Scan ALL Assets)"
+            except Exception:
+                index_note = "asset index: status unavailable"
 
             msg = (
                 f"ZZ runtime ready: dat={dat_count}, "
                 f"mesh_spk={len(mesh_spk_files) if mesh_spk_files else (1 if mesh_spk else 0)}, "
                 f"skeleton_spk={len(skeleton_spk_files) if skeleton_spk_files else (1 if skeleton_spk else 0)}"
             )
+            msg += f" | {index_note}"
             msg += f" | elapsed:{time.monotonic()-t0:.1f}s"
             settings.status = msg
             _warno_log(settings, msg, stage="runtime")
@@ -3713,6 +5243,33 @@ class WARNO_OT_OpenTextureFolder(Operator):
     bl_label = "Open Texture Folder"
     bl_description = "Open folder where textures were saved on last import"
 
+    @staticmethod
+    def _pick_best_texture_folder(root: Path) -> Path:
+        # Prefer deterministic atlas output leaf: <asset>/textures/<logical_path>/...
+        textures_root = root / "textures"
+        search_root = textures_root if textures_root.exists() and textures_root.is_dir() else root
+
+        dirs_with_images: List[Path] = []
+        try:
+            for p in search_root.rglob("*"):
+                if not p.is_file():
+                    continue
+                if p.suffix.lower() not in IMAGE_EXTENSIONS:
+                    continue
+                try:
+                    dirs_with_images.append(p.parent.resolve())
+                except Exception:
+                    dirs_with_images.append(p.parent)
+        except Exception:
+            return search_root
+
+        if not dirs_with_images:
+            return search_root
+
+        # Pick deepest directory with images (usually textures/<3d/.../asset_name>).
+        dirs_unique = sorted(set(dirs_with_images), key=lambda d: (len(d.parts), str(d).lower()), reverse=True)
+        return dirs_unique[0]
+
     def execute(self, context):
         settings = context.scene.warno_import
         raw = str(settings.last_texture_dir or "").strip()
@@ -3723,6 +5280,7 @@ class WARNO_OT_OpenTextureFolder(Operator):
         if not folder.exists() or not folder.is_dir():
             self.report({"WARNING"}, f"Texture folder not found: {folder}")
             return {"CANCELLED"}
+        folder = self._pick_best_texture_folder(folder)
         try:
             bpy.ops.wm.path_open(filepath=str(folder))
         except Exception as exc:
@@ -3750,14 +5308,11 @@ class WARNO_OT_ClearTextureFolder(Operator):
         # Remove generated texture files only (keep mesh/manifests unrelated to textures).
         deleted = 0
         failed = 0
-        extra_files = {"manual_texture_manifest.json"}
-
         for p in sorted(root.rglob("*")):
             if not p.is_file():
                 continue
-            low_name = p.name.lower()
             low_ext = p.suffix.lower()
-            if low_ext in IMAGE_EXTENSIONS or low_name in extra_files:
+            if low_ext in IMAGE_EXTENSIONS:
                 try:
                     p.unlink()
                     deleted += 1
@@ -3791,19 +5346,9 @@ class WARNO_OT_InstallTGVDeps(Operator):
         try:
             extractor_mod = _extractor_module(settings)
             project_root = _project_root(settings)
-
-            converter_text = str(settings.tgv_converter or "").strip()
-            converter = _resolve_path(project_root, converter_text) if converter_text else Path()
-            if (not converter_text or not converter.exists() or not converter.is_file()) and bool(settings.use_zz_dat_source):
-                cand = _candidate_tgv_converter_from_modding_suite(settings)
-                if cand is not None:
-                    converter = cand
+            converter = project_root / "tgv_to_png.py"
             if not converter.exists() or not converter.is_file():
-                bundled = project_root / "tgv_to_png.py"
-                if bundled.exists() and bundled.is_file():
-                    converter = bundled
-            if not converter.exists() or not converter.is_file():
-                raise RuntimeError(f"TGV converter not found: {converter}")
+                raise RuntimeError(f"Bundled TGV converter not found: {converter}")
 
             deps_dir = _resolve_path(project_root, str(settings.tgv_deps_dir or "").strip() or ".warno_pydeps")
             ok, msg = extractor_mod.install_tgv_converter_deps(converter=converter, deps_dir=deps_dir)
@@ -3868,23 +5413,71 @@ class WARNO_OT_OpenLogFile(Operator):
             return {"CANCELLED"}
 
 
-def _manual_channel_from_suffix_token(token: str) -> str | None:
-    low = _norm_low(token)
-    if low in {"d", "diff", "diffuse", "albedo", "color"}:
-        return "diffuse"
-    if low in {"nm", "normal", "n"}:
-        return "normal"
-    if low in {"r", "rough", "roughness"}:
-        return "roughness"
-    if low in {"m", "metal", "metallic"}:
-        return "metallic"
-    if low in {"ao", "occlusion"}:
-        return "occlusion"
-    if low in {"a", "alpha"}:
-        return "alpha"
-    if low in {"orm"}:
-        return "roughness"
-    return None
+class WARNO_OT_RebuildAtlasJsonCache(Operator):
+    bl_idname = "warno.rebuild_atlas_json_cache"
+    bl_label = "Rebuild Atlas JSON Cache"
+    bl_description = "Force rebuild Atlas JSON map for current selected asset"
+
+    def execute(self, context):
+        settings = context.scene.warno_import
+        _enforce_fixed_runtime_defaults(settings)
+
+        asset = str(settings.selected_asset or "").strip()
+        if not asset:
+            msg = "No asset selected. Scan and pick an asset first."
+            settings.status = msg
+            self.report({"WARNING"}, msg)
+            return {"CANCELLED"}
+
+        project_root = _project_root(settings)
+        warno_root = _resolve_path(project_root, str(settings.warno_root or "").strip())
+        modsuite_root = _resolve_path(project_root, str(settings.modding_suite_root or "").strip())
+        wrapper_path = _resolve_path(
+            project_root,
+            str(settings.modding_suite_atlas_wrapper or "").strip() or "modding_suite_atlas_export.py",
+        )
+        atlas_cli_text = str(settings.modding_suite_atlas_cli or "").strip()
+        atlas_cli_path = _resolve_path(project_root, atlas_cli_text) if atlas_cli_text else None
+        cache_root = _atlas_json_cache_root(settings)
+
+        if not warno_root.exists() or not warno_root.is_dir():
+            msg = f"WARNO folder not found: {warno_root}"
+            settings.status = msg
+            self.report({"ERROR"}, msg)
+            return {"CANCELLED"}
+        if not modsuite_root.exists() or not modsuite_root.is_dir():
+            msg = f"moddingSuite root not found: {modsuite_root}"
+            settings.status = msg
+            self.report({"ERROR"}, msg)
+            return {"CANCELLED"}
+
+        try:
+            extractor_mod = _extractor_module(settings)
+            if hasattr(extractor_mod, "clear_atlas_json_cache"):
+                extractor_mod.clear_atlas_json_cache()
+            info = extractor_mod.build_or_load_atlas_texture_map(
+                warno_root=warno_root,
+                modding_suite_root=modsuite_root,
+                asset_path=asset,
+                cache_dir=cache_root,
+                wrapper_path=wrapper_path,
+                atlas_cli_path=atlas_cli_path,
+                force_rebuild=True,
+                timeout_sec=max(5, int(settings.atlas_cli_timeout_sec)),
+            )
+            entries = int(info.get("atlas_map_entries", 0) or 0)
+            map_path = str(info.get("atlas_map_path", "")).strip()
+            msg = f"Atlas JSON rebuilt: entries={entries} | {map_path or asset}"
+            settings.status = msg
+            _warno_log(settings, msg, stage="atlas")
+            self.report({"INFO"}, msg)
+            return {"FINISHED"}
+        except Exception as exc:
+            msg = f"Atlas JSON rebuild failed: {exc}"
+            settings.status = msg
+            _warno_log(settings, msg, level="ERROR", stage="atlas")
+            self.report({"ERROR"}, msg)
+            return {"CANCELLED"}
 
 
 def _strip_texture_channel_suffix(stem: str) -> str:
@@ -3898,417 +5491,134 @@ def _strip_texture_channel_suffix(stem: str) -> str:
     return out
 
 
-def _name_similarity_score(target_base: str, cand_base: str, mat_name: str) -> float:
-    ta = _norm_low(_strip_texture_channel_suffix(target_base))
-    ca = _norm_low(_strip_texture_channel_suffix(cand_base))
-    ma = _norm_low(_strip_texture_channel_suffix(mat_name))
-    if not ta and not ca:
-        return 0.0
-    score = 0.0
-    if ta and ca:
-        if ta == ca:
-            score += 120.0
-        if ta and ta in ca:
-            score += 40.0
-        if ca and ca in ta:
-            score += 30.0
-        pref = 0
-        for a, b in zip(ta, ca):
-            if a != b:
-                break
-            pref += 1
-        score += min(20.0, pref * 0.8)
-        tok_t = {t for t in re.split(r"[^a-z0-9]+", ta) if t}
-        tok_c = {t for t in re.split(r"[^a-z0-9]+", ca) if t}
-        score += float(len(tok_t & tok_c)) * 12.0
-    if ma and ca:
-        if ma in ca or ca in ma:
-            score += 16.0
-        tok_m = {t for t in re.split(r"[^a-z0-9]+", ma) if t}
-        tok_c = {t for t in re.split(r"[^a-z0-9]+", ca) if t}
-        score += float(len(tok_m & tok_c)) * 6.0
-    return score
+def _forced_track_material_name(raw_name: str) -> str:
+    low = _norm_low(str(raw_name or ""))
+    if not low:
+        return ""
+    low = re.sub(r"\.\d{3}$", "", low)
+    low = low.replace(" ", "_")
+    low = re.sub(r"_+", "_", low).strip("_")
+    if re.search(r"(?:^|_)(tracks|trk)_2$", low):
+        return "Chenille_Gauche"
+    if re.search(r"(?:^|_)(tracks|trk)$", low):
+        return "Chenille_Droite"
+    return ""
 
 
-def _first_image_upstream_socket(socket, max_depth: int = 5):
-    visited: set[tuple[int, str, int]] = set()
+def _forced_track_material_name_for_role(raw_name: str, material_role: str) -> str:
+    role_low = _norm_low(material_role)
+    if role_low == "track_left":
+        return "Chenille_Gauche"
+    if role_low == "track_right":
+        return "Chenille_Droite"
 
-    def walk(sock, depth: int):
-        if sock is None or depth < 0:
-            return None
-        links = getattr(sock, "links", [])
-        for link_i, link in enumerate(links):
-            src_node = getattr(link, "from_node", None)
-            src_sock = getattr(link, "from_socket", None)
-            key = (id(src_node), str(getattr(src_sock, "name", "")), depth)
-            if key in visited:
-                continue
-            visited.add(key)
-            if src_node is None:
-                continue
-            if getattr(src_node, "type", "") == "TEX_IMAGE":
-                return src_node
-            if depth <= 0:
-                continue
-            for in_sock in getattr(src_node, "inputs", []):
-                hit = walk(in_sock, depth - 1)
-                if hit is not None:
-                    return hit
-        return None
+    forced = _forced_track_material_name(raw_name)
+    if forced:
+        return forced
 
-    return walk(socket, max_depth)
+    low = _norm_low(str(raw_name or ""))
+    if "chenille_gauche" in low or "track_left" in low:
+        return "Chenille_Gauche"
+    if "chenille_droite" in low or "track_right" in low:
+        return "Chenille_Droite"
+    return ""
 
 
-def _guess_material_base_from_nodes(mat: bpy.types.Material) -> str:
-    if mat is None or not mat.use_nodes or mat.node_tree is None:
-        return _strip_texture_channel_suffix(mat.name if mat else "")
-    nt = mat.node_tree
-    bsdf = None
-    for node in nt.nodes:
-        if getattr(node, "type", "") == "BSDF_PRINCIPLED":
-            bsdf = node
-            break
-    image_node = None
-    if bsdf is not None and "Base Color" in bsdf.inputs:
-        image_node = _first_image_upstream_socket(bsdf.inputs["Base Color"], max_depth=6)
-    if image_node is None:
-        for node in nt.nodes:
-            if getattr(node, "type", "") == "TEX_IMAGE" and getattr(node, "image", None) is not None:
-                image_node = node
-                break
-    if image_node is not None and image_node.image is not None:
-        fp = str(image_node.image.filepath_raw or image_node.image.filepath or "").strip()
-        if fp:
-            try:
-                stem = Path(bpy.path.abspath(fp)).stem
-            except Exception:
-                stem = Path(fp).stem
-            return _strip_texture_channel_suffix(stem)
-    return _strip_texture_channel_suffix(mat.name)
+def _derive_material_roles_runtime(
+    extractor_mod,
+    material_ids: Sequence[int],
+    raw_spk_names: Dict[int, str],
+    raw_slot_names: Dict[int, Dict[str, str]],
+) -> Dict[int, str]:
+    def _local_track_role(text: str) -> str:
+        low = _norm_low(text).replace("\\", "/")
+        if not low:
+            return ""
+        if "chenille_droite_2" in low or "chenille_droite.2" in low:
+            return "track_left"
+        if (
+            "chenille_gauche" in low
+            or "track_left" in low
+            or "left_track" in low
+            or "tracks_2" in low
+            or "trk_2" in low
+        ):
+            return "track_left"
+        if (
+            "chenille_droite" in low
+            or "track_right" in low
+            or "right_track" in low
+            or ("tracks" in low and "tracks_2" not in low)
+            or ("trk" in low and "trk_2" not in low)
+        ):
+            return "track_right"
+        return ""
 
-
-def _assign_image_to_material_channel(mat: bpy.types.Material, channel: str, image_path: Path) -> bool:
-    if mat is None or not image_path.exists() or not image_path.is_file():
-        return False
-    if not mat.use_nodes:
-        mat.use_nodes = True
-    if mat.node_tree is None:
-        return False
-    nt = mat.node_tree
-    nodes = nt.nodes
-    links = nt.links
-    bsdf = None
-    for node in nodes:
-        if getattr(node, "type", "") == "BSDF_PRINCIPLED":
-            bsdf = node
-            break
-    if bsdf is None:
-        bsdf = nodes.new("ShaderNodeBsdfPrincipled")
-    img = _load_image(image_path)
-    if img is None:
-        return False
-
-    def ensure_tex_node(non_color: bool, x: float, y: float):
-        node = nodes.new("ShaderNodeTexImage")
-        node.location = (x, y)
-        node.image = img
-        if non_color:
-            try:
-                node.image.colorspace_settings.name = "Non-Color"
-            except Exception:
-                pass
-        return node
-
-    ch = str(channel or "").lower()
-    if ch == "diffuse":
-        sock = bsdf.inputs.get("Base Color")
-        if sock is None:
-            return False
-        tex_node = _first_image_upstream_socket(sock, max_depth=6)
-        if tex_node is not None:
-            tex_node.image = img
-            try:
-                tex_node.image.colorspace_settings.name = "sRGB"
-            except Exception:
-                pass
-            return True
-        tex_node = ensure_tex_node(non_color=False, x=bsdf.location.x - 620, y=bsdf.location.y + 170)
-        links.new(tex_node.outputs["Color"], sock)
-        return True
-
-    if ch == "normal":
-        sock = bsdf.inputs.get("Normal")
-        if sock is None:
-            return False
-        normal_map = None
-        if sock.is_linked:
-            src = sock.links[0].from_node
-            if getattr(src, "type", "") == "NORMAL_MAP":
-                normal_map = src
-        if normal_map is None:
-            normal_map = nodes.new("ShaderNodeNormalMap")
-            normal_map.location = (bsdf.location.x - 360, bsdf.location.y - 300)
-            links.new(normal_map.outputs["Normal"], sock)
-        tex_node = _first_image_upstream_socket(normal_map.inputs.get("Color"), max_depth=4)
-        if tex_node is not None:
-            tex_node.image = img
-            try:
-                tex_node.image.colorspace_settings.name = "Non-Color"
-            except Exception:
-                pass
-            return True
-        tex_node = ensure_tex_node(non_color=True, x=normal_map.location.x - 280, y=normal_map.location.y)
-        links.new(tex_node.outputs["Color"], normal_map.inputs["Color"])
-        return True
-
-    scalar_inputs = {
-        "roughness": "Roughness",
-        "metallic": "Metallic",
-        "alpha": "Alpha",
-        "occlusion": None,  # keep AO unconnected by default
-    }
-    target_input = scalar_inputs.get(ch)
-    if ch == "occlusion":
-        ensure_tex_node(non_color=True, x=bsdf.location.x - 860, y=bsdf.location.y - 40)
-        return True
-    if target_input is None:
-        return False
-    sock = bsdf.inputs.get(target_input)
-    if sock is None:
-        return False
-    tex_node = _first_image_upstream_socket(sock, max_depth=4)
-    if tex_node is not None:
-        tex_node.image = img
+    roles: Dict[int, str] = {}
+    if hasattr(extractor_mod, "derive_material_roles_from_source"):
         try:
-            tex_node.image.colorspace_settings.name = "Non-Color"
+            src_roles = extractor_mod.derive_material_roles_from_source(raw_spk_names, raw_slot_names)
         except Exception:
-            pass
-        return True
-    tex_node = ensure_tex_node(non_color=True, x=bsdf.location.x - 620, y=bsdf.location.y - (250 if ch == "roughness" else 400))
-    links.new(tex_node.outputs["Color"], sock)
-    return True
+            src_roles = {}
+    else:
+        src_roles = {}
+
+    for mid in material_ids:
+        role = str(src_roles.get(int(mid), "")).strip().lower()
+        if role not in {"track_left", "track_right"}:
+            role = _local_track_role(str(raw_spk_names.get(int(mid), "")))
+        if role not in {"track_left", "track_right"}:
+            slot_map = raw_slot_names.get(int(mid), {})
+            if isinstance(slot_map, dict):
+                for key, value in slot_map.items():
+                    role = _local_track_role(str(key or "")) or _local_track_role(str(value or ""))
+                    if role:
+                        break
+        if role not in {"track_left", "track_right"}:
+            role = "other"
+        roles[int(mid)] = role
+    return roles
 
 
-def _materials_from_last_import(context, settings: WARNOImporterSettings) -> List[bpy.types.Material]:
-    out: List[bpy.types.Material] = []
-    seen: set[str] = set()
-    for obj in _target_model_meshes(context, settings):
-        for slot in getattr(obj, "material_slots", []):
-            mat = getattr(slot, "material", None)
-            if mat is None:
-                continue
-            key = _norm_low(mat.name)
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(mat)
+def _build_material_name_map(
+    extractor_mod,
+    material_ids: Sequence[int],
+    raw_spk_names: Dict[int, str],
+    material_role_by_id: Dict[int, str],
+    auto_name_materials: bool,
+) -> Dict[int, str]:
+    if not auto_name_materials:
+        return {int(mid): f"Material_{int(mid):03d}" for mid in material_ids}
+
+    used_names: set[str] = set()
+    out: Dict[int, str] = {}
+    for mid in material_ids:
+        role_name = str(material_role_by_id.get(int(mid), "other"))
+        raw_name = str(raw_spk_names.get(int(mid), "")).strip()
+        if not raw_name:
+            raw_name = f"Material_{int(mid):03d}"
+        if hasattr(extractor_mod, "sanitize_material_name"):
+            try:
+                base_name = str(extractor_mod.sanitize_material_name(raw_name) or raw_name).strip()
+            except Exception:
+                base_name = raw_name
+        else:
+            base_name = raw_name
+        if not base_name:
+            base_name = f"Material_{int(mid):03d}"
+
+        forced_track_name = _forced_track_material_name_for_role(base_name, role_name)
+        if forced_track_name:
+            base_name = forced_track_name
+
+        unique_name = base_name
+        dup_idx = 2
+        while _norm_low(unique_name) in used_names:
+            unique_name = f"{base_name}_{dup_idx}"
+            dup_idx += 1
+        used_names.add(_norm_low(unique_name))
+        out[int(mid)] = unique_name
     return out
-
-
-def _apply_manual_manifest_to_materials(context, settings: WARNOImporterSettings, manifest_path: Path) -> int:
-    if not manifest_path.exists() or not manifest_path.is_file():
-        return 0
-    try:
-        raw = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
-    except Exception:
-        return 0
-    entries = raw.get("entries", []) if isinstance(raw, dict) else []
-    if not isinstance(entries, list):
-        return 0
-
-    parsed: List[Dict[str, Any]] = []
-    for item in entries:
-        if not isinstance(item, dict):
-            continue
-        primary = str(item.get("primary", "")).strip()
-        outs = item.get("outputs", [])
-        suffix = str(item.get("suffix", "")).strip()
-        base = str(item.get("base", "")).strip()
-        channel = str(item.get("channel", "")).strip().lower()
-        if not channel:
-            channel = str(_manual_channel_from_suffix_token(suffix) or "")
-        if not channel:
-            continue
-        paths_raw: List[str] = []
-        if primary:
-            paths_raw.append(primary)
-        if isinstance(outs, list):
-            for op in outs:
-                if isinstance(op, str) and op.strip():
-                    paths_raw.append(op.strip())
-        if not paths_raw:
-            continue
-
-        seen_paths: set[str] = set()
-        for raw_path in paths_raw:
-            p = Path(raw_path)
-            if not p.is_absolute():
-                p = manifest_path.parent / p
-            try:
-                key = str(p.resolve()).lower()
-            except Exception:
-                key = str(p).lower()
-            if key in seen_paths:
-                continue
-            seen_paths.add(key)
-            if not p.exists() or not p.is_file():
-                continue
-            parsed.append({"path": p, "channel": channel, "base": base, "suffix": suffix})
-    if not parsed:
-        return 0
-
-    mats = _materials_from_last_import(context, settings)
-    if not mats:
-        return 0
-
-    applied = 0
-    for mat in mats:
-        target_base = _guess_material_base_from_nodes(mat)
-        for channel in ("diffuse", "normal", "roughness", "metallic", "occlusion", "alpha"):
-            cands = [it for it in parsed if str(it.get("channel", "")) == channel]
-            if not cands:
-                continue
-            cands = sorted(
-                cands,
-                key=lambda it: (
-                    _name_similarity_score(target_base, str(it.get("base", "")), mat.name),
-                    it["path"].stat().st_mtime if it["path"].exists() else 0.0,
-                ),
-                reverse=True,
-            )
-            if _assign_image_to_material_channel(mat, channel, cands[0]["path"]):
-                applied += 1
-    return applied
-
-
-def _find_latest_manual_manifest(tex_dir: Path, preferred: Path) -> Path | None:
-    cand: List[Path] = []
-    if preferred.exists() and preferred.is_file():
-        cand.append(preferred)
-    try:
-        for p in tex_dir.rglob("manual_texture_manifest.json"):
-            if p.is_file():
-                cand.append(p)
-    except Exception:
-        pass
-    if not cand:
-        return None
-    cand = list(dict.fromkeys(cand))
-    cand.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0.0, reverse=True)
-    return cand[0]
-
-
-class WARNO_OT_ManualTextureCorrecting(Operator):
-    bl_idname = "warno.manual_texture_correcting"
-    bl_label = "Manual texture correcting"
-    bl_description = "Launch external C++ tool for manual texture split/correction and apply manifest back to Blender"
-
-    def execute(self, context):
-        settings = context.scene.warno_import
-        tex_dir_raw = str(settings.last_texture_dir or "").strip()
-        if not tex_dir_raw:
-            msg = "No texture folder yet. Import model with textures first."
-            settings.status = msg
-            self.report({"WARNING"}, msg)
-            return {"CANCELLED"}
-        tex_dir = Path(tex_dir_raw)
-        if not tex_dir.exists() or not tex_dir.is_dir():
-            msg = f"Texture folder not found: {tex_dir}"
-            settings.status = msg
-            self.report({"WARNING"}, msg)
-            return {"CANCELLED"}
-
-        project_root = _project_root(settings)
-        tool_raw = str(settings.manual_texture_tool or "").strip()
-        if not tool_raw:
-            msg = "Manual texture tool path is empty."
-            settings.status = msg
-            self.report({"WARNING"}, msg)
-            return {"CANCELLED"}
-        tool_path = _resolve_path(project_root, tool_raw)
-        if not tool_path.exists() or not tool_path.is_file():
-            msg = f"Tool not found: {tool_path}"
-            settings.status = msg
-            self.report({"ERROR"}, msg)
-            return {"CANCELLED"}
-
-        extractor_mod = None
-        try:
-            extractor_mod = _extractor_module(settings)
-        except Exception:
-            extractor_mod = None
-        input_dir = _pick_manual_tool_input_dir(settings, extractor_mod)
-        if not input_dir.exists() or not input_dir.is_dir():
-            input_dir = tex_dir
-
-        out_dir = input_dir / "manual_corrected"
-        cmd = [str(tool_path), "--input", str(input_dir), "--output", str(out_dir)]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True)
-        except Exception as exc:
-            msg = f"Tool launch failed: {exc}"
-            settings.status = msg
-            self.report({"ERROR"}, msg)
-            return {"CANCELLED"}
-
-        tool_error_msg = ""
-        if proc.returncode != 0:
-            err = (proc.stderr or proc.stdout or "").strip()
-            if len(err) > 240:
-                err = err[:240] + "..."
-            code = int(proc.returncode)
-            crash_note = ""
-            if code in (3221225477, -1073741819):
-                crash_note = " (access violation crash)"
-            tool_error_msg = f"Manual tool failed (code {code}{crash_note}). {err}".strip()
-
-        preferred_manifest = out_dir / "manual_texture_manifest.json"
-        manifest = _find_latest_manual_manifest(input_dir, preferred_manifest)
-
-        # Reload images from known roots to pick file changes.
-        roots_low = []
-        roots = [tex_dir, input_dir, out_dir]
-        if manifest is not None:
-            roots.append(manifest.parent)
-        for root in roots:
-            try:
-                roots_low.append(str(root.resolve()).lower())
-            except Exception:
-                roots_low.append(str(root).lower())
-        for img in bpy.data.images:
-            fp = str(img.filepath_raw or img.filepath or "").strip()
-            if not fp:
-                continue
-            try:
-                abs_fp = str(Path(bpy.path.abspath(fp)).resolve()).lower()
-            except Exception:
-                abs_fp = str(Path(fp)).lower()
-            if any(abs_fp.startswith(root) for root in roots_low):
-                try:
-                    img.reload()
-                except Exception:
-                    pass
-
-        applied = _apply_manual_manifest_to_materials(context, settings, manifest) if manifest is not None else 0
-        if tool_error_msg:
-            if manifest is not None and applied > 0:
-                msg = f"{tool_error_msg} Recovered from manifest: {manifest}. Applied channels: {applied}."
-                settings.status = msg
-                self.report({"WARNING"}, msg)
-                return {"FINISHED"}
-            msg = tool_error_msg
-            if manifest is None:
-                msg += " Manifest not found."
-            else:
-                msg += f" Manifest found ({manifest}) but nothing applied."
-            settings.status = msg
-            self.report({"ERROR"}, msg)
-            return {"CANCELLED"}
-
-        msg = f"Manual texture correction complete. Applied channels: {applied}. Output: {out_dir}"
-        settings.status = msg
-        self.report({"INFO"}, msg)
-        return {"FINISHED"}
 
 
 def _target_model_meshes(context, settings: WARNOImporterSettings) -> List[bpy.types.Object]:
@@ -4341,83 +5651,6 @@ def _collection_asset_from_name(col_name: str) -> str:
     return ""
 
 
-def _remove_collection_with_objects(col_name: str) -> int:
-    name = str(col_name or "").strip()
-    if not name:
-        return 0
-    col = bpy.data.collections.get(name)
-    if col is None:
-        return 0
-    all_objs = list(col.all_objects)
-    for obj in all_objs:
-        try:
-            bpy.data.objects.remove(obj, do_unlink=True)
-        except Exception:
-            pass
-    try:
-        bpy.data.collections.remove(col)
-    except Exception:
-        pass
-    return len(all_objs)
-
-
-class WARNO_OT_ApplyAutoSmooth(Operator):
-    bl_idname = "warno.apply_auto_smooth"
-    bl_label = "Apply Auto Smooth To Model"
-    bl_description = "Apply Smooth by Angle to imported model and accept modifier"
-
-    def execute(self, context):
-        settings = context.scene.warno_import
-        targets = _target_model_meshes(context, settings)
-        if not targets:
-            self.report({"WARNING"}, "No imported mesh objects found.")
-            return {"CANCELLED"}
-
-        try:
-            count = _apply_auto_smooth_modifier(targets, float(settings.auto_smooth_angle))
-        except Exception as exc:
-            self.report({"ERROR"}, f"Auto smooth failed: {exc}")
-            return {"CANCELLED"}
-
-        if count <= 0:
-            self.report({"WARNING"}, "Auto smooth was not applied.")
-            return {"CANCELLED"}
-        self.report({"INFO"}, f"Auto smooth applied to {count} object(s).")
-        return {"FINISHED"}
-
-
-class WARNO_OT_ApplyTrackCorrection(Operator):
-    bl_idname = "warno.apply_track_correction"
-    bl_label = "Apply Track/Wheel Correction"
-    bl_description = "Rebuild last imported WARNO model with current track/wheel tuning, then replace old collection"
-
-    def execute(self, context):
-        settings = context.scene.warno_import
-        old_col_name = str(settings.last_import_collection or "").strip()
-        if not old_col_name:
-            self.report({"WARNING"}, "No last import collection found.")
-            return {"CANCELLED"}
-
-        asset = _collection_asset_from_name(old_col_name)
-        if not asset:
-            self.report({"WARNING"}, f"Collection has no WARNO asset: {old_col_name}")
-            return {"CANCELLED"}
-
-        settings.selected_asset = asset
-        result = bpy.ops.warno.import_asset()
-        if "FINISHED" not in result:
-            self.report({"ERROR"}, "Track correction import failed.")
-            return {"CANCELLED"}
-
-        new_col_name = str(settings.last_import_collection or "").strip()
-        if old_col_name and old_col_name != new_col_name:
-            removed = _remove_collection_with_objects(old_col_name)
-            self.report({"INFO"}, f"Track correction applied. Rebuilt '{new_col_name}', removed {removed} old object(s).")
-        else:
-            self.report({"INFO"}, "Track correction applied.")
-        return {"FINISHED"}
-
-
 class WARNO_OT_ApplyTextures(Operator):
     bl_idname = "warno.apply_textures"
     bl_label = "Apply/Reapply Textures"
@@ -4425,6 +5658,7 @@ class WARNO_OT_ApplyTextures(Operator):
 
     def execute(self, context):
         settings = context.scene.warno_import
+        _enforce_fixed_runtime_defaults(settings)
         t0 = time.monotonic()
         _warno_log(settings, "Apply/Reapply textures started.", stage="apply_textures")
         col_name = str(settings.last_import_collection or "").strip()
@@ -4439,9 +5673,9 @@ class WARNO_OT_ApplyTextures(Operator):
             extractor_mod = _extractor_module(settings)
             project_root = _project_root(settings)
             runtime_info: Dict[str, Any] = {}
-            if settings.use_zz_dat_source:
-                _set_status(settings, "stage: preparing runtime", stage="apply_textures")
-                runtime_info = _prepare_zz_runtime_sources(extractor_mod, settings)
+            _set_status(settings, "stage: preparing runtime", stage="apply_textures")
+            runtime_info = _prepare_zz_runtime_sources(extractor_mod, settings)
+            _warno_log(settings, "runtime source policy: zz_runtime_only", stage="runtime")
             mesh_spk_paths = _resolve_mesh_spk_paths(project_root, settings, runtime_info)
             if not mesh_spk_paths:
                 raise RuntimeError("No mesh SPK files found.")
@@ -4459,12 +5693,22 @@ class WARNO_OT_ApplyTextures(Operator):
                     raise RuntimeError(f"Asset not found in SPK: {asset}")
                 asset_real, _meta = hit
                 model = spk.get_model_geometry(asset_real)
-                infer_names, material_role_by_id = extractor_mod.infer_material_names(model, mirror_y=True)
                 material_ids = sorted({int(part["material"]) for part in model["parts"]})
-                if settings.auto_name_materials:
-                    material_name_by_id = dict(infer_names)
-                else:
-                    material_name_by_id = {int(mid): f"Material_{int(mid):03d}" for mid in material_ids}
+                raw_spk_names = getattr(spk, "material_name_by_id", {}) or {}
+                raw_slot_names = getattr(spk, "material_texture_names_by_id", {}) or {}
+                material_role_by_id = _derive_material_roles_runtime(
+                    extractor_mod=extractor_mod,
+                    material_ids=material_ids,
+                    raw_spk_names=raw_spk_names,
+                    raw_slot_names=raw_slot_names,
+                )
+                material_name_by_id = _build_material_name_map(
+                    extractor_mod=extractor_mod,
+                    material_ids=material_ids,
+                    raw_spk_names=raw_spk_names,
+                    material_role_by_id=material_role_by_id,
+                    auto_name_materials=bool(settings.auto_name_materials),
+                )
 
                 model_dir = _cache_asset_dir(extractor_mod, settings, asset_real)
                 model_dir.mkdir(parents=True, exist_ok=True)
@@ -4520,7 +5764,13 @@ class WARNO_OT_ApplyTextures(Operator):
                 if not maps:
                     continue
                 role = role_by_mat_key.get(key, "other")
-                _apply_material_nodes(mat, maps, role, bool(settings.use_ao_multiply))
+                _apply_material_nodes(
+                    mat,
+                    maps,
+                    role,
+                    ao_multiply_diffuse=False,
+                    normal_invert_mode="none",
+                )
                 touched += 1
 
         tex_refs = len(texture_report.get("refs", []))
@@ -4549,6 +5799,52 @@ class WARNO_OT_ApplyTextures(Operator):
         return {"FINISHED"}
 
 
+class WARNO_OT_ManualAutoSmoothApply(Operator):
+    bl_idname = "warno.manual_auto_smooth_apply"
+    bl_label = "Manual Auto Smooth Apply"
+    bl_description = "Apply auto smooth to all mesh objects from last imported WARNO collection"
+
+    def execute(self, context):
+        settings = context.scene.warno_import
+        _enforce_fixed_runtime_defaults(settings)
+        t0 = time.monotonic()
+        col_name = str(settings.last_import_collection or "").strip()
+        if not col_name:
+            msg = "No imported WARNO collection found yet."
+            settings.status = msg
+            _warno_log(settings, msg, level="WARNING", stage="manual_auto_smooth")
+            self.report({"WARNING"}, msg)
+            return {"CANCELLED"}
+        collection = bpy.data.collections.get(col_name)
+        if collection is None:
+            msg = f"Last import collection not found: {col_name}"
+            settings.status = msg
+            _warno_log(settings, msg, level="WARNING", stage="manual_auto_smooth")
+            self.report({"WARNING"}, msg)
+            return {"CANCELLED"}
+
+        meshes = [obj for obj in collection.objects if obj.type == "MESH"]
+        if not meshes:
+            msg = f"No mesh objects in collection: {col_name}"
+            settings.status = msg
+            _warno_log(settings, msg, level="WARNING", stage="manual_auto_smooth")
+            self.report({"WARNING"}, msg)
+            return {"CANCELLED"}
+        try:
+            touched = _apply_auto_smooth_modifier(meshes, float(FIXED_AUTO_SMOOTH_ANGLE))
+            msg = f"Manual auto smooth applied: meshes={touched}/{len(meshes)} | elapsed:{time.monotonic()-t0:.1f}s"
+            settings.status = msg
+            _warno_log(settings, msg, stage="manual_auto_smooth")
+            self.report({"INFO"}, msg)
+            return {"FINISHED"}
+        except Exception as exc:
+            msg = f"Manual auto smooth failed: {exc}"
+            settings.status = msg
+            _warno_log(settings, msg, level="ERROR", stage="manual_auto_smooth")
+            self.report({"ERROR"}, msg)
+            return {"CANCELLED"}
+
+
 class WARNO_OT_ImportAsset(Operator):
     bl_idname = "warno.import_asset"
     bl_label = "Import To Blender"
@@ -4556,13 +5852,8 @@ class WARNO_OT_ImportAsset(Operator):
 
     def execute(self, context):
         settings = context.scene.warno_import
+        _enforce_fixed_runtime_defaults(settings)
         t0 = time.monotonic()
-        if bool(settings.open_console_on_import):
-            try:
-                if hasattr(bpy.ops.wm, "console_toggle"):
-                    bpy.ops.wm.console_toggle()
-            except Exception:
-                pass
         _warno_log(settings, "Import started.", stage="import")
         asset = str(settings.selected_asset or "").strip()
         if not asset or asset == "__none__":
@@ -4582,19 +5873,19 @@ class WARNO_OT_ImportAsset(Operator):
 
         project_root = _project_root(settings)
         runtime_info: Dict[str, Any] = {}
-        if settings.use_zz_dat_source:
-            try:
-                _set_status(settings, "stage: preparing runtime", stage="import")
-                runtime_info = _prepare_zz_runtime_sources(extractor_mod, settings)
-            except Exception as exc:
-                msg = f"ZZ runtime prepare failed: {exc}"
-                settings.status = msg
-                _warno_log(settings, msg, level="ERROR", stage="import")
-                self.report({"ERROR"}, msg)
-                return {"CANCELLED"}
+        try:
+            _set_status(settings, "stage: preparing runtime", stage="import")
+            runtime_info = _prepare_zz_runtime_sources(extractor_mod, settings)
+            _warno_log(settings, "runtime source policy: zz_runtime_only", stage="runtime")
+        except Exception as exc:
+            msg = f"ZZ runtime prepare failed: {exc}"
+            settings.status = msg
+            _warno_log(settings, msg, level="ERROR", stage="import")
+            self.report({"ERROR"}, msg)
+            return {"CANCELLED"}
         mesh_spk_paths = _resolve_mesh_spk_paths(project_root, settings, runtime_info)
         if not mesh_spk_paths:
-            msg = "No mesh SPK files found. Set Mesh SPK/Folder or prepare ZZ runtime."
+            msg = "No mesh SPK files found in prepared ZZ runtime."
             settings.status = msg
             _warno_log(settings, msg, level="ERROR", stage="import")
             self.report({"ERROR"}, msg)
@@ -4608,7 +5899,7 @@ class WARNO_OT_ImportAsset(Operator):
             return {"CANCELLED"}
         mesh_spk_path, asset_hint = pick
 
-        need_bone_map = bool(settings.auto_split_main_parts or settings.auto_split_wheels or settings.auto_pull_bones)
+        need_bone_map = bool(settings.auto_split_main_parts or settings.auto_pull_bones)
         rot = extractor_mod.build_rotation_params(
             0.0,
             0.0,
@@ -4623,6 +5914,7 @@ class WARNO_OT_ImportAsset(Operator):
         texture_dir_to_open = ""
         bone_payload: dict[str, Any] = {
             "bone_name_by_index": {},
+            "bone_parent_by_index": {},
             "bone_names": [],
             "bone_positions": {},
         }
@@ -4650,16 +5942,22 @@ class WARNO_OT_ImportAsset(Operator):
                     pass
 
                 model = spk.get_model_geometry(asset_real)
-
-                infer_names, material_role_by_id = extractor_mod.infer_material_names(
-                    model,
-                    mirror_y=True,
-                )
                 material_ids = sorted({int(part["material"]) for part in model["parts"]})
-                if settings.auto_name_materials:
-                    material_name_by_id = dict(infer_names)
-                else:
-                    material_name_by_id = {int(mid): f"Material_{int(mid):03d}" for mid in material_ids}
+                raw_spk_names = getattr(spk, "material_name_by_id", {}) or {}
+                raw_slot_names = getattr(spk, "material_texture_names_by_id", {}) or {}
+                material_role_by_id = _derive_material_roles_runtime(
+                    extractor_mod=extractor_mod,
+                    material_ids=material_ids,
+                    raw_spk_names=raw_spk_names,
+                    raw_slot_names=raw_slot_names,
+                )
+                material_name_by_id = _build_material_name_map(
+                    extractor_mod=extractor_mod,
+                    material_ids=material_ids,
+                    raw_spk_names=raw_spk_names,
+                    material_role_by_id=material_role_by_id,
+                    auto_name_materials=bool(settings.auto_name_materials),
+                )
 
                 skeleton_spks: List[Any] = []
                 if need_bone_map:
@@ -4682,6 +5980,17 @@ class WARNO_OT_ImportAsset(Operator):
                         rot=rot,
                         skeleton_spks=skeleton_spks,
                         unit_ndf_hints=ndf_hints,
+                    )
+                    _warno_log(
+                        settings,
+                        (
+                            "bone payload: "
+                            f"source={bone_payload.get('bone_name_source', 'none')} "
+                            f"names={len(bone_payload.get('bone_names', []) or [])} "
+                            f"indexed={len(bone_payload.get('bone_name_by_index', {}) or {})} "
+                            f"positions={len(bone_payload.get('bone_positions', {}) or {})}"
+                        ),
+                        stage="import",
                     )
 
                 model_dir = _cache_asset_dir(extractor_mod, settings, asset_real)
@@ -4707,9 +6016,30 @@ class WARNO_OT_ImportAsset(Operator):
                     material_name_by_id=material_name_by_id,
                     material_role_by_id=material_role_by_id,
                     bone_name_by_index=bone_payload.get("bone_name_by_index", {}),
+                    bone_parent_by_index=bone_payload.get("bone_parent_by_index", {}),
                     split_main_parts=bool(settings.auto_split_main_parts),
-                    split_wheels=bool(settings.auto_split_wheels),
-                    wheel_tuning=_wheel_tuning_payload(settings),
+                )
+                wheel_groups = 0
+                track_groups = 0
+                turret_chain_groups = 0
+                for b in buckets:
+                    gname_low = _norm_low(str(b.get("group_name", "")))
+                    if gname_low.startswith("roue_") or "wheel" in gname_low:
+                        wheel_groups += 1
+                    if gname_low.startswith("chenille_") or "track" in gname_low:
+                        track_groups += 1
+                    if gname_low in {"tourelle_01", "axe_canon_01", "canon_01"}:
+                        turret_chain_groups += 1
+                _warno_log(
+                    settings,
+                    (
+                        "split_mode=bone_deterministic "
+                        f"groups_total={len(buckets)} "
+                        f"groups_wheels={wheel_groups} "
+                        f"groups_tracks={track_groups} "
+                        f"groups_turret_chain={turret_chain_groups}"
+                    ),
+                    stage="import",
                 )
         except Exception as exc:
             msg = f"Import prep failed: {exc}"
@@ -4736,13 +6066,7 @@ class WARNO_OT_ImportAsset(Operator):
         for bucket_i, bucket in enumerate(buckets, start=1):
             group_name = str(bucket.get("group_name", f"Part_{bucket_i:03d}"))
             if settings.auto_name_parts:
-                pretty_name = group_name
-                if hasattr(extractor_mod, "pretty_part_name"):
-                    try:
-                        pretty_name = str(extractor_mod.pretty_part_name(group_name) or group_name)
-                    except Exception:
-                        pretty_name = group_name
-                base_name = _safe_name(pretty_name, f"Part_{bucket_i:03d}")[:63]
+                base_name = _safe_name(group_name, f"Part_{bucket_i:03d}")[:63]
             else:
                 base_name = f"Part_{bucket_i:03d}"
             obj_name = base_name
@@ -4782,7 +6106,13 @@ class WARNO_OT_ImportAsset(Operator):
                     mat = bpy.data.materials.get(mat_name)
                     if mat is None:
                         mat = bpy.data.materials.new(name=mat_name)
-                    _apply_material_nodes(mat, maps, role, bool(settings.use_ao_multiply))
+                    _apply_material_nodes(
+                        mat,
+                        maps,
+                        role,
+                        ao_multiply_diffuse=False,
+                        normal_invert_mode="none",
+                    )
                     material_cache[cache_key] = mat
                 mesh.materials.append(mat)
                 mat_slot_by_mid[mid] = len(mesh.materials) - 1
@@ -4795,18 +6125,22 @@ class WARNO_OT_ImportAsset(Operator):
             obj = bpy.data.objects.new(obj_name, mesh)
             obj["warno_group"] = group_name
             obj["warno_asset"] = asset
+            obj["warno_group_bone_index"] = int(bucket.get("group_bone_index", -1))
             collection.objects.link(obj)
             imported_objects.append(obj)
             mesh_count += 1
 
         # Geometry cleanup on import: merge by distance first.
         _set_status(settings, "stage: building scene objects", stage="import")
-        if settings.use_merge_by_distance:
-            _merge_by_distance(imported_objects, float(settings.merge_distance))
+        _merge_by_distance(imported_objects, float(FIXED_MERGE_DISTANCE))
+        try:
+            _apply_auto_smooth_modifier(imported_objects, float(FIXED_AUTO_SMOOTH_ANGLE))
+        except Exception as exc:
+            _warno_log(settings, f"auto_smooth warning: {exc}", level="WARNING", stage="import")
 
         if settings.auto_pull_bones:
             try:
-                armature_obj = _build_helper_armature(imported_objects, bone_payload, collection)
+                armature_obj = _build_helper_armature(imported_objects, bone_payload, collection, settings=settings)
             except Exception as exc:
                 self.report({"WARNING"}, f"Armature build failed: {exc}")
                 armature_obj = None
@@ -4885,16 +6219,18 @@ class WARNO_PT_ImporterPanel(Panel):
     def draw(self, context):
         layout = self.layout
         s = context.scene.warno_import
-        if not str(s.track_preset_cache_json or "").strip():
-            _refresh_wheel_preset_cache(s)
 
         root_box = layout.box()
-        root_box.label(text="Project")
-        root_box.prop(s, "project_root")
-        row = root_box.row(align=True)
-        row.operator("warno.load_config", text="Load My config")
-        row.operator("warno.load_example_config", text="Load example config")
-        row.operator("warno.save_config", text="Save Config")
+        root_hdr = root_box.row(align=True)
+        root_icon = "TRIA_DOWN" if bool(s.show_project_section) else "TRIA_RIGHT"
+        root_hdr.prop(s, "show_project_section", text="Project", icon=root_icon, emboss=False)
+        if s.show_project_section:
+            root_box.prop(s, "project_root")
+            row = root_box.row(align=True)
+            row.operator("warno.load_config", text="Load My config")
+            row.operator("warno.load_example_config", text="Load example config")
+            row.operator("warno.save_config", text="Save Config")
+            root_box.operator("warno.remember_project_root", text="Remember Project Root", icon="BOOKMARKS")
 
         setup = layout.box()
         header = setup.row(align=True)
@@ -4902,14 +6238,11 @@ class WARNO_PT_ImporterPanel(Panel):
         header.prop(s, "show_first_setup_logs", text="First Setup / Logs", icon=setup_icon, emboss=False)
         if s.show_first_setup_logs:
             src = setup.column(align=True)
-            src.prop(s, "use_zz_dat_source")
-            if s.use_zz_dat_source:
-                src.prop(s, "warno_root")
-                src.prop(s, "modding_suite_root")
-                src.prop(s, "zz_runtime_dir")
-                src.operator("warno.prepare_zz_runtime", text="Prepare ZZ Runtime", icon="FILE_REFRESH")
-            src.prop(s, "spk_path")
-            src.prop(s, "skeleton_spk")
+            src.prop(s, "warno_root")
+            src.prop(s, "modding_suite_root")
+            src.prop(s, "modding_suite_atlas_cli")
+            src.prop(s, "zz_runtime_dir")
+            src.operator("warno.prepare_zz_runtime", text="Prepare ZZ Runtime", icon="FILE_REFRESH")
             src.prop(s, "cache_dir")
             src.separator()
             src.prop(s, "auto_install_tgv_deps")
@@ -4920,47 +6253,30 @@ class WARNO_PT_ImporterPanel(Panel):
             row.operator("warno.open_log_file", text="Open Log File", icon="TEXT")
             src.prop(s, "log_to_file")
             src.prop(s, "log_file_name")
-            src.prop(s, "open_console_on_import")
 
         tex = layout.box()
-        tex.label(text="Textures")
-        tex.prop(s, "atlas_assets_dir")
-        tex.prop(s, "manual_texture_tool")
-        tex.prop(s, "tgv_split_mode")
-        checks = tex.grid_flow(row_major=True, columns=2, even_columns=True, even_rows=False, align=True)
-        checks.prop(s, "auto_textures")
-        checks.prop(s, "auto_rename_textures")
-        checks.prop(s, "use_ao_multiply")
-        checks.prop(s, "fast_exact_texture_resolve")
-        checks.prop(s, "allow_group_texture_convert")
-        checks.prop(s, "tgv_aggressive_split")
-        time_row = tex.row(align=True)
-        time_row.prop(s, "texture_process_timeout_sec")
-        time_row.prop(s, "texture_stage_timeout_sec")
-        row = tex.row(align=True)
-        row.operator("warno.open_texture_folder", text="Open Texture Folder", icon="FILE_FOLDER")
-        row.operator("warno.clear_texture_folder", text="Clear texture folder from old files", icon="TRASH")
-        row = tex.row(align=True)
-        row.operator("warno.manual_texture_correcting", text="Manual texture correcting", icon="PREFERENCES")
-        row.prop(s, "use_source_folder_for_textures", text="Use source folder for textures")
-        tex.operator("warno.apply_textures", text="Apply/Reapply Textures", icon="SHADING_TEXTURE")
+        tex_hdr = tex.row(align=True)
+        tex_icon = "TRIA_DOWN" if bool(s.show_textures_section) else "TRIA_RIGHT"
+        tex_hdr.prop(s, "show_textures_section", text="Textures", icon=tex_icon, emboss=False)
+        if s.show_textures_section:
+            tex.prop(s, "atlas_assets_dir")
+            row = tex.row(align=True)
+            row.operator("warno.open_texture_folder", text="Open Texture Folder", icon="FILE_FOLDER")
+            row.operator("warno.rebuild_atlas_json_cache", text="Rebuild Atlas JSON Cache", icon="FILE_REFRESH")
+            row.operator("warno.clear_texture_folder", text="Clear texture folder from old files", icon="TRASH")
+            tex.operator("warno.apply_textures", text="Apply/Reapply Textures", icon="SHADING_TEXTURE")
 
         qry = layout.box()
-        qry.label(text="Asset Picker")
-        qry.prop(s, "query")
-        qry.prop(s, "match_limit")
-        row = qry.row(align=True)
-        row.operator("warno.scan_assets", text="Scan Assets")
-        row.operator("warno.scan_assets_all", text="Scan ALL Assets (takes a long time)", icon="TIME")
-        qry.operator("warno.pick_asset_browser", text="Pick Asset Browser", icon="FILEBROWSER")
-
-        main_row = qry.row(align=True)
-        lod_icon = "TRIA_DOWN" if bool(s.show_asset_lods) else "TRIA_RIGHT"
-        main_row.prop(s, "selected_asset_group", text="Main")
-        main_row.prop(s, "show_asset_lods", text="", icon=lod_icon, emboss=False)
-        if s.show_asset_lods:
-            qry.prop(s, "selected_asset_lod", text="LOD")
-        qry.label(text=f"Current: {str(s.selected_asset or '').strip()}", icon="OBJECT_DATA")
+        qry_hdr = qry.row(align=True)
+        qry_icon = "TRIA_DOWN" if bool(s.show_asset_picker_section) else "TRIA_RIGHT"
+        qry_hdr.prop(s, "show_asset_picker_section", text="Asset Picker", icon=qry_icon, emboss=False)
+        if s.show_asset_picker_section:
+            qry.prop(s, "query")
+            row = qry.row(align=True)
+            row.operator("warno.scan_assets", text="Scan Assets")
+            row.operator("warno.scan_assets_all", text="Scan ALL Assets (uses cache)", icon="TIME")
+            qry.operator("warno.pick_asset_browser", text="Pick Asset Browser", icon="FILEBROWSER")
+            qry.label(text=f"Current: {str(s.selected_asset or '').strip()}", icon="OBJECT_DATA")
 
         opts = layout.box()
         hdr = opts.row(align=True)
@@ -4969,41 +6285,17 @@ class WARNO_PT_ImporterPanel(Panel):
         if s.show_import_options:
             opt_grid = opts.grid_flow(row_major=True, columns=2, even_columns=True, even_rows=False, align=True)
             opt_grid.prop(s, "auto_split_main_parts")
-            opt_grid.prop(s, "auto_split_wheels")
             opt_grid.prop(s, "auto_name_parts")
             opt_grid.prop(s, "auto_pull_bones")
-            opt_grid.prop(s, "auto_track_wheel_correction")
             opt_grid.prop(s, "auto_name_materials")
-            if s.auto_track_wheel_correction:
-                corr = opts.column(align=True)
-                corr.prop(s, "track_fix_distance_scale")
-                corr.prop(s, "track_fix_edge_scale")
-                corr.prop(s, "track_fix_target_ratio")
-                corr.prop(s, "track_fix_min_pool_ratio")
-                corr.prop(s, "track_fix_axial_scale")
-                row = corr.row(align=True)
-                row.prop(s, "track_fix_ring_min")
-                row.prop(s, "track_fix_ring_max")
-                corr.separator()
-                corr.prop(s, "track_preset_name")
-                corr.prop(s, "selected_track_preset")
-                row = corr.row(align=True)
-                row.operator("warno.reset_track_tuning", text="Reset Defaults", icon="LOOP_BACK")
-                row.operator("warno.load_track_preset", text="Load Preset", icon="IMPORT")
-                corr.operator("warno.save_track_preset", text="Save Preset", icon="ADD")
-                corr.operator("warno.apply_track_correction", text="Apply Correction Now", icon="MODIFIER")
 
-        geo = layout.box()
-        geo.label(text="Geometry Cleanup")
-        row = geo.row(align=True)
-        row.prop(s, "use_merge_by_distance", text="Merge by distance")
-        rvals = row.row(align=True)
-        rvals.prop(s, "merge_distance", text="Merge distance")
-        rvals.prop(s, "auto_smooth_angle", text="Smooth angle")
-        rvals.enabled = bool(s.use_merge_by_distance)
-        geo.operator("warno.apply_auto_smooth", text="Apply Auto smooth to the model", icon="MOD_SMOOTH")
-
-        layout.operator("warno.import_asset", text="Import To Blender", icon="IMPORT")
+        import_row = layout.row(align=True)
+        import_row.operator("warno.import_asset", text="Import To Blender", icon="IMPORT")
+        import_row.operator("warno.manual_auto_smooth_apply", text="Manual Auto Smooth Apply", icon="MOD_SMOOTH")
+        layout.label(
+            text="Auto smooth use only if your model looks unsmoothed and polygons are clearly visible",
+            icon="INFO",
+        )
         if s.status:
             layout.label(text=s.status)
 
@@ -5013,9 +6305,8 @@ CLASSES = [
     WARNO_OT_LoadConfig,
     WARNO_OT_LoadExampleConfig,
     WARNO_OT_SaveConfig,
-    WARNO_OT_ResetTrackTuning,
-    WARNO_OT_SaveTrackPreset,
-    WARNO_OT_LoadTrackPreset,
+    WARNO_OT_RememberProjectRoot,
+    WARNO_OT_BuildAssetIndex,
     WARNO_OT_ScanAssets,
     WARNO_OT_ScanAssetsAll,
     WARNO_OT_PickAssetBrowser,
@@ -5024,28 +6315,54 @@ CLASSES = [
     WARNO_OT_InstallTGVDeps,
     WARNO_OT_OpenSystemConsole,
     WARNO_OT_OpenLogFile,
+    WARNO_OT_RebuildAtlasJsonCache,
     WARNO_OT_OpenTextureFolder,
     WARNO_OT_ClearTextureFolder,
-    WARNO_OT_ManualTextureCorrecting,
-    WARNO_OT_ApplyAutoSmooth,
-    WARNO_OT_ApplyTrackCorrection,
     WARNO_OT_ApplyTextures,
+    WARNO_OT_ManualAutoSmoothApply,
     WARNO_OT_ImportAsset,
     WARNO_PT_ImporterPanel,
 ]
 
 
+@persistent
+def _warno_load_post(_dummy):
+    for scene in _iter_scenes_safe():
+        settings = getattr(scene, "warno_import", None)
+        if settings is None:
+            continue
+        try:
+            _restore_project_root_and_auto_config(settings)
+        except Exception:
+            continue
+
+
 def register():
+    ASSET_PICKER_VIEW_CACHE.clear()
     for cls in CLASSES:
         bpy.utils.register_class(cls)
     bpy.types.Scene.warno_import = PointerProperty(type=WARNOImporterSettings)
+    if _warno_load_post not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_warno_load_post)
+    for scene in _iter_scenes_safe():
+        settings = getattr(scene, "warno_import", None)
+        if settings is None:
+            continue
+        try:
+            _restore_project_root_and_auto_config(settings)
+        except Exception:
+            continue
 
 
 def unregister():
     if hasattr(bpy.types.Scene, "warno_import"):
         del bpy.types.Scene.warno_import
+    if _warno_load_post in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_warno_load_post)
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
+    ASSET_PICKER_VIEW_CACHE.clear()
+    ASSET_INDEX_SESSION_CACHE.clear()
 
 
 if __name__ == "__main__":

@@ -1,8 +1,0 @@
-__pycache__/
-*.pyc
-output/
-outputfbx/
-output_blender/
-out_blender_runtime/
-textures/
-*.blend1

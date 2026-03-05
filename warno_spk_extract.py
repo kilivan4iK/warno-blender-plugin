@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack
-import importlib.util
 import json
 import math
 import mmap
@@ -19,6 +18,7 @@ import shutil
 import subprocess
 import struct
 import sys
+import tempfile
 import zlib
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Sequence, Tuple
@@ -240,6 +240,69 @@ def unique_keep_order(values: Sequence[str]) -> List[str]:
 
 def is_track_token(text: str) -> bool:
     return bool(TRACK_TOKEN_RX.search(str(text or "")))
+
+
+def _classify_track_role_from_text(text: str) -> str:
+    low = str(text or "").strip().lower().replace("\\", "/")
+    if not low:
+        return ""
+
+    # Some assets use droite_2 for the second (left) track material.
+    if "chenille_droite_2" in low or "chenille_droite.2" in low:
+        return "track_left"
+
+    # Explicit left/right markers from source naming.
+    if (
+        "chenille_gauche" in low
+        or "track_left" in low
+        or "left_track" in low
+        or "tracks_2" in low
+        or "trk_2" in low
+    ):
+        return "track_left"
+    if (
+        "chenille_droite" in low
+        or "track_right" in low
+        or "right_track" in low
+    ):
+        return "track_right"
+    if "tracks" in low or "trk" in low:
+        # WARNO convention usually uses base tracks as right and *_2 as left.
+        if "tracks_2" in low or "trk_2" in low:
+            return "track_left"
+        return "track_right"
+    return ""
+
+
+def derive_material_roles_from_source(
+    material_name_by_id: Dict[int, str] | None,
+    material_texture_names_by_id: Dict[int, Dict[str, str]] | None = None,
+) -> Dict[int, str]:
+    names_by_id = material_name_by_id or {}
+    slots_by_id = material_texture_names_by_id or {}
+    out: Dict[int, str] = {}
+
+    mids: set[int] = set()
+    mids.update(int(k) for k in names_by_id.keys())
+    mids.update(int(k) for k in slots_by_id.keys())
+
+    for mid in sorted(mids):
+        role = ""
+        name = str(names_by_id.get(int(mid), "")).strip()
+        if name:
+            role = _classify_track_role_from_text(name)
+        if not role:
+            slot_map = slots_by_id.get(int(mid), {})
+            if isinstance(slot_map, dict):
+                for slot_name, slot_value in slot_map.items():
+                    role = _classify_track_role_from_text(str(slot_name or ""))
+                    if role:
+                        break
+                    role = _classify_track_role_from_text(str(slot_value or ""))
+                    if role:
+                        break
+        out[int(mid)] = role or "other"
+    return out
 
 
 def read_png_size(path: Path) -> Tuple[int, int] | None:
@@ -808,7 +871,7 @@ def channel_from_token(token: str) -> str | None:
         return "diffuse"
     if "normal_reconstructed" in t:
         return "normal"
-    if "occlusion" in t or "_ao" in t:
+    if "occlusion" in t or "_ao" in t or t.endswith("_o") or "_o." in t or "_track_o" in t:
         return "occlusion"
     if "roughness" in t or t.endswith("_r") or "_track_r" in t:
         return "roughness"
@@ -1209,6 +1272,452 @@ def infer_missing_wheel_bone_names(
 
         out[int(bidx)] = f"roue_auto_{int(bidx):02d}"
 
+    return out
+
+
+def _top_level_child_bone_index(
+    bone_index: int,
+    bone_parent_by_index: Dict[int, int],
+) -> int:
+    cur = int(bone_index)
+    prev = cur
+    seen: set[int] = set()
+    while True:
+        if cur in seen:
+            return int(prev)
+        seen.add(cur)
+        parent = int(bone_parent_by_index.get(cur, -1))
+        if parent < 0:
+            return int(prev)
+        prev = cur
+        cur = parent
+
+
+_WHEEL_BONE_NAME_RX = re.compile(r"^roue_(elev_)?([dg])([0-9]+)$", re.IGNORECASE)
+
+
+def _parse_wheel_bone_name(name: str) -> Tuple[str, str, int] | None:
+    low = str(name or "").strip().lower()
+    if not low:
+        return None
+    m = _WHEEL_BONE_NAME_RX.match(low)
+    if not m:
+        return None
+    kind = "elev" if m.group(1) else "wheel"
+    side = str(m.group(2)).upper()
+    num = int(m.group(3))
+    return kind, side, num
+
+
+def _track_side_from_bone_name(name: str) -> str:
+    low = str(name or "").strip().lower()
+    if not low:
+        return ""
+    parsed_wheel = _parse_wheel_bone_name(low)
+    if parsed_wheel is not None:
+        _, side, _ = parsed_wheel
+        return "left" if side == "G" else "right"
+    if "chenille_gauche" in low or "track_left" in low or "left_track" in low:
+        return "left"
+    if "chenille_droite" in low or "track_right" in low or "right_track" in low:
+        return "right"
+    if re.search(r"(?:^|_)g[0-9]+(?:_|$)", low):
+        return "left"
+    if re.search(r"(?:^|_)d[0-9]+(?:_|$)", low):
+        return "right"
+    return ""
+
+
+def classify_group_from_bone_name(name: str) -> str:
+    low = str(name or "").strip().lower()
+    if not low:
+        return "Chassis"
+
+    def _fmt2(prefix: str, number: int | None, default_number: int = 1) -> str:
+        num = int(default_number if number is None else number)
+        if num < 0:
+            num = default_number
+        return f"{prefix}_{num:02d}"
+
+    wheel = _parse_wheel_bone_name(low)
+    if wheel is not None:
+        _kind, side, num = wheel
+        return f"Roue_{side}{num}"
+
+    if "chenille_gauche" in low or "track_left" in low or "left_track" in low:
+        return "Chenille_Gauche"
+    if "chenille_droite" in low or "track_right" in low or "right_track" in low:
+        return "Chenille_Droite"
+
+    m = re.match(r"^blindage_([dg])_?([0-9]+)$", low, flags=re.IGNORECASE)
+    if m:
+        side = str(m.group(1)).upper()
+        num = int(m.group(2))
+        return f"Blindage_{side}{num}"
+
+    m = re.match(r"^(?:base_)?tourelle_([0-9]+)$", low, flags=re.IGNORECASE)
+    if m:
+        return _fmt2("Tourelle", int(m.group(1)))
+    m = re.match(r"^fx_tourelle([0-9]+)(?:_|$)", low, flags=re.IGNORECASE)
+    if m:
+        return _fmt2("Tourelle", int(m.group(1)))
+    if "turret" in low:
+        return _fmt2("Tourelle", None)
+
+    m = re.match(r"^axe_canon_([0-9]+)$", low, flags=re.IGNORECASE)
+    if m:
+        return _fmt2("Axe_Canon", int(m.group(1)))
+    if low.startswith("axe_canon"):
+        return _fmt2("Axe_Canon", None)
+
+    m = re.match(r"^canon_([0-9]+)$", low, flags=re.IGNORECASE)
+    if m:
+        return _fmt2("Canon", int(m.group(1)))
+    m = re.match(r"^fx_canon([0-9]+)(?:_|$)", low, flags=re.IGNORECASE)
+    if m:
+        return _fmt2("Canon", int(m.group(1)))
+    if low.startswith("canon") or "barrel" in low:
+        return _fmt2("Canon", None)
+
+    if low.startswith("chassis") or low in {"hull", "base", "chassisfake", "chassisarmaturefake"}:
+        return "Chassis"
+    if low.startswith("fx_"):
+        return "Chassis"
+
+    return "Chassis"
+
+
+def resolve_center_wheel_bone_index(
+    elev_idx: int,
+    bone_name_by_index: Dict[int, str],
+) -> int:
+    cur_name = str(bone_name_by_index.get(int(elev_idx), "")).strip()
+    parsed = _parse_wheel_bone_name(cur_name)
+    if parsed is None:
+        return int(elev_idx)
+    kind, side, num = parsed
+    if kind != "elev":
+        return int(elev_idx)
+
+    target_low = f"roue_{side.lower()}{num}"
+    for bidx, raw_name in bone_name_by_index.items():
+        if str(raw_name or "").strip().lower() == target_low:
+            return int(bidx)
+    return int(elev_idx)
+
+
+def split_faces_by_bone_deterministic(
+    part: Dict[str, Any],
+    bone_name_by_index: Dict[int, str],
+    bone_parent_by_index: Dict[int, int],
+    material_role: str = "",
+    material_name: str = "",
+) -> List[Dict[str, Any]]:
+    idx = part.get("indices", [])
+    xyz = part.get("vertices", {}).get("xyz", [])
+    vertex_count = len(xyz) // 3
+
+    def all_tris() -> List[Tuple[int, int, int]]:
+        out: List[Tuple[int, int, int]] = []
+        for i in range(0, len(idx), 3):
+            if i + 2 >= len(idx):
+                break
+            out.append((int(idx[i + 0]), int(idx[i + 1]), int(idx[i + 2])))
+        return out
+
+    tris_all = all_tris()
+    if not tris_all:
+        return []
+
+    dominant = dominant_bone_indices(part.get("vertices", {}), vertex_count)
+    if not dominant:
+        return [{
+            "group_name_raw": "MainBody",
+            "group_name_sanitized": sanitize_material_name("MainBody"),
+            "group_bone_index": -1,
+            "tris": tris_all,
+        }]
+
+    out: List[Dict[str, Any]] = []
+
+    role = str(material_role or "").strip().lower()
+    mat_low = str(material_name or "").strip().lower()
+    default_track_side = ""
+    if role == "track_left":
+        default_track_side = "left"
+    elif role == "track_right":
+        default_track_side = "right"
+    else:
+        hint_side = _track_side_from_bone_name(mat_low)
+        default_track_side = hint_side
+    is_track_material = role.startswith("track") or ("tracks" in mat_low) or ("chenille" in mat_low)
+
+    chenille_bone_by_side: Dict[str, int] = {}
+    for bidx, bone_name in bone_name_by_index.items():
+        low = str(bone_name or "").strip().lower()
+        if "chenille_" not in low:
+            continue
+        side = _track_side_from_bone_name(low)
+        if side and side not in chenille_bone_by_side:
+            chenille_bone_by_side[side] = int(bidx)
+
+    tri_infos: List[Dict[str, Any]] = []
+    side_counter: Dict[str, int] = {"left": 0, "right": 0}
+
+    for tri in tris_all:
+        a, b, c = tri
+        if min(a, b, c) < 0 or max(a, b, c) >= len(dominant):
+            continue
+
+        votes = [int(dominant[a]), int(dominant[b]), int(dominant[c])]
+        vote_counts: Dict[int, int] = {}
+        for v in votes:
+            vote_counts[v] = vote_counts.get(v, 0) + 1
+        dom_bone = min(vote_counts.keys(), key=lambda x: (-vote_counts[x], int(x)))
+
+        raw_bone_name = str(bone_name_by_index.get(int(dom_bone), f"bone_{int(dom_bone):03d}") or f"bone_{int(dom_bone):03d}")
+        group_name = classify_group_from_bone_name(raw_bone_name)
+        group_bone_index = int(dom_bone)
+        tri_side = _track_side_from_bone_name(raw_bone_name)
+
+        if group_name.startswith("Roue_"):
+            center_idx = resolve_center_wheel_bone_index(int(dom_bone), bone_name_by_index)
+            group_bone_index = int(center_idx)
+            center_name = str(bone_name_by_index.get(int(center_idx), raw_bone_name) or raw_bone_name)
+            center_group = classify_group_from_bone_name(center_name)
+            if center_group.startswith("Roue_"):
+                group_name = center_group
+
+        if tri_side in side_counter:
+            side_counter[tri_side] += 1
+
+        tri_infos.append(
+            {
+                "tri": (int(a), int(b), int(c)),
+                "group_name": str(group_name),
+                "group_bone_index": int(group_bone_index),
+                "tri_side": str(tri_side or ""),
+            }
+        )
+
+    if not tri_infos:
+        return [{
+            "group_name_raw": "MainBody",
+            "group_name_sanitized": sanitize_material_name("MainBody"),
+            "group_bone_index": -1,
+            "tris": tris_all,
+        }]
+
+    def _pick_track_side() -> str:
+        if side_counter["left"] > side_counter["right"]:
+            return "left"
+        if side_counter["right"] > side_counter["left"]:
+            return "right"
+        if default_track_side in {"left", "right"}:
+            return default_track_side
+        return "right"
+
+    part_track_side = _pick_track_side()
+
+    grouped: Dict[str, Dict[str, Any]] = {}
+
+    # Secondary deterministic signal for tracks: if caller could not mark track role,
+    # but every classified triangle resolves to roue_* and the material name contains
+    # common track tokens, force track mode to preserve chenille meshes.
+    if (not is_track_material) and ("trk" in mat_low):
+        if tri_infos and all(str(it.get("group_name", "")).startswith("Roue_") for it in tri_infos):
+            is_track_material = True
+
+    if is_track_material:
+        # Strict track policy: all triangles from track materials stay in chenille buckets.
+        # This avoids wheel contamination where small track fragments can be weighted to roue_* bones.
+        side_left: List[Tuple[int, int, int]] = []
+        side_right: List[Tuple[int, int, int]] = []
+        fallback_tris: List[Tuple[int, int, int]] = []
+        side_bone_hint: Dict[str, int] = {"left": -1, "right": -1}
+
+        for info in tri_infos:
+            tri = info["tri"]
+            tri_side = str(info.get("tri_side", "") or "")
+            gbone = int(info.get("group_bone_index", -1))
+            if tri_side == "left":
+                side_left.append(tri)
+                if side_bone_hint["left"] < 0 and gbone >= 0:
+                    side_bone_hint["left"] = gbone
+            elif tri_side == "right":
+                side_right.append(tri)
+                if side_bone_hint["right"] < 0 and gbone >= 0:
+                    side_bone_hint["right"] = gbone
+            else:
+                fallback_tris.append(tri)
+
+        if fallback_tris:
+            if part_track_side == "left":
+                side_left.extend(fallback_tris)
+            else:
+                side_right.extend(fallback_tris)
+
+        def _emit_track_bucket(side: str, tris: List[Tuple[int, int, int]]) -> None:
+            if not tris:
+                return
+            gname = "Chenille_Gauche" if side == "left" else "Chenille_Droite"
+            gbone = int(
+                chenille_bone_by_side.get(
+                    side,
+                    side_bone_hint.get(side, -1),
+                )
+            )
+            key = sanitize_material_name(gname).lower()
+            grouped[key] = {
+                "group_name_raw": gname,
+                "group_name_sanitized": sanitize_material_name(gname),
+                "group_bone_index": gbone,
+                "tris": list(tris),
+            }
+
+        _emit_track_bucket("left", side_left)
+        _emit_track_bucket("right", side_right)
+
+        # Safety fallback: preserve geometry if side detection yielded no buckets.
+        if not grouped:
+            target_side = part_track_side
+            gname = "Chenille_Gauche" if target_side == "left" else "Chenille_Droite"
+            gbone = int(chenille_bone_by_side.get(target_side, -1))
+            grouped[sanitize_material_name(gname).lower()] = {
+                "group_name_raw": gname,
+                "group_name_sanitized": sanitize_material_name(gname),
+                "group_bone_index": gbone,
+                "tris": [it["tri"] for it in tri_infos],
+            }
+    else:
+        for info in tri_infos:
+            group_name = str(info.get("group_name", ""))
+            group_bone_index = int(info.get("group_bone_index", -1))
+            key = sanitize_material_name(group_name).lower()
+            payload = grouped.get(key)
+            if payload is None:
+                payload = {
+                    "group_name_raw": group_name,
+                    "group_name_sanitized": sanitize_material_name(group_name),
+                    "group_bone_index": int(group_bone_index),
+                    "tris": [],
+                }
+                grouped[key] = payload
+            elif int(payload.get("group_bone_index", -1)) < 0 and int(group_bone_index) >= 0:
+                payload["group_bone_index"] = int(group_bone_index)
+            payload["tris"].append(info["tri"])
+
+    for key in sorted(grouped.keys()):
+        payload = grouped.get(key)
+        if payload is None:
+            continue
+        tris = payload.get("tris", [])
+        if not isinstance(tris, list) or not tris:
+            continue
+        out.append(payload)
+    return out
+
+
+def split_faces_by_bone_top_level(
+    part: Dict[str, Any],
+    bone_name_by_index: Dict[int, str],
+    bone_parent_by_index: Dict[int, int],
+    material_role: str = "",
+    material_name: str = "",
+) -> List[Dict[str, Any]]:
+    idx = part.get("indices", [])
+    xyz = part.get("vertices", {}).get("xyz", [])
+    vertex_count = len(xyz) // 3
+
+    def all_tris() -> List[Tuple[int, int, int]]:
+        out: List[Tuple[int, int, int]] = []
+        for i in range(0, len(idx), 3):
+            if i + 2 >= len(idx):
+                break
+            out.append((int(idx[i + 0]), int(idx[i + 1]), int(idx[i + 2])))
+        return out
+
+    dominant = dominant_bone_indices(part.get("vertices", {}), vertex_count)
+    if not dominant:
+        return [{
+            "group_name_raw": "MainBody",
+            "group_name_sanitized": sanitize_material_name("MainBody"),
+            "group_bone_index": -1,
+            "tris": all_tris(),
+        }]
+
+    role = str(material_role or "").strip().lower()
+    mat_low = str(material_name or "").strip().lower()
+
+    top_cache: Dict[int, int] = {}
+
+    def top_level_for_bone(bidx: int) -> int:
+        key = int(bidx)
+        hit = top_cache.get(key)
+        if hit is not None:
+            return int(hit)
+        top = _top_level_child_bone_index(key, bone_parent_by_index)
+        top_cache[key] = int(top)
+        return int(top)
+
+    def representative_top_level_bone() -> int:
+        counts: Dict[int, int] = {}
+        for b in dominant:
+            bb = int(b)
+            counts[bb] = counts.get(bb, 0) + 1
+        if not counts:
+            return -1
+        dom_bone = min(counts.keys(), key=lambda x: (-counts[x], int(x)))
+        return top_level_for_bone(dom_bone)
+
+    if role == "track_left" or "chenille_gauche" in mat_low or "track_left" in mat_low:
+        return [{
+            "group_name_raw": "Chenille_Gauche",
+            "group_name_sanitized": sanitize_material_name("Chenille_Gauche"),
+            "group_bone_index": int(representative_top_level_bone()),
+            "tris": all_tris(),
+        }]
+    if role == "track_right" or "chenille_droite" in mat_low or "track_right" in mat_low:
+        return [{
+            "group_name_raw": "Chenille_Droite",
+            "group_name_sanitized": sanitize_material_name("Chenille_Droite"),
+            "group_bone_index": int(representative_top_level_bone()),
+            "tris": all_tris(),
+        }]
+
+    grouped: Dict[int, List[Tuple[int, int, int]]] = {}
+    for tri in all_tris():
+        a, b, c = tri
+        if min(a, b, c) < 0 or max(a, b, c) >= len(dominant):
+            continue
+        votes = [int(dominant[a]), int(dominant[b]), int(dominant[c])]
+        counts: Dict[int, int] = {}
+        for v in votes:
+            counts[v] = counts.get(v, 0) + 1
+        dom_bone = min(counts.keys(), key=lambda x: (-counts[x], int(x)))
+        top = top_level_for_bone(dom_bone)
+        grouped.setdefault(int(top), []).append(tri)
+
+    if not grouped:
+        return [{
+            "group_name_raw": "MainBody",
+            "group_name_sanitized": sanitize_material_name("MainBody"),
+            "group_bone_index": -1,
+            "tris": all_tris(),
+        }]
+
+    out: List[Dict[str, Any]] = []
+    for bidx in sorted(grouped.keys()):
+        tris = grouped.get(int(bidx), [])
+        if not tris:
+            continue
+        raw_name = str(bone_name_by_index.get(int(bidx), f"bone_{int(bidx):03d}") or f"bone_{int(bidx):03d}")
+        out.append({
+            "group_name_raw": raw_name,
+            "group_name_sanitized": sanitize_material_name(raw_name),
+            "group_bone_index": int(bidx),
+            "tris": tris,
+        })
     return out
 
 
@@ -2826,6 +3335,121 @@ def pick_material_maps_from_textures(textures: Sequence[Dict[str, Any]]) -> Dict
     return out
 
 
+def _atlas_item_is_track(item: Dict[str, Any]) -> bool:
+    text = " ".join(
+        [
+            str(item.get("atlas_target_basename", "") or ""),
+            str(item.get("atlas_target_logical_rel", "") or ""),
+            str(item.get("atlas_ref", "") or ""),
+        ]
+    ).strip()
+    low = text.lower()
+    if "tracks" in low or "_trk" in low or "chenille" in low:
+        return True
+    if detect_part_label(text) == "TRK":
+        return True
+    return is_track_token(text)
+
+
+def _atlas_item_channel(item: Dict[str, Any]) -> str:
+    channel = _canonical_channel(str(item.get("atlas_target_channel", "")))
+    token = " ".join(
+        [
+            str(item.get("atlas_target_basename", "") or ""),
+            str(item.get("atlas_target_logical_rel", "") or ""),
+            str(item.get("atlas_ref", "") or ""),
+            str(Path(str(item.get("out_png", "") or "")).stem),
+        ]
+    )
+    guessed = channel_from_token(token)
+    guessed_channel = _canonical_channel(guessed) if guessed is not None else "generic"
+    if guessed_channel != "generic":
+        if channel == "generic":
+            channel = guessed_channel
+        elif channel == "diffuse" and guessed_channel in {"alpha", "normal", "roughness", "metallic", "occlusion", "orm"}:
+            channel = guessed_channel
+    if channel == "generic":
+        channel = _canonical_channel(str(item.get("role", "")))
+    return channel
+
+
+def pick_maps_for_material_from_atlas_resolved(
+    resolved_items: Sequence[Dict[str, Any]],
+    material_role: str,
+    asset_stem: str,
+) -> Dict[str, Path]:
+    wanted = {"diffuse", "normal", "roughness", "metallic", "occlusion", "alpha", "orm"}
+    role_low = str(material_role or "").strip().lower()
+    want_track = role_low.startswith("track")
+    stem_low = str(asset_stem or "").strip().lower()
+    best_explicit: Dict[str, Tuple[float, Path]] = {}
+    best_extra: Dict[str, Tuple[float, Path]] = {}
+
+    def _prefer_occlusion_short_o(path: Path) -> Path:
+        try:
+            p = Path(path)
+        except Exception:
+            return path
+        stem = p.stem
+        up = stem.upper()
+        if up.endswith("_AO"):
+            alt = p.with_name(f"{stem[:-3]}_O{p.suffix}")
+            if alt.exists() and alt.is_file():
+                return alt
+        return p
+
+    def _add(bucket: Dict[str, Tuple[float, Path]], channel: str, path: Path | None, is_track: bool, score: float) -> None:
+        if path is None or channel not in wanted:
+            return
+        if channel == "occlusion":
+            path = _prefer_occlusion_short_o(path)
+        if not path.exists() or not path.is_file():
+            return
+        current = bucket.get(channel)
+        if current is None or float(score) > current[0]:
+            bucket[channel] = (float(score), path)
+
+    for idx, item in enumerate(resolved_items):
+        out_raw = item.get("out_png")
+        out_png = Path(out_raw) if out_raw else None
+        if out_png is None:
+            continue
+
+        channel = _atlas_item_channel(item)
+        if channel not in wanted:
+            continue
+
+        is_track = _atlas_item_is_track(item)
+        if is_track != want_track:
+            continue
+
+        # Deterministic ordering: earlier resolved items win inside same channel.
+        score = 1000.0 - float(idx)
+        if stem_low:
+            base = str(item.get("atlas_target_basename", "") or "").lower()
+            if base.startswith(f"{stem_low}_"):
+                score += 25.0
+            elif base == stem_low:
+                score += 20.0
+
+        _add(best_explicit, channel, out_png, is_track, score)
+
+        extras = item.get("extras", {})
+        if isinstance(extras, dict):
+            for ek, ev in extras.items():
+                extra_path = Path(ev)
+                token = f"{str(ek or '')} {extra_path.stem}"
+                extra_channel = channel_from_token(token)
+                if extra_channel is None:
+                    continue
+                _add(best_extra, _canonical_channel(extra_channel), extra_path, is_track, score - 5.0)
+
+    merged: Dict[str, Path] = {ch: src for ch, (_score, src) in best_explicit.items()}
+    for ch, (_score, src) in best_extra.items():
+        merged.setdefault(ch, src)
+    return merged
+
+
 def rel_path_for_obj(base_obj: Path, target: Path) -> str:
     try:
         base_parent = base_obj.parent.resolve()
@@ -2861,6 +3485,7 @@ class SpkMeshExtractor:
         self.material_texture_refs: List[str] = []
         self.material_refs_by_dir: Dict[str, List[str]] = {}
         self.material_texture_slots_by_id: Dict[int, Dict[str, str]] = {}
+        self.material_texture_names_by_id: Dict[int, Dict[str, str]] = {}
         self.material_texture_refs_by_material: Dict[int, List[str]] = {}
         self.material_name_by_id: Dict[int, str] = {}
         self._index_cache: Dict[int, List[int]] = {}
@@ -3264,6 +3889,15 @@ class SpkMeshExtractor:
         return out
 
     def _extract_texture_slots_from_value(self, value: Tuple[str, Any] | Any) -> Dict[str, str]:
+        raw = self._extract_texture_slots_raw_from_value(value)
+        out: Dict[str, str] = {}
+        for slot_name, raw_value in raw.items():
+            low = str(raw_value or "").strip().lower()
+            if "/pc/atlas/assets/" in low or low.startswith("pc/atlas/assets/") or low.startswith("assets/"):
+                out.setdefault(slot_name, normalize_atlas_ref(str(raw_value)))
+        return out
+
+    def _extract_texture_slots_raw_from_value(self, value: Tuple[str, Any] | Any) -> Dict[str, str]:
         out: Dict[str, str] = {}
         if not isinstance(value, tuple) or len(value) < 2:
             return out
@@ -3280,11 +3914,13 @@ class SpkMeshExtractor:
             slot_name = self._ndf_value_to_string(key_val)
             if not slot_name:
                 continue
-            refs = self._extract_atlas_refs_from_ndf_value(map_val)
-            if not refs:
+            raw_value = self._ndf_value_to_string(map_val)
+            if raw_value:
+                out.setdefault(slot_name, raw_value)
                 continue
-            # Keep first binding per slot.
-            out.setdefault(slot_name, refs[0])
+            refs = self._extract_atlas_refs_from_ndf_value(map_val)
+            if refs:
+                out.setdefault(slot_name, refs[0])
         return out
 
     @staticmethod
@@ -3310,14 +3946,50 @@ class SpkMeshExtractor:
         refs = [normalize_atlas_ref(v) for _, v in items if str(v).strip()]
         return unique_keep_order(refs)
 
+    @staticmethod
+    def _material_name_from_raw_slots(slot_map: Dict[str, str]) -> str:
+        if not isinstance(slot_map, dict) or not slot_map:
+            return ""
+        preferred_slots = [
+            "DiffuseTextureNoAlpha",
+            "DiffuseTexture",
+            "BaseColorTexture",
+            "ColorTexture",
+            "NormalTexture",
+            "RoughnessTexture",
+            "MetallicTexture",
+            "AmbientOcclusionTexture",
+            "OpacityTexture",
+        ]
+        candidates: List[str] = []
+        for key in preferred_slots:
+            raw = str(slot_map.get(key, "")).strip()
+            if raw:
+                candidates.append(raw)
+        if not candidates:
+            for raw in slot_map.values():
+                val = str(raw or "").strip()
+                if val:
+                    candidates.append(val)
+        for raw in candidates:
+            stem = Path(raw).stem
+            if not stem:
+                continue
+            base = re.sub(r"(?i)_(d|nm|r|m|o|ao|a|orm)$", "", stem).strip("_")
+            if not base:
+                base = stem.strip("_")
+            if base:
+                return sanitize_material_name(base)
+        return ""
+
     def _parse_material_texture_refs_structured(
         self,
         payload: bytes,
         toc_index_hint: int | None = None,
         offset_shift: int = 0,
-    ) -> Tuple[Dict[int, Dict[str, str]], Dict[int, str], List[str]]:
+    ) -> Tuple[Dict[int, Dict[str, str]], Dict[int, str], List[str], Dict[int, Dict[str, str]]]:
         if not payload:
-            return {}, {}, []
+            return {}, {}, [], {}
 
         toc_index = -1
         if toc_index_hint is not None and 0 <= toc_index_hint < len(payload):
@@ -3326,17 +3998,17 @@ class SpkMeshExtractor:
         if toc_index < 0:
             toc_index = payload.rfind(b"TOC0")
         if toc_index < 0 or toc_index + 8 > len(payload):
-            return {}, {}, []
+            return {}, {}, [], {}
 
         entry_count = struct.unpack_from("<I", payload, toc_index + 4)[0]
         if entry_count <= 0 or entry_count > 1024:
-            return {}, {}, []
+            return {}, {}, [], {}
 
         pos = toc_index + 8
         entries: Dict[str, Tuple[int, int]] = {}
         for _ in range(int(entry_count)):
             if pos + 24 > len(payload):
-                return {}, {}, []
+                return {}, {}, [], {}
             name = payload[pos : pos + 8].split(b"\x00", 1)[0].decode("ascii", errors="ignore")
             pos += 8
             off = struct.unpack_from("<Q", payload, pos)[0]
@@ -3348,7 +4020,7 @@ class SpkMeshExtractor:
 
         need = {"OBJE", "CHNK", "CLAS", "PROP", "STRG"}
         if not need.issubset(set(entries.keys())):
-            return {}, {}, []
+            return {}, {}, [], {}
 
         def read_string_table(offset: int, size: int) -> List[str]:
             out: List[str] = []
@@ -3382,16 +4054,17 @@ class SpkMeshExtractor:
 
         chnk_off, chnk_size = entries["CHNK"]
         if chnk_size < 8 or chnk_off + 8 > len(payload):
-            return {}, {}, []
+            return {}, {}, [], {}
         obj_count = struct.unpack_from("<I", payload, chnk_off + 4)[0]
         if obj_count <= 0 or obj_count > 10_000_000:
-            return {}, {}, []
+            return {}, {}, [], {}
 
         obje_off, obje_size = entries["OBJE"]
         p = int(obje_off)
         obje_end = min(len(payload), int(obje_off + obje_size))
 
         slots_by_object_id: Dict[int, Dict[str, str]] = {}
+        raw_slots_by_object_id: Dict[int, Dict[str, str]] = {}
         names_by_object_id: Dict[int, str] = {}
         material_object_order: List[int] = []
         refs_all: List[str] = []
@@ -3413,12 +4086,15 @@ class SpkMeshExtractor:
                     break
                 prop_name = prop_names[prop_id] if 0 <= prop_id < len(prop_names) else f"prop_{prop_id}"
                 p, val = self._parse_material_ndf_value(payload, p, strings)
-                if cls_name == "TEugBListPBaseClass" and prop_name == "Value" and not material_object_order:
+                if cls_name in {"TEugBListPBaseClass", "TMeshPack_MeshMaterialList"} and prop_name in {"Value", "Materials"} and not material_object_order:
                     material_object_order = self._extract_object_refs_from_ndf_value(val)
                 elif cls_name == "TMeshMaterial":
                     if prop_name == "MaterialName":
                         mat_name = self._ndf_value_to_string(val)
-                    elif prop_name == "Textures":
+                    elif prop_name in {"Textures", "TextureDico"}:
+                        raw_slots = self._extract_texture_slots_raw_from_value(val)
+                        if raw_slots:
+                            raw_slots_by_object_id.setdefault(int(obj_id), {}).update(raw_slots)
                         slot_refs.update(self._extract_texture_slots_from_value(val))
 
             if cls_name != "TMeshMaterial":
@@ -3433,6 +4109,7 @@ class SpkMeshExtractor:
                     refs_all.extend(self._ordered_refs_from_slots(clean_slot_refs))
 
         slots_by_id: Dict[int, Dict[str, str]] = {}
+        raw_slots_by_id: Dict[int, Dict[str, str]] = {}
         names_by_id: Dict[int, str] = {}
         if material_object_order:
             for mat_index, obj_ref_id in enumerate(material_object_order):
@@ -3440,19 +4117,24 @@ class SpkMeshExtractor:
                 slot_map = slots_by_object_id.get(obj_id)
                 if slot_map:
                     slots_by_id[int(mat_index)] = slot_map
+                raw_slot_map = raw_slots_by_object_id.get(obj_id)
+                if raw_slot_map:
+                    raw_slots_by_id[int(mat_index)] = dict(raw_slot_map)
                 mat_name = names_by_object_id.get(obj_id)
                 if mat_name:
                     names_by_id[int(mat_index)] = mat_name
         else:
             slots_by_id = dict(slots_by_object_id)
+            raw_slots_by_id = {int(k): dict(v) for k, v in raw_slots_by_object_id.items()}
             names_by_id = dict(names_by_object_id)
 
-        return slots_by_id, names_by_id, unique_keep_order(refs_all)
+        return slots_by_id, names_by_id, unique_keep_order(refs_all), raw_slots_by_id
 
     def _parse_material_texture_refs(self) -> None:
         self.material_texture_refs = []
         self.material_refs_by_dir = {}
         self.material_texture_slots_by_id = {}
+        self.material_texture_names_by_id = {}
         self.material_texture_refs_by_material = {}
         self.material_name_by_id = {}
 
@@ -3479,7 +4161,7 @@ class SpkMeshExtractor:
                 offset_shift = 0
 
         if payload:
-            slots_by_id, names_by_id, refs_structured = self._parse_material_texture_refs_structured(
+            slots_by_id, names_by_id, refs_structured, raw_slots_by_id = self._parse_material_texture_refs_structured(
                 payload,
                 toc_index_hint=toc_hint,
                 offset_shift=offset_shift,
@@ -3497,6 +4179,18 @@ class SpkMeshExtractor:
                 refs = unique_keep_order(refs_ordered)
                 if not refs and refs_structured:
                     refs = unique_keep_order(refs_structured)
+            if raw_slots_by_id:
+                self.material_texture_names_by_id = {
+                    int(mid): {str(k): str(v) for k, v in slots.items()}
+                    for mid, slots in raw_slots_by_id.items()
+                    if isinstance(slots, dict) and slots
+                }
+                for mid, slots in self.material_texture_names_by_id.items():
+                    if str(self.material_name_by_id.get(int(mid), "")).strip():
+                        continue
+                    guessed = self._material_name_from_raw_slots(slots)
+                    if guessed:
+                        self.material_name_by_id[int(mid)] = guessed
 
         # Fallback for unsupported payload variants: raw regex path scan.
         if not refs and payload:
@@ -3951,6 +4645,7 @@ class SpkMeshExtractor:
     ) -> Dict[str, List[float]]:
         # Known formats from SpkFile.php logic.
         patterns = {
+            "$/M3D/System/VertexType/TVertex__Position_3f__TexCoord0_2wn__TangentIn01_4ubn__BinormalIn01_4ubn",
             "$/M3D/System/VertexType/TVertex__Position_3f__TexCoord0_2wn__TangentIn01_4ubn__BinormalIn01_4ubn__TexPackedAtlas0_4ubn__TexPackedAtlas1_4ubn__TexPackedAtlas2_4ubn",
             "$/M3D/System/VertexType/TVertex__Position_3f__NormalIn01_4ubn__TexCoord0_2wn__TexPackedAtlas0_4ubn__TexPackedAtlas1_4ubn__TexPackedAtlas2_4ubn",
             "$/M3D/System/VertexType/TVertex__Position_3f__NormalIn01_4ubn__TexCoord0_2wn__TexPackedAtlas0_4ubn",
@@ -3992,7 +4687,11 @@ class SpkMeshExtractor:
         for _ in range(num_vertices):
             xyz.extend([rf32(), rf32(), rf32()])
 
-            if fmt == "$/M3D/System/VertexType/TVertex__Position_3f__TexCoord0_2wn__TangentIn01_4ubn__BinormalIn01_4ubn__TexPackedAtlas0_4ubn__TexPackedAtlas1_4ubn__TexPackedAtlas2_4ubn":
+            if fmt == "$/M3D/System/VertexType/TVertex__Position_3f__TexCoord0_2wn__TangentIn01_4ubn__BinormalIn01_4ubn":
+                uv.extend([ru16_uv(), ru16_uv()])
+                # Tangent + Binormal (4 + 4 bytes).
+                skip(0x08)
+            elif fmt == "$/M3D/System/VertexType/TVertex__Position_3f__TexCoord0_2wn__TangentIn01_4ubn__BinormalIn01_4ubn__TexPackedAtlas0_4ubn__TexPackedAtlas1_4ubn__TexPackedAtlas2_4ubn":
                 uv.extend([ru16_uv(), ru16_uv()])
                 skip(0x14)
             elif fmt == "$/M3D/System/VertexType/TVertex__Position_3f__NormalIn01_4ubn__TexCoord0_2wn__TexPackedAtlas0_4ubn__TexPackedAtlas1_4ubn__TexPackedAtlas2_4ubn":
@@ -4818,6 +5517,7 @@ class ZZDatResolver:
 
 
 _ZZ_RESOLVER_CACHE: Dict[Tuple[Tuple[str, int, int], ...], ZZDatResolver] = {}
+_ATLAS_JSON_CACHE: Dict[Tuple[str, str, int, int, str], Dict[str, Any]] = {}
 
 
 def get_zz_runtime_resolver(warno_root: Path) -> ZZDatResolver:
@@ -4837,6 +5537,268 @@ def get_zz_runtime_resolver(warno_root: Path) -> ZZDatResolver:
     _ZZ_RESOLVER_CACHE.clear()
     _ZZ_RESOLVER_CACHE[key] = resolver
     return resolver
+
+
+def clear_atlas_json_cache() -> None:
+    _ATLAS_JSON_CACHE.clear()
+
+
+def _normalize_logical_ref(path: str) -> str:
+    raw = str(path or "").replace("\\", "/").strip()
+    if not raw:
+        return ""
+    low = raw.lower()
+    if low.startswith("combinedtexture:/"):
+        raw = raw[len("combinedtexture:/") :]
+    if raw.lower().startswith("gamedata:/"):
+        raw = raw[len("gamedata:/") :]
+    if raw.lower().startswith("gamedata:"):
+        raw = raw[len("gamedata:") :]
+    raw = raw.lstrip("/")
+    raw = normalize_asset_path(raw)
+    low = raw.lower()
+    if low.startswith("pc/atlas/assets/"):
+        return normalize_asset_path("Assets/" + raw[len("PC/Atlas/Assets/") :]).lower()
+    return low
+
+
+def _canonical_channel(value: str) -> str:
+    low = str(value or "").strip().lower()
+    if not low:
+        return "generic"
+    if low in {"d", "diff", "albedo", "basecolor", "base_color", "diffuse"}:
+        return "diffuse"
+    if low in {"nm", "normal", "normalmap"}:
+        return "normal"
+    if low in {"orm", "occlusionroughnessmetallic", "rma"}:
+        return "orm"
+    if low in {"r", "rough", "roughness"}:
+        return "roughness"
+    if low in {"m", "metal", "metallic"}:
+        return "metallic"
+    if low in {"o", "ao", "occlusion", "ambientocclusion"}:
+        return "occlusion"
+    if low in {"a", "alpha", "opacity"}:
+        return "alpha"
+    if low in {"da", "combined_da", "coloralpha"}:
+        return "combined_da"
+    return low
+
+
+def _atlas_target_output_rel(target_logical_rel: str, target_basename: str) -> Path:
+    logical = _normalize_logical_ref(target_logical_rel)
+    if logical.startswith("assets/"):
+        rel = Path(*PurePosixPath(logical).parts[1:])
+        parent = rel.parent
+    else:
+        parent = Path()
+    stem = str(target_basename or "").strip() or Path(logical).stem or "Texture"
+    return parent / f"{stem}.png"
+
+
+def _build_atlas_json_index(data: Dict[str, Any]) -> Tuple[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]]]:
+    index: Dict[str, List[Dict[str, Any]]] = {}
+    entries: List[Dict[str, Any]] = []
+    textures = data.get("textures", [])
+    if not isinstance(textures, list):
+        return index, entries
+
+    def add_key(key: str, item: Dict[str, Any]) -> None:
+        norm = _normalize_logical_ref(key)
+        if not norm:
+            return
+        bucket = index.setdefault(norm, [])
+        if item not in bucket:
+            bucket.append(item)
+
+    for tex in textures:
+        if not isinstance(tex, dict):
+            continue
+        source_tgv_rel = _normalize_logical_ref(str(tex.get("source_tgv_rel", "")).strip())
+        if not source_tgv_rel:
+            continue
+        source_role = _canonical_channel(str(tex.get("source_role", "generic")))
+        rect = tex.get("crop_rect_px") if isinstance(tex.get("crop_rect_px"), dict) else {}
+        crop_rect_px = {
+            "x": int(rect.get("x", 0) or 0),
+            "y": int(rect.get("y", 0) or 0),
+            "w": int(rect.get("w", 0) or 0),
+            "h": int(rect.get("h", 0) or 0),
+        }
+        targets = tex.get("targets") if isinstance(tex.get("targets"), list) else []
+        if not targets:
+            targets = [{}]
+        for tgt in targets:
+            if not isinstance(tgt, dict):
+                tgt = {}
+            logical_rel = str(tgt.get("logical_rel", "")).strip()
+            basename = str(tgt.get("basename", "")).strip()
+            channel = _canonical_channel(str(tgt.get("channel", "")))
+            entry = {
+                "source_tgv_rel": source_tgv_rel,
+                "source_role": source_role,
+                "crop_rect_px": dict(crop_rect_px),
+                "target_logical_rel": logical_rel,
+                "target_basename": basename or Path(_normalize_logical_ref(logical_rel)).stem,
+                "target_channel": channel if channel != "generic" else source_role,
+            }
+            entries.append(entry)
+            add_key(logical_rel, entry)
+            logical_norm = _normalize_logical_ref(logical_rel)
+            if logical_norm.endswith(".png"):
+                add_key(logical_norm[:-4] + ".tgv", entry)
+            elif logical_norm.endswith(".tgv"):
+                add_key(logical_norm[:-4] + ".png", entry)
+    return index, entries
+
+
+def _atlas_target_refs_from_entries(entries: Sequence[Dict[str, Any]]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        logical = str(entry.get("target_logical_rel", "")).strip()
+        norm = _normalize_logical_ref(logical)
+        if not norm:
+            continue
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append(logical or norm)
+    return out
+
+
+def _atlas_map_signature(path: Path) -> Tuple[str, int, int]:
+    p = Path(path)
+    st = p.stat()
+    return (str(p.resolve()).lower(), int(st.st_mtime_ns), int(st.st_size))
+
+
+def _python_cmd_candidates_for_wrapper() -> List[List[str]]:
+    if sys.executable:
+        return [[sys.executable]]
+    env_py = os.environ.get("PYTHON", "").strip()
+    if env_py:
+        return [[env_py]]
+    return []
+
+
+def _resolve_atlas_wrapper(wrapper_path: Path) -> Path:
+    p = Path(wrapper_path)
+    if p.exists() and p.is_file():
+        return p
+    alt = Path(__file__).with_name("modding_suite_atlas_export.py")
+    if alt.exists() and alt.is_file():
+        return alt
+    return p
+
+
+def build_or_load_atlas_texture_map(
+    warno_root: Path,
+    modding_suite_root: Path,
+    asset_path: str,
+    cache_dir: Path,
+    wrapper_path: Path,
+    atlas_cli_path: Path | None = None,
+    force_rebuild: bool = False,
+    timeout_sec: int = 45,
+) -> Dict[str, Any]:
+    asset_norm = normalize_asset_path(str(asset_path or "")).strip()
+    if not asset_norm:
+        raise RuntimeError("Atlas JSON build failed: empty asset path")
+
+    cache_root = Path(cache_dir)
+    cache_root.mkdir(parents=True, exist_ok=True)
+    rel = Path(*PurePosixPath(asset_norm).parts).with_suffix(".atlas_map.json")
+    out_json = cache_root / rel
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+
+    wrapper = _resolve_atlas_wrapper(wrapper_path)
+    if not wrapper.exists() or not wrapper.is_file():
+        raise RuntimeError(f"Atlas JSON wrapper not found: {wrapper}")
+
+    need_export = force_rebuild or not out_json.exists()
+    if need_export:
+        temp_out = out_json.with_suffix(".tmp.json")
+        cmd_tail = [
+            str(wrapper),
+            "--warno-root",
+            str(warno_root),
+            "--modding-suite-root",
+            str(modding_suite_root),
+            "--asset-path",
+            asset_norm,
+            "--out-json",
+            str(temp_out),
+            "--cache-dir",
+            str(cache_root),
+            "--timeout-sec",
+            str(max(5, int(timeout_sec))),
+        ]
+        if atlas_cli_path is not None and str(atlas_cli_path).strip():
+            cmd_tail.extend(["--atlas-cli", str(atlas_cli_path)])
+        errors: List[str] = []
+        for py_cmd in _python_cmd_candidates_for_wrapper():
+            cmd = [*py_cmd, *cmd_tail]
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=max(10, int(timeout_sec) + 10),
+                )
+            except subprocess.TimeoutExpired:
+                errors.append(f"[{' '.join(py_cmd)}] timeout>{int(timeout_sec) + 10}s")
+                continue
+            if proc.returncode == 0 and temp_out.exists():
+                temp_out.replace(out_json)
+                errors = []
+                break
+            msg = (proc.stderr or proc.stdout or "").strip()
+            if proc.returncode == 2:
+                errors.append(f"[{' '.join(py_cmd)}] rc=2: atlas data has no entries for asset {asset_norm}")
+                continue
+            errors.append(f"[{' '.join(py_cmd)}] rc={proc.returncode}: {msg}")
+        if errors:
+            raise RuntimeError(
+                "Atlas JSON export failed: " + " | ".join(errors[:2])
+            )
+
+    sig = _atlas_map_signature(out_json)
+    try:
+        data = json.loads(out_json.read_text(encoding="utf-8-sig"))
+    except Exception as exc:
+        raise RuntimeError(f"Atlas JSON parse failed: {out_json}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Atlas JSON has invalid root object: {out_json}")
+    if int(data.get("schema_version", 0) or 0) != 1:
+        raise RuntimeError(f"Atlas JSON schema mismatch: expected schema_version=1, got {data.get('schema_version')}")
+    if not isinstance(data.get("textures"), list):
+        raise RuntimeError("Atlas JSON schema mismatch: textures[] is missing")
+
+    cli_version = str(data.get("cli_version", "") or "").strip() or "unknown"
+    cache_key = (asset_norm.lower(), sig[0], sig[1], sig[2], cli_version)
+    cached = _ATLAS_JSON_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+
+    index, entries = _build_atlas_json_index(data)
+    atlas_targets = _atlas_target_refs_from_entries(entries)
+    result = {
+        "asset_path": asset_norm,
+        "atlas_map_path": str(out_json),
+        "atlas_map_entries": int(len(entries)),
+        "atlas_map_targets": list(atlas_targets),
+        "atlas_map_index": index,
+        "atlas_cli_version": cli_version,
+        "atlas_signature": {
+            "path": sig[0],
+            "mtime_ns": int(sig[1]),
+            "size": int(sig[2]),
+        },
+    }
+    _ATLAS_JSON_CACHE.clear()
+    _ATLAS_JSON_CACHE[cache_key] = dict(result)
+    return dict(result)
 
 
 def prepare_runtime_sources_from_zz(warno_root: Path, runtime_root: Path) -> Dict[str, Any]:
@@ -4924,6 +5886,7 @@ def prepare_runtime_sources_from_zz(warno_root: Path, runtime_root: Path) -> Dic
     return {
         "warno_root": str(root),
         "runtime_root": str(runtime),
+        "source_policy": "zz_runtime_only",
         "atlas_assets_root": str(atlas_assets_root),
         "mesh_spk": str(mesh_spk) if mesh_spk is not None else "",
         "mesh_spk_dir": str(mesh_spk_dir),
@@ -4938,33 +5901,38 @@ def prepare_runtime_sources_from_zz(warno_root: Path, runtime_root: Path) -> Dic
     }
 
 
-def find_generated_extra_maps(out_png: Path) -> Dict[str, Path]:
+def find_generated_extra_maps(out_png: Path, strict_atlas: bool = False) -> Dict[str, Path]:
     stem = out_png.with_suffix("")
     out: Dict[str, Path] = {}
+    alpha_canonical = stem.with_name(f"{stem.name}_A.png")
+    alpha_legacy = stem.with_name(f"{stem.name}_alpha.png")
     candidates = {
         "diffuse": stem.with_name(f"{stem.name}_diffuse.png"),
-        "alpha": stem.with_name(f"{stem.name}_alpha.png"),
+        "diffuse_d": stem.with_name(f"{stem.name}_D.png"),
         "occlusion": stem.with_name(f"{stem.name}_occlusion.png"),
         "roughness": stem.with_name(f"{stem.name}_roughness.png"),
         "metallic": stem.with_name(f"{stem.name}_metallic.png"),
         "normal_reconstructed": stem.with_name(f"{stem.name}_normal_reconstructed.png"),
-        "normal_x": stem.with_name(f"{stem.name}_normal_x.png"),
-        "normal_y": stem.with_name(f"{stem.name}_normal_y.png"),
-        "normal_z": stem.with_name(f"{stem.name}_normal_z.png"),
     }
+    if alpha_canonical.exists():
+        out["alpha"] = alpha_canonical
+    elif alpha_legacy.exists():
+        out["alpha"] = alpha_legacy
     for k, v in candidates.items():
         if v.exists():
             out[k] = v
 
-    # Collect dynamic extras generated by converter (track_* and similar variants).
-    prefix = f"{stem.name}_"
-    for p in stem.parent.glob(f"{stem.name}_*.png"):
-        suffix = p.stem[len(prefix) :]
-        if suffix:
-            out.setdefault(suffix.lower(), p)
+    # Strict atlas mode only allows exact sibling extras for the same stem.
+    # Non-strict mode may still discover dynamic extras from broad converter outputs.
+    if not bool(strict_atlas):
+        prefix = f"{stem.name}_"
+        for p in stem.parent.glob(f"{stem.name}_*.png"):
+            suffix = p.stem[len(prefix) :]
+            if suffix:
+                out.setdefault(suffix.lower(), p)
 
-    # Canonical TRK outputs when source stem is canonical (e.g. Unit_ORM -> Unit_TRK_ORM).
-    m = re.match(r"(?i)^(.+?)_(NM|ORM|DA|D|A|AO|R|M)$", stem.name)
+    # Canonical aliases derived from the same logical base.
+    m = re.match(r"(?i)^(.+?)_(NM|ORM|DA|D|A|AO|O|R|M|OS|RS)$", stem.name)
     if m:
         base = m.group(1)
         tag = m.group(2).upper()
@@ -4972,12 +5940,32 @@ def find_generated_extra_maps(out_png: Path) -> Dict[str, Path]:
             canonical_alpha = stem.with_name(f"{base}_A.png")
             if canonical_alpha.exists():
                 out.setdefault("alpha", canonical_alpha)
-        for p in stem.parent.glob(f"{base}_TRK_*.png"):
-            out.setdefault(p.stem.lower(), p)
+        if tag == "ORM":
+            canonical_o = stem.with_name(f"{base}_O.png")
+            canonical_ao = stem.with_name(f"{base}_AO.png")
+            canonical_r = stem.with_name(f"{base}_R.png")
+            canonical_m = stem.with_name(f"{base}_M.png")
+            if canonical_o.exists():
+                out.setdefault("occlusion", canonical_o)
+            elif canonical_ao.exists():
+                out.setdefault("occlusion", canonical_ao)
+            if canonical_r.exists():
+                out.setdefault("roughness", canonical_r)
+            if canonical_m.exists():
+                out.setdefault("metallic", canonical_m)
+        if tag in {"O", "AO"}:
+            canonical_o = stem.with_name(f"{base}_O.png")
+            canonical_ao = stem.with_name(f"{base}_AO.png")
+            if canonical_o.exists():
+                out.setdefault("occlusion", canonical_o)
+            elif canonical_ao.exists():
+                out.setdefault("occlusion", canonical_ao)
+        if not bool(strict_atlas):
+            for p in stem.parent.glob(f"{base}_TRK_*.png"):
+                out.setdefault(p.stem.lower(), p)
     return out
 
 
-_TGV_FOLDER_CONVERT_CACHE: set[Tuple[str, str, str, str, bool, bool, bool]] = set()
 _DEPS_READY_CACHE: Dict[Tuple[str, str], bool] = {}
 _DEPS_AUTO_INSTALL_COUNT: int = 0
 
@@ -4989,73 +5977,8 @@ def _safe_resolved_str(path: Path) -> str:
         return str(path)
 
 
-def _folder_convert_cache_key(
-    converter: Path,
-    src_dir: Path,
-    dst_dir: Path,
-    split_mode: str,
-    mirror: bool,
-    aggressive_split: bool,
-    auto_naming: bool,
-) -> Tuple[str, str, str, str, bool, bool, bool]:
-    conv_sig = _safe_resolved_str(converter)
-    try:
-        stc = converter.stat()
-        conv_sig = f"{conv_sig}:{int(stc.st_size)}:{int(stc.st_mtime_ns)}"
-    except Exception:
-        pass
-
-    # Include source folder content fingerprint so cached group conversion
-    # is re-run when additional TGV files appear later in the same folder.
-    sig_parts: List[str] = []
-    try:
-        for p in sorted(src_dir.glob("*.tgv"), key=lambda x: x.name.lower()):
-            try:
-                st = p.stat()
-                sig_parts.append(f"{p.name.lower()}:{int(st.st_size)}:{int(st.st_mtime_ns)}")
-            except Exception:
-                sig_parts.append(f"{p.name.lower()}:na")
-    except Exception:
-        pass
-    src_signature = "|".join(sig_parts)
-    return (
-        conv_sig,
-        f"{_safe_resolved_str(src_dir)}::{src_signature}",
-        _safe_resolved_str(dst_dir),
-        str(split_mode or "auto").strip().lower(),
-        bool(mirror),
-        bool(aggressive_split),
-        bool(auto_naming),
-    )
-
-
 def _python_cmd_key(py_cmd: Sequence[str]) -> str:
     return " ".join(str(x).strip().lower() for x in py_cmd if str(x).strip())
-
-
-def _python_cmd_candidates() -> List[List[str]]:
-    cands: List[List[str]] = []
-    env_py = os.environ.get("WARNO_TGV_PYTHON", "").strip()
-    if env_py:
-        cands.append([env_py])
-    if sys.executable:
-        cands.append([sys.executable])
-    py_shim = shutil.which("py")
-    if py_shim:
-        cands.append([py_shim, "-3"])
-    py_bin = shutil.which("python")
-    if py_bin:
-        cands.append([py_bin])
-
-    uniq: List[List[str]] = []
-    seen: set[str] = set()
-    for cmd in cands:
-        key = _python_cmd_key(cmd)
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        uniq.append(cmd)
-    return uniq
 
 
 def _is_missing_py_dependency_error(stderr_text: str) -> set[str]:
@@ -5076,6 +5999,12 @@ def _converter_env_with_deps(target_dir: Path) -> Dict[str, str]:
     cur = str(env.get("PYTHONPATH", "") or "").strip()
     env["PYTHONPATH"] = deps if not cur else deps + os.pathsep + cur
     return env
+
+
+def _scoped_deps_dir(base_dir: Path) -> Path:
+    major = int(getattr(sys.version_info, "major", 3))
+    minor = int(getattr(sys.version_info, "minor", 0))
+    return Path(base_dir) / f"py{major}{minor}"
 
 
 def _ensure_converter_python_deps(py_cmd: Sequence[str], target_dir: Path) -> Tuple[bool, str]:
@@ -5131,133 +6060,35 @@ def get_tgv_deps_auto_install_count() -> int:
 def install_tgv_converter_deps(converter: Path, deps_dir: Path | None = None) -> Tuple[bool, str]:
     if Path(converter).suffix.lower() != ".py":
         return True, "converter is not a python script; deps bootstrap is not required"
-    target_dir = Path(deps_dir) if deps_dir is not None else (Path(converter).parent / ".warno_pydeps")
-    cands = _python_cmd_candidates()
-    if not cands:
-        return False, "no python interpreter candidate found for dependency install"
-    errors: List[str] = []
-    for py_cmd in cands:
-        ok, msg = _ensure_converter_python_deps(py_cmd, target_dir)
-        if ok:
-            return True, f"[{' '.join(py_cmd)}] {msg}"
-        errors.append(f"[{' '.join(py_cmd)}] {msg}")
-    return False, "; ".join(errors[:3])
-
-
-def run_tgv_converter_for_folder_once(
-    converter: Path,
-    src_dir: Path,
-    dst_dir: Path,
-    split_mode: str = "auto",
-    mirror: bool = False,
-    aggressive_split: bool = False,
-    auto_naming: bool = False,
-    auto_install_deps: bool = True,
-    deps_dir: Path | None = None,
-    allow_inprocess: bool = True,
-    subprocess_timeout_sec: int = 120,
-) -> None:
-    key = _folder_convert_cache_key(
-        converter=converter,
-        src_dir=src_dir,
-        dst_dir=dst_dir,
-        split_mode=split_mode,
-        mirror=mirror,
-        aggressive_split=aggressive_split,
-        auto_naming=auto_naming,
-    )
-    if key in _TGV_FOLDER_CONVERT_CACHE:
-        return
-    run_tgv_converter(
-        converter=converter,
-        src_tgv=src_dir,
-        dst_png=dst_dir,
-        split_mode=split_mode,
-        mirror=mirror,
-        aggressive_split=aggressive_split,
-        auto_naming=auto_naming,
-        auto_install_deps=auto_install_deps,
-        deps_dir=deps_dir,
-        allow_inprocess=allow_inprocess,
-        subprocess_timeout_sec=subprocess_timeout_sec,
-    )
-    _TGV_FOLDER_CONVERT_CACHE.add(key)
-
-
-def run_tgv_converter_inprocess(
-    converter: Path,
-    src_tgv: Path,
-    dst_png: Path,
-    split_mode: str = "auto",
-    mirror: bool = False,
-    aggressive_split: bool = False,
-    auto_naming: bool = True,
-) -> bool:
-    if converter.suffix.lower() != ".py":
-        return False
-    try:
-        spec = importlib.util.spec_from_file_location(
-            f"warno_tgv_converter_{abs(hash(str(converter.resolve())))}",
-            str(converter),
-        )
-        if spec is None or spec.loader is None:
-            return False
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-    except Exception:
-        return False
-
-    convert_path = getattr(module, "convert_path", None)
-    if not callable(convert_path):
-        return False
-
-    kwargs = {
-        "input_path": src_tgv,
-        "output_arg": str(dst_png),
-        "recursive": False,
-        "split_mode": split_mode,
-        "mirror": bool(mirror),
-        "auto_naming": bool(auto_naming),
-        "aggressive_split": bool(aggressive_split),
-    }
-    try:
-        convert_path(**kwargs)
-        return True
-    except TypeError:
-        pass
-
-    # Backward-compatible calls for older converters without new kwargs.
-    for remove_keys in (
-        ("aggressive_split",),
-        ("aggressive_split", "auto_naming"),
-    ):
-        local_kwargs = dict(kwargs)
-        for key in remove_keys:
-            local_kwargs.pop(key, None)
-        try:
-            convert_path(**local_kwargs)
-            return True
-        except Exception:
-            continue
-    return False
+    if not sys.executable:
+        return False, "python runtime unavailable (sys.executable is empty)"
+    base_target = Path(deps_dir) if deps_dir is not None else (Path(converter).parent / ".warno_pydeps")
+    target_dir = _scoped_deps_dir(base_target)
+    py_cmd = [sys.executable]
+    ok, msg = _ensure_converter_python_deps(py_cmd, target_dir)
+    if ok:
+        return True, f"[{' '.join(py_cmd)}] {msg}"
+    return False, f"[{' '.join(py_cmd)}] {msg}"
 
 
 def run_tgv_converter(
     converter: Path,
     src_tgv: Path,
     dst_png: Path,
-    split_mode: str = "auto",
-    mirror: bool = False,
-    aggressive_split: bool = False,
-    auto_naming: bool = True,
     auto_install_deps: bool = True,
     deps_dir: Path | None = None,
-    allow_inprocess: bool = True,
     subprocess_timeout_sec: int = 120,
+    atlas_map_path: Path | None = None,
+    atlas_asset_path: str = "",
+    atlas_out_dir: Path | None = None,
+    only_logical_ref: str | None = None,
 ) -> None:
-    split = str(split_mode or "auto").strip().lower()
-    if split not in {"auto", "all", "none"}:
-        split = "auto"
+    atlas_mode = atlas_map_path is not None and str(atlas_asset_path or "").strip()
+    if not atlas_mode:
+        raise RuntimeError("converter_failed_other: legacy converter mode removed; atlas-map mode is required")
+    if converter.suffix.lower() != ".py":
+        raise RuntimeError("converter_failed_other: atlas-map mode requires python converter script")
+
     timeout_value: int | None
     try:
         timeout_value = int(subprocess_timeout_sec)
@@ -5266,130 +6097,140 @@ def run_tgv_converter(
     if timeout_value is not None and timeout_value <= 0:
         timeout_value = None
 
-    if allow_inprocess and run_tgv_converter_inprocess(
-        converter=converter,
-        src_tgv=src_tgv,
-        dst_png=dst_png,
-        split_mode=split,
-        mirror=mirror,
-        aggressive_split=aggressive_split,
-        auto_naming=auto_naming,
-    ):
+    if not sys.executable:
+        raise RuntimeError("converter_failed_other: Python runtime not available (sys.executable is empty)")
+    py_cmd: List[str] = [sys.executable]
+    who = " ".join(py_cmd)
+    base_deps_target = Path(deps_dir) if deps_dir is not None else (converter.parent / ".warno_pydeps")
+    deps_target = _scoped_deps_dir(base_deps_target)
+    runtime_env: Dict[str, str] | None = None
+
+    if auto_install_deps:
+        ok, dep_msg = _ensure_converter_python_deps(py_cmd, deps_target)
+        if not ok:
+            raise RuntimeError(
+                "converter_failed_missing_dep: "
+                f"Failed to prepare converter deps for {src_tgv.name}: [{who}] {dep_msg}"
+            )
+        runtime_env = _converter_env_with_deps(deps_target)
+
+    out_dir = Path(atlas_out_dir) if atlas_out_dir is not None else dst_png.parent
+    manifest_out = out_dir / "conversion_manifest.json"
+    cmd = [
+        *py_cmd,
+        str(converter),
+        "--atlas-map",
+        str(Path(atlas_map_path)),
+        "--asset-path",
+        str(atlas_asset_path),
+        "--out-dir",
+        str(out_dir),
+        "--manifest-out",
+        str(manifest_out),
+    ]
+    if only_logical_ref:
+        cmd.extend(["--only-logical-ref", str(only_logical_ref)])
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=runtime_env,
+            timeout=timeout_value,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"converter_timeout: TGV converter timed out after {timeout_value}s "
+            f"for {src_tgv.name}"
+        )
+
+    if proc.returncode == 0:
         return
 
-    errors: List[str] = []
-    dep_errors: List[str] = []
-    missing_dep_hits: set[str] = set()
-    deps_target = Path(deps_dir) if deps_dir is not None else (converter.parent / ".warno_pydeps")
-
-    if converter.suffix.lower() == ".py":
-        for py_cmd in _python_cmd_candidates():
-            who = " ".join(py_cmd)
-            retry_with_deps = False
-            runtime_env: Dict[str, str] | None = None
-            while True:
-                cmd = [*py_cmd, str(converter), str(src_tgv), str(dst_png), "--split", split]
-                if mirror:
-                    cmd.append("--mirror")
-                if aggressive_split:
-                    cmd.append("--aggressive-split")
-                if not auto_naming:
-                    cmd.append("--no-auto-naming")
-                try:
-                    proc = subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        env=runtime_env,
-                        timeout=timeout_value,
-                    )
-                except subprocess.TimeoutExpired:
-                    raise RuntimeError(
-                        f"converter_timeout: TGV converter timed out after {timeout_value}s "
-                        f"for {src_tgv.name}"
-                    )
-                if proc.returncode == 0:
-                    return
-
-                # Compatibility fallback for custom/older converters that don't support --split.
-                fallback_cmd = [*py_cmd, str(converter), str(src_tgv), str(dst_png)]
-                if mirror:
-                    fallback_cmd.append("--mirror")
-                try:
-                    proc2 = subprocess.run(
-                        fallback_cmd,
-                        capture_output=True,
-                        text=True,
-                        env=runtime_env,
-                        timeout=timeout_value,
-                    )
-                except subprocess.TimeoutExpired:
-                    raise RuntimeError(
-                        f"converter_timeout: TGV converter fallback timed out after {timeout_value}s "
-                        f"for {src_tgv.name}"
-                    )
-                if proc2.returncode == 0:
-                    return
-
-                msg = (proc2.stderr or proc2.stdout or proc.stderr or proc.stdout or "").strip()
-                missing = _is_missing_py_dependency_error(msg)
-                if missing:
-                    missing_dep_hits.update(missing)
-                if auto_install_deps and (not retry_with_deps) and missing:
-                    ok, dep_msg = _ensure_converter_python_deps(py_cmd, deps_target)
-                    if ok:
-                        runtime_env = _converter_env_with_deps(deps_target)
-                        retry_with_deps = True
-                        continue
-                    dep_errors.append(f"[{who}] {dep_msg}")
-                    errors.append(f"[{who}] dependency bootstrap failed: {dep_msg}")
-
-                errors.append(f"[{who}] {msg}")
-                break
-    else:
-        cmd = [str(converter), str(src_tgv), str(dst_png), "--split", split]
-        if mirror:
-            cmd.append("--mirror")
-        if aggressive_split:
-            cmd.append("--aggressive-split")
-        if not auto_naming:
-            cmd.append("--no-auto-naming")
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_value)
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(
-                f"converter_timeout: TGV converter timed out after {timeout_value}s "
-                f"for {src_tgv.name}"
-            )
-        if proc.returncode == 0:
-            return
-        fallback_cmd = [str(converter), str(src_tgv), str(dst_png)]
-        if mirror:
-            fallback_cmd.append("--mirror")
-        try:
-            proc2 = subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=timeout_value)
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(
-                f"converter_timeout: TGV converter fallback timed out after {timeout_value}s "
-                f"for {src_tgv.name}"
-            )
-        if proc2.returncode == 0:
-            return
-        msg = (proc2.stderr or proc2.stdout or proc.stderr or proc.stdout or "").strip()
-        errors.append(msg)
-
-    detail = "; ".join(errors[:3]).strip() or "unknown converter error"
-    if missing_dep_hits:
-        modules = ",".join(sorted(missing_dep_hits))
-        dep_tail = ""
-        if dep_errors:
-            dep_tail = f" | deps: {'; '.join(dep_errors[:2])}"
+    msg = (proc.stderr or proc.stdout or "").strip()
+    missing = _is_missing_py_dependency_error(msg)
+    if missing:
+        modules = ",".join(sorted(missing))
         raise RuntimeError(
             "converter_failed_missing_dep: "
-            f"TGV converter failed for {src_tgv.name} (missing {modules}): {detail}{dep_tail}. "
-            "Run 'Install/Check TGV deps' or install Pillow/zstandard for Blender Python."
+            f"TGV converter failed for {src_tgv.name} (missing {modules}): [{who}] {msg}. "
+            "Install Pillow/zstandard for Blender Python runtime."
         )
-    raise RuntimeError(f"converter_failed_other: TGV converter failed for {src_tgv.name}: {detail}")
+    raise RuntimeError(f"converter_failed_other: TGV converter failed for {src_tgv.name}: [{who}] {msg}")
+
+
+def _atlas_map_lookup_entries(
+    atlas_map_index: Dict[str, List[Dict[str, Any]]] | None,
+    ref: str,
+) -> List[Dict[str, Any]]:
+    if not isinstance(atlas_map_index, dict):
+        return []
+    ref_norm = _normalize_logical_ref(ref)
+    if not ref_norm:
+        return []
+    out = atlas_map_index.get(ref_norm, [])
+    return [item for item in out if isinstance(item, dict)]
+
+
+def _resolve_source_from_atlas_entry(
+    entry: Dict[str, Any],
+    atlas_assets_root: Path,
+    extra_roots: Sequence[Path],
+    zz_resolver: ZZDatResolver | None,
+    zz_runtime_root: Path | None,
+) -> Tuple[Path, Path, str]:
+    source_rel_norm = _normalize_logical_ref(str(entry.get("source_tgv_rel", "")))
+    if not source_rel_norm:
+        raise FileNotFoundError("missing_source: atlas map entry has empty source_tgv_rel")
+
+    rel_under_assets = source_rel_norm
+    if rel_under_assets.startswith("assets/"):
+        rel_under_assets = rel_under_assets[len("assets/") :]
+    rel_path = Path(*PurePosixPath(rel_under_assets).parts)
+
+    src_png = atlas_assets_root / rel_path.with_suffix(".png")
+    src_tgv = atlas_assets_root / rel_path.with_suffix(".tgv")
+    atlas_source = "manual_path"
+
+    if not src_tgv.exists() and not src_png.exists():
+        for alt_root in extra_roots:
+            alt_png = alt_root / rel_path.with_suffix(".png")
+            alt_tgv = alt_root / rel_path.with_suffix(".tgv")
+            if alt_tgv.exists() or alt_png.exists():
+                src_tgv = alt_tgv
+                src_png = alt_png
+                atlas_source = "fallback"
+                break
+
+    if not src_tgv.exists() and not src_png.exists() and zz_resolver is not None:
+        runtime_root = Path(zz_runtime_root) if zz_runtime_root is not None else None
+        if runtime_root is None:
+            runtime_root = atlas_assets_root
+            for _ in range(3):
+                runtime_root = runtime_root.parent
+        candidates = [
+            normalize_asset_path(f"PC/Atlas/Assets/{rel_path.with_suffix('.tgv').as_posix()}"),
+            normalize_asset_path(f"PC/Atlas/Assets/{rel_path.with_suffix('.png').as_posix()}"),
+            normalize_asset_path(f"Assets/{rel_path.with_suffix('.tgv').as_posix()}"),
+            normalize_asset_path(f"Assets/{rel_path.with_suffix('.png').as_posix()}"),
+        ]
+        for cand in candidates:
+            try:
+                extracted = zz_resolver.extract_asset_to_runtime(cand, runtime_root, exact_only=True)
+            except Exception:
+                extracted = None
+            if extracted is None:
+                continue
+            if extracted.suffix.lower() == ".tgv":
+                src_tgv = extracted
+                src_png = extracted.with_suffix(".png")
+            else:
+                src_png = extracted
+                src_tgv = extracted.with_suffix(".tgv")
+            atlas_source = "zz_runtime"
+            break
+    return src_tgv, src_png, atlas_source
 
 
 def resolve_texture_from_atlas_ref(
@@ -5398,23 +6239,24 @@ def resolve_texture_from_atlas_ref(
     out_model_dir: Path,
     converter: Path,
     texture_subdir: str,
-    tgv_split_mode: str = "auto",
-    tgv_mirror: bool = False,
-    tgv_aggressive_split: bool = False,
     zz_resolver: ZZDatResolver | None = None,
     zz_runtime_root: Path | None = None,
     fallback_atlas_roots: Sequence[Path] | None = None,
     auto_install_deps: bool = True,
     deps_dir: Path | None = None,
-    allow_group_convert: bool = False,
-    allow_inprocess: bool = True,
     subprocess_timeout_sec: int = 120,
+    atlas_map_path: Path | None = None,
+    atlas_map_index: Dict[str, List[Dict[str, Any]]] | None = None,
+    asset_path: str = "",
+    atlas_json_strict: bool = True,
 ) -> Dict[str, Any]:
     rel = atlas_ref_to_rel_under_assets(ref)
     role_hint = classify_texture_role(ref)
     src_png = atlas_assets_root / rel
     src_tgv = src_png.with_suffix(".tgv")
     atlas_source = "manual_path"
+    atlas_mode = ""
+    atlas_entry: Dict[str, Any] | None = None
 
     extra_roots: List[Path] = []
     for root in fallback_atlas_roots or []:
@@ -5425,115 +6267,101 @@ def resolve_texture_from_atlas_ref(
         if p.exists() and p.is_dir():
             extra_roots.append(p)
 
-    # Try exact path in additional atlas roots (e.g. WARNO/Output/PC/Atlas/Assets)
-    # before broad basename fallback.
-    if not src_tgv.exists() and not src_png.exists():
-        for alt_root in extra_roots:
-            alt_png = alt_root / rel
-            alt_tgv = alt_png.with_suffix(".tgv")
-            if alt_tgv.exists() or alt_png.exists():
-                src_tgv = alt_tgv
-                src_png = alt_png
-                atlas_source = "fallback"
-                break
+    if isinstance(atlas_map_index, dict) and atlas_map_index:
+        atlas_mode = "json_export"
+        matched = _atlas_map_lookup_entries(atlas_map_index, ref)
+        if matched:
+            if len(matched) == 1:
+                atlas_entry = matched[0]
+            else:
+                role_hint = classify_texture_role(ref)
+                ranked = sorted(
+                    matched,
+                    key=lambda item: (
+                        0
+                        if _canonical_channel(str(item.get("target_channel", ""))) == role_hint
+                        else 1,
+                        str(item.get("target_logical_rel", "")).lower(),
+                        str(item.get("source_tgv_rel", "")).lower(),
+                    ),
+                )
+                atlas_entry = ranked[0]
+        if atlas_entry is None and bool(atlas_json_strict):
+            raise FileNotFoundError(
+                f"missing_source: atlas_json_strict no mapping for ref {ref}"
+            )
 
-    if not src_tgv.exists() and not src_png.exists():
-        # Optional runtime fallback: extract missing atlas asset directly from ZZ.dat packages.
-        if zz_resolver is not None:
-            runtime_root = Path(zz_runtime_root) if zz_runtime_root is not None else None
-            if runtime_root is None:
-                runtime_root = atlas_assets_root
-                for _ in range(3):
-                    runtime_root = runtime_root.parent
-            rel_tgv = rel.with_suffix(".tgv")
-            rel_png = rel.with_suffix(".png")
-            candidates = [
-                normalize_asset_path(f"PC/Atlas/Assets/{rel_tgv.as_posix()}"),
-                normalize_asset_path(f"PC/Atlas/Assets/{rel_png.as_posix()}"),
-                normalize_asset_path(f"Assets/{rel_tgv.as_posix()}"),
-                normalize_asset_path(f"Assets/{rel_png.as_posix()}"),
-            ]
-            for cand in candidates:
-                try:
-                    extracted = zz_resolver.extract_asset_to_runtime(cand, runtime_root, exact_only=True)
-                except Exception:
-                    extracted = None
-                if extracted is None:
-                    continue
-                if extracted.suffix.lower() == ".tgv":
-                    src_tgv = extracted
-                    src_png = extracted.with_suffix(".png")
-                else:
-                    src_png = extracted
-                    src_tgv = extracted.with_suffix(".tgv")
-                atlas_source = "zz_runtime"
-                break
-
-    # Strict resolve policy: do not broad-scan by basename across atlas roots.
-    # If exact ref cannot be resolved from runtime/atlas roots, return missing_source.
-
-    out_png = out_model_dir / texture_subdir / rel
+    if atlas_entry is not None:
+        out_rel = _atlas_target_output_rel(
+            target_logical_rel=str(atlas_entry.get("target_logical_rel", "")),
+            target_basename=str(atlas_entry.get("target_basename", "")),
+        )
+        out_png = out_model_dir / texture_subdir / out_rel
+    else:
+        out_png = out_model_dir / texture_subdir / rel
     out_png.parent.mkdir(parents=True, exist_ok=True)
 
     source_type = ""
-    effective_split_mode = str(tgv_split_mode or "auto").strip().lower()
-    # Even when user chooses "none", ORM must still be unpacked to R/M/AO channel maps.
-    if role_hint == "orm" and effective_split_mode == "none":
-        effective_split_mode = "auto"
+    if atlas_entry is None and bool(atlas_json_strict):
+        raise FileNotFoundError(f"missing_source: atlas_json_strict no mapping for ref {ref}")
+
+    # Deterministic cache hit: if target texture already exists, reuse it and skip converter.
+    try:
+        if out_png.exists() and out_png.is_file() and out_png.stat().st_size > 0:
+            extras = find_generated_extra_maps(
+                out_png,
+                strict_atlas=bool(atlas_entry is not None and atlas_json_strict),
+            )
+            return {
+                "atlas_ref": ref,
+                "role": classify_texture_role(ref),
+                "atlas_source": atlas_source,
+                "source_type": "cached_png",
+                "source_tgv": str(src_tgv) if src_tgv.exists() else None,
+                "source_png": str(src_png) if src_png.exists() else None,
+                "out_png": out_png,
+                "extras": extras,
+                "deps_auto_installed": False,
+                "atlas_mode": atlas_mode,
+                "atlas_target_logical_rel": str(atlas_entry.get("target_logical_rel", "")).strip() if atlas_entry else "",
+                "atlas_target_basename": str(atlas_entry.get("target_basename", "")).strip() if atlas_entry else "",
+                "atlas_target_channel": _canonical_channel(str(atlas_entry.get("target_channel", ""))) if atlas_entry else "",
+                "cache_hit": True,
+            }
+    except OSError:
+        pass
+
+    if atlas_entry is not None:
+        src_tgv, src_png, atlas_source = _resolve_source_from_atlas_entry(
+            atlas_entry,
+            atlas_assets_root=atlas_assets_root,
+            extra_roots=extra_roots,
+            zz_resolver=zz_resolver,
+            zz_runtime_root=Path(zz_runtime_root) if zz_runtime_root is not None else None,
+        )
+
     if src_tgv.exists():
         deps_before = get_tgv_deps_auto_install_count()
-        split_mode_norm = effective_split_mode
-        group_error: str | None = None
-        force_auto_for_orm = role_hint == "orm" and str(tgv_split_mode or "auto").strip().lower() == "none"
-        # Do not run folder-wide conversion when ORM is force-switched from none->auto:
-        # we only need single-file ORM channel outputs and must avoid touching unrelated textures.
-        run_group_auto = bool(allow_group_convert) and split_mode_norm == "auto" and not force_auto_for_orm
-        if run_group_auto:
-            try:
-                run_tgv_converter_for_folder_once(
-                    converter=converter,
-                    src_dir=src_tgv.parent,
-                    dst_dir=out_png.parent,
-                    split_mode=split_mode_norm,
-                    mirror=tgv_mirror,
-                    aggressive_split=tgv_aggressive_split,
-                    auto_naming=False,
-                    auto_install_deps=auto_install_deps,
-                    deps_dir=deps_dir,
-                    allow_inprocess=allow_inprocess,
-                    subprocess_timeout_sec=subprocess_timeout_sec,
-                )
-                if out_png.exists():
-                    source_type = "tgv_group"
-            except Exception as exc:
-                group_error = str(exc)
-
         try:
-            if not source_type:
-                run_tgv_converter(
-                    converter,
-                    src_tgv,
-                    out_png,
-                    split_mode=effective_split_mode,
-                    mirror=tgv_mirror,
-                    aggressive_split=tgv_aggressive_split,
-                    auto_naming=True,
-                    auto_install_deps=auto_install_deps,
-                    deps_dir=deps_dir,
-                    allow_inprocess=allow_inprocess,
-                    subprocess_timeout_sec=subprocess_timeout_sec,
-                )
-                source_type = "tgv"
+            run_tgv_converter(
+                converter,
+                src_tgv,
+                out_png,
+                auto_install_deps=auto_install_deps,
+                deps_dir=deps_dir,
+                subprocess_timeout_sec=subprocess_timeout_sec,
+                atlas_map_path=Path(atlas_map_path) if atlas_map_path is not None else None,
+                atlas_asset_path=str(asset_path or ""),
+                atlas_out_dir=out_png.parent,
+                only_logical_ref=(
+                    str(atlas_entry.get("target_logical_rel", "")).strip()
+                    if atlas_entry is not None
+                    else None
+                ),
+            )
+            source_type = "tgv"
         except Exception:
-            if src_png.exists():
-                shutil.copy2(src_png, out_png)
-                source_type = "png_fallback"
-            else:
-                if group_error:
-                    if str(group_error).startswith("converter_failed_"):
-                        raise RuntimeError(str(group_error))
-                    raise RuntimeError(f"converter_failed_other: {group_error}")
-                raise
+            raise
         deps_auto_installed = get_tgv_deps_auto_install_count() > deps_before
     elif src_png.exists():
         shutil.copy2(src_png, out_png)
@@ -5544,7 +6372,10 @@ def resolve_texture_from_atlas_ref(
             f"missing_source: Missing source texture for ref {ref}: expected {src_tgv} or {src_png}"
         )
 
-    extras = find_generated_extra_maps(out_png)
+    extras = find_generated_extra_maps(
+        out_png,
+        strict_atlas=bool(atlas_entry is not None and atlas_json_strict),
+    )
     return {
         "atlas_ref": ref,
         "role": classify_texture_role(ref),
@@ -5555,6 +6386,11 @@ def resolve_texture_from_atlas_ref(
         "out_png": out_png,
         "extras": extras,
         "deps_auto_installed": bool(deps_auto_installed),
+        "atlas_mode": atlas_mode,
+        "atlas_target_logical_rel": str(atlas_entry.get("target_logical_rel", "")).strip() if atlas_entry else "",
+        "atlas_target_basename": str(atlas_entry.get("target_basename", "")).strip() if atlas_entry else "",
+        "atlas_target_channel": _canonical_channel(str(atlas_entry.get("target_channel", ""))) if atlas_entry else "",
+        "cache_hit": False,
     }
 
 
