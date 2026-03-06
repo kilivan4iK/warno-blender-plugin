@@ -1293,16 +1293,31 @@ def _top_level_child_bone_index(
         cur = parent
 
 
-_WHEEL_BONE_NAME_RX = re.compile(r"^roue_(elev_)?([dg])([0-9]+)$", re.IGNORECASE)
+_WHEEL_BONE_NAME_SHORT_RX = re.compile(r"^roue_(elev_)?([dg])([0-9]+)$", re.IGNORECASE)
+_WHEEL_BONE_NAME_WORD_RX = re.compile(
+    r"^roue_(elev_)?(droite|gauche)_?([0-9]+)$",
+    re.IGNORECASE,
+)
+_WHEEL_BONE_NAME_UNSIDED_RX = re.compile(r"^roue_([0-9]+)$", re.IGNORECASE)
 
 
 def _parse_wheel_bone_name(name: str) -> Tuple[str, str, int] | None:
     low = str(name or "").strip().lower()
     if not low:
         return None
-    m = _WHEEL_BONE_NAME_RX.match(low)
+    m = _WHEEL_BONE_NAME_SHORT_RX.match(low)
     if not m:
-        return None
+        m = _WHEEL_BONE_NAME_WORD_RX.match(low)
+        if not m:
+            m = _WHEEL_BONE_NAME_UNSIDED_RX.match(low)
+            if not m:
+                return None
+            return "wheel", "U", int(m.group(1))
+        kind = "elev" if m.group(1) else "wheel"
+        side_word = str(m.group(2)).lower()
+        side = "D" if side_word.startswith("droi") else "G"
+        num = int(m.group(3))
+        return kind, side, num
     kind = "elev" if m.group(1) else "wheel"
     side = str(m.group(2)).upper()
     num = int(m.group(3))
@@ -1316,7 +1331,11 @@ def _track_side_from_bone_name(name: str) -> str:
     parsed_wheel = _parse_wheel_bone_name(low)
     if parsed_wheel is not None:
         _, side, _ = parsed_wheel
-        return "left" if side == "G" else "right"
+        if side == "G":
+            return "left"
+        if side == "D":
+            return "right"
+        return ""
     if "chenille_gauche" in low or "track_left" in low or "left_track" in low:
         return "left"
     if "chenille_droite" in low or "track_right" in low or "right_track" in low:
@@ -1342,6 +1361,8 @@ def classify_group_from_bone_name(name: str) -> str:
     wheel = _parse_wheel_bone_name(low)
     if wheel is not None:
         _kind, side, num = wheel
+        if side == "U":
+            return f"Roue_{num:02d}"
         return f"Roue_{side}{num}"
 
     if "chenille_gauche" in low or "track_left" in low or "left_track" in low:

@@ -3759,6 +3759,7 @@ def _collect_mesh_buckets(
     material_role_by_id: Dict[int, str],
     bone_name_by_index: Dict[int, str],
     bone_parent_by_index: Dict[int, int],
+    bone_positions: Dict[str, List[float]],
     split_main_parts: bool,
 ) -> list[dict[str, Any]]:
     buckets: Dict[str, dict[str, Any]] = {}
@@ -3774,6 +3775,189 @@ def _collect_mesh_buckets(
             default_root_bone_index = min(root_candidates)
         else:
             default_root_bone_index = min(int(i) for i in bone_name_by_index.keys())
+
+    def _parse_wheel_group_label(raw_name: str) -> Tuple[str, str] | None:
+        low = _norm_low(raw_name)
+        if not low:
+            return None
+        m = re.match(r"^roue_(elev_)?([dg])([0-9]+)$", low, flags=re.IGNORECASE)
+        if m:
+            kind = "elev" if m.group(1) else "wheel"
+            side = str(m.group(2)).upper()
+            num = int(m.group(3))
+            return (f"Roue_{side}{num}", kind)
+        m = re.match(r"^roue_(elev_)?(droite|gauche)_?([0-9]+)$", low, flags=re.IGNORECASE)
+        if m:
+            kind = "elev" if m.group(1) else "wheel"
+            side = "D" if str(m.group(2)).lower().startswith("droi") else "G"
+            num = int(m.group(3))
+            return (f"Roue_{side}{num}", kind)
+        m = re.match(r"^roue_([0-9]+)$", low, flags=re.IGNORECASE)
+        if m:
+            num = int(m.group(1))
+            return (f"Roue_{num:02d}", "wheel")
+        return None
+
+    def _position_for_bone_name(raw_name: str) -> Vector | None:
+        low = _norm_low(raw_name)
+        if not low:
+            return None
+        keys = [low]
+        tok = _norm_token(low)
+        if tok:
+            keys.append(tok)
+        for key in keys:
+            hit = bone_positions.get(key)
+            if isinstance(hit, (list, tuple)) and len(hit) >= 3:
+                try:
+                    return Vector((float(hit[0]), float(hit[1]), float(hit[2])))
+                except Exception:
+                    continue
+        return None
+
+    wheel_anchor_by_group: Dict[str, Dict[str, Any]] = {}
+    for bidx, raw_name in bone_name_by_index.items():
+        parsed = _parse_wheel_group_label(str(raw_name or ""))
+        if parsed is None:
+            continue
+        group_name, kind = parsed
+        pos = _position_for_bone_name(str(raw_name or ""))
+        if pos is None:
+            continue
+        score = 2 if kind == "wheel" else 1
+        cur = wheel_anchor_by_group.get(group_name)
+        if cur is None or int(cur.get("_score", 0)) < score:
+            wheel_anchor_by_group[group_name] = {
+                "bone_index": int(bidx),
+                "position": pos,
+                "_score": score,
+            }
+
+    def _split_chassis_tris_by_wheel_anchors(
+        tris: Sequence[Tuple[int, int, int]],
+        rotated_vertices: Sequence[Tuple[float, float, float]],
+    ) -> Tuple[List[Tuple[int, int, int]], Dict[str, List[Tuple[int, int, int]]]] | None:
+        if len(wheel_anchor_by_group) < 2:
+            return None
+        tri_list = [tuple(map(int, t)) for t in tris if len(t) == 3]
+        if len(tri_list) < 12:
+            return None
+        vcount = len(rotated_vertices)
+        if vcount <= 0:
+            return None
+
+        vert_to_tris: Dict[int, List[int]] = defaultdict(list)
+        for ti, tri in enumerate(tri_list):
+            a, b, c = tri
+            if min(a, b, c) < 0 or max(a, b, c) >= vcount:
+                continue
+            vert_to_tris[a].append(ti)
+            vert_to_tris[b].append(ti)
+            vert_to_tris[c].append(ti)
+
+        visited: set[int] = set()
+        components: List[List[int]] = []
+        for start in range(len(tri_list)):
+            if start in visited:
+                continue
+            queue = [start]
+            visited.add(start)
+            comp: List[int] = []
+            while queue:
+                cur = queue.pop()
+                comp.append(cur)
+                a, b, c = tri_list[cur]
+                for v in (a, b, c):
+                    for nei in vert_to_tris.get(v, []):
+                        if nei in visited:
+                            continue
+                        visited.add(nei)
+                        queue.append(nei)
+            if comp:
+                components.append(comp)
+
+        if len(components) <= 1:
+            return None
+
+        anchors = [
+            (str(gname), Vector(payload["position"]))
+            for gname, payload in wheel_anchor_by_group.items()
+            if isinstance(payload.get("position"), Vector)
+        ]
+        if len(anchors) < 2:
+            return None
+
+        min_anchor_gap = None
+        for i in range(len(anchors)):
+            for j in range(i + 1, len(anchors)):
+                d = (anchors[i][1] - anchors[j][1]).length
+                if d <= 1e-6:
+                    continue
+                if min_anchor_gap is None or d < min_anchor_gap:
+                    min_anchor_gap = d
+        if min_anchor_gap is None:
+            min_anchor_gap = 1.0
+        max_assign_dist = max(0.28, float(min_anchor_gap) * 0.48)
+
+        assignments: Dict[str, List[Tuple[int, int, int]]] = defaultdict(list)
+        keep_chassis: List[Tuple[int, int, int]] = []
+        total_triangles = len(tri_list)
+        max_component_triangles = max(120, int(total_triangles * 0.35))
+
+        for comp in components:
+            comp_tris = [tri_list[i] for i in comp]
+            if not comp_tris:
+                continue
+
+            verts: set[int] = set()
+            for a, b, c in comp_tris:
+                if min(a, b, c) < 0 or max(a, b, c) >= vcount:
+                    continue
+                verts.update((a, b, c))
+            if not verts:
+                keep_chassis.extend(comp_tris)
+                continue
+
+            xs = [float(rotated_vertices[v][0]) for v in verts]
+            ys = [float(rotated_vertices[v][1]) for v in verts]
+            zs = [float(rotated_vertices[v][2]) for v in verts]
+            dx = max(xs) - min(xs)
+            dy = max(ys) - min(ys)
+            dz = max(zs) - min(zs)
+            dims = sorted([dx, dy, dz], reverse=True)
+            centroid = Vector((
+                sum(xs) / len(xs),
+                sum(ys) / len(ys),
+                sum(zs) / len(zs),
+            ))
+
+            # Conservative deterministic gate: keep only compact wheel-like components.
+            wheel_like = True
+            if len(comp_tris) > max_component_triangles:
+                wheel_like = False
+            if dims[0] < 0.12 or dims[1] < 0.12:
+                wheel_like = False
+            if dims[1] > 1e-6 and (dims[0] / dims[1]) > 2.5:
+                wheel_like = False
+            if dims[2] > dims[0] * 0.92:
+                wheel_like = False
+
+            nearest_group = ""
+            nearest_dist = float("inf")
+            for gname, gpos in anchors:
+                dist = (centroid - gpos).length
+                if dist < nearest_dist:
+                    nearest_dist = dist
+                    nearest_group = gname
+
+            if wheel_like and nearest_group and nearest_dist <= max_assign_dist:
+                assignments[nearest_group].extend(comp_tris)
+            else:
+                keep_chassis.extend(comp_tris)
+
+        if not assignments:
+            return None
+        return keep_chassis, dict(assignments)
 
     for part_i, part in enumerate(model.get("parts", [])):
         indices = part.get("indices", [])
@@ -3835,6 +4019,44 @@ def _collect_mesh_buckets(
                     "group_bone_index": int(default_root_bone_index),
                     "tris": _all_tris(indices),
                 }]
+
+            # Deterministic wheel fallback for wheeled vehicles where wheel faces have no bone weights
+            # and were merged into chassis/mainbody by split step.
+            if wheel_anchor_by_group:
+                has_wheel_group = any(
+                    _norm_low(str(g.get("group_name_raw", "") or g.get("group_name_sanitized", ""))).startswith("roue_")
+                    for g in group_payloads
+                )
+                if not has_wheel_group:
+                    patched_groups: List[Dict[str, Any]] = []
+                    for g in group_payloads:
+                        gname_low = _norm_low(str(g.get("group_name_raw", "") or g.get("group_name_sanitized", "")))
+                        gtris = g.get("tris", [])
+                        if gname_low in {"chassis", "mainbody"} or gname_low.startswith("part_"):
+                            split_result = _split_chassis_tris_by_wheel_anchors(gtris, rotated)
+                            if split_result is not None:
+                                chassis_tris, wheel_tris_by_group = split_result
+                                if chassis_tris:
+                                    g2 = dict(g)
+                                    g2["tris"] = list(chassis_tris)
+                                    patched_groups.append(g2)
+                                for wheel_group_name in sorted(wheel_tris_by_group.keys()):
+                                    tris_list = wheel_tris_by_group.get(wheel_group_name, [])
+                                    if not tris_list:
+                                        continue
+                                    anchor = wheel_anchor_by_group.get(wheel_group_name, {})
+                                    patched_groups.append(
+                                        {
+                                            "group_name_raw": wheel_group_name,
+                                            "group_name_sanitized": wheel_group_name,
+                                            "group_bone_index": int(anchor.get("bone_index", -1)),
+                                            "tris": list(tris_list),
+                                        }
+                                    )
+                                continue
+                        patched_groups.append(g)
+                    if patched_groups:
+                        group_payloads = patched_groups
         else:
             group_payloads = [{
                 "group_name_raw": "MainBody",
@@ -4333,6 +4555,15 @@ def _build_helper_armature(
             side = str(m.group(2)).upper()
             num = int(m.group(3))
             return f"{prefix}_{side}{num}"
+        m = re.match(r"^roue_(elev_)?(droite|gauche)_?([0-9]+)$", low, flags=re.IGNORECASE)
+        if m:
+            prefix = "Roue_Elev" if m.group(1) else "Roue"
+            side = "D" if str(m.group(2)).lower().startswith("droi") else "G"
+            num = int(m.group(3))
+            return f"{prefix}_{side}{num}"
+        m = re.match(r"^roue_([0-9]+)$", low, flags=re.IGNORECASE)
+        if m:
+            return f"Roue_{int(m.group(1)):02d}"
         m = re.match(r"^armature_([dg])([0-9]+)$", low, flags=re.IGNORECASE)
         if m:
             side = str(m.group(1)).upper()
@@ -6017,6 +6248,7 @@ class WARNO_OT_ImportAsset(Operator):
                     material_role_by_id=material_role_by_id,
                     bone_name_by_index=bone_payload.get("bone_name_by_index", {}),
                     bone_parent_by_index=bone_payload.get("bone_parent_by_index", {}),
+                    bone_positions=bone_payload.get("bone_positions", {}) or {},
                     split_main_parts=bool(settings.auto_split_main_parts),
                 )
                 wheel_groups = 0
