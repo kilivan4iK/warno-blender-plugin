@@ -77,8 +77,13 @@ def _load_extractor_module(script_root: Path):
     if spec is None or spec.loader is None:
         return None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+        return module
+    except Exception:
+        sys.modules.pop(spec.name, None)
+        raise
 
 
 def _atlas_rel_candidates_for_asset(asset_path: str) -> List[str]:
@@ -264,6 +269,15 @@ def _run_cli(cmd: List[str], timeout_sec: int) -> tuple[int, str, str, float, bo
         return 124, out, err, elapsed, True
 
 
+def _build_dotnet_fallback_cmd(cli_exe: Path) -> List[str] | None:
+    exe = Path(cli_exe)
+    dll = exe.with_suffix(".dll")
+    runtimeconfig = dll.with_suffix(".runtimeconfig.json")
+    if dll.exists() and dll.is_file() and runtimeconfig.exists() and runtimeconfig.is_file():
+        return ["dotnet", str(dll)]
+    return None
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Export WARNO Atlas crop/name map via headless Atlas CLI")
     ap.add_argument("--warno-root", required=True)
@@ -303,8 +317,7 @@ def main() -> int:
         )
         return 3
 
-    cmd = [
-        str(cli_exe),
+    base_args = [
         "--warno-root",
         str(warno_root),
         "--asset-path",
@@ -314,6 +327,11 @@ def main() -> int:
         "--cache-dir",
         str(lookup_cache_dir),
         "--include-sibling-assets",
+    ]
+
+    cmd = [
+        str(cli_exe),
+        *base_args,
     ]
     if bool(args.verbose):
         cmd.append("--verbose")
@@ -340,6 +358,30 @@ def main() -> int:
         print(f"[atlas-wrapper] stdout_tail: {out_tail}", file=sys.stderr)
     if err_tail:
         print(f"[atlas-wrapper] stderr_tail: {err_tail}", file=sys.stderr)
+
+    # Some environments crash when launching apphost EXE directly (e.g. CLR assert),
+    # but succeed through dotnet + DLL host. Retry once before failing strict flow.
+    if not timed_out and rc not in {0, 2}:
+        dotnet_exec = _build_dotnet_fallback_cmd(cli_exe)
+        if dotnet_exec is not None:
+            retry_cmd = [*dotnet_exec, *base_args]
+            if bool(args.verbose):
+                retry_cmd.append("--verbose")
+            quoted_retry = " ".join(shlex.quote(x) for x in retry_cmd)
+            print(f"[atlas-wrapper] retry_cmd: {quoted_retry}", file=sys.stderr)
+            rc2, out2, err2, elapsed2, timed_out2 = _run_cli(
+                retry_cmd,
+                timeout_sec=max(5, int(args.timeout_sec or 45)),
+            )
+            print(f"[atlas-wrapper] retry_elapsed: {elapsed2:.2f}s", file=sys.stderr)
+            print(f"[atlas-wrapper] retry_exit_code: {rc2}", file=sys.stderr)
+            out2_tail = _tail_text(out2)
+            err2_tail = _tail_text(err2)
+            if out2_tail:
+                print(f"[atlas-wrapper] retry_stdout_tail: {out2_tail}", file=sys.stderr)
+            if err2_tail:
+                print(f"[atlas-wrapper] retry_stderr_tail: {err2_tail}", file=sys.stderr)
+            rc, out, err, timed_out = rc2, out2, err2, timed_out2
 
     if timed_out:
         print(f"atlas_cli_timeout: exceeded {int(args.timeout_sec or 45)}s", file=sys.stderr)

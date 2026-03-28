@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack
+from dataclasses import dataclass, field
 import json
 import math
 import mmap
@@ -27,6 +28,237 @@ import zstandard
 
 
 Entry = Tuple[str, Dict[str, Any]]
+WARNO_DEV_SCALE = 20.0 / 43.0
+WARNO_OFF_MAT_SCALE = WARNO_DEV_SCALE / 100.0
+
+
+@dataclass
+class RawNodeTransform:
+    source: str
+    block_index: int
+    translation: List[float]
+    rotation_basis: List[List[float]]
+    scale: List[float]
+    matrix_local: List[List[float]]
+    world_translation: List[float] | None = None
+
+
+@dataclass
+class RawNodeRecord:
+    index: int
+    raw_name: str
+    safe_name: str
+    parent_index: int
+    off_mat_points: List[List[float]] = field(default_factory=list)
+    off_mat_blocks: List[List[float]] = field(default_factory=list)
+    own_transform_candidates: List[RawNodeTransform] = field(default_factory=list)
+    stream_transform_candidates: List[RawNodeTransform] = field(default_factory=list)
+    local_transform: RawNodeTransform | None = None
+    world_translation: List[float] | None = None
+    deterministic_miss: str = ""
+
+
+@dataclass
+class RawSceneGraph:
+    node_index: int
+    node_count: int
+    stream_start_index: int
+    stream_end_index: int
+    records: List[RawNodeRecord]
+
+
+def _norm_low(value: str) -> str:
+    return str(value or "").strip().lower()
+
+
+def _safe_name_text(name: str) -> str:
+    raw = SAFE_MATERIAL_RX.sub("_", str(name or "").strip())
+    raw = re.sub(r"_+", "_", raw).strip("_")
+    return raw or str(name or "").strip()
+
+
+def _mat4_mul(a: Sequence[Sequence[float]], b: Sequence[Sequence[float]]) -> List[List[float]]:
+    out = [[0.0, 0.0, 0.0, 0.0] for _ in range(4)]
+    for row in range(4):
+        for col in range(4):
+            out[row][col] = sum(float(a[row][k]) * float(b[k][col]) for k in range(4))
+    return out
+
+
+def _mat4_translation(mat: Sequence[Sequence[float]]) -> List[float]:
+    return [
+        float(mat[0][3]),
+        float(mat[1][3]),
+        float(mat[2][3]),
+    ]
+
+
+def _vec_len3(values: Sequence[float]) -> float:
+    return math.sqrt(sum(float(v) * float(v) for v in values[:3]))
+
+
+def _decompose_affine_matrix_rows(local_matrix: Sequence[Sequence[float]]) -> Tuple[List[float], List[List[float]], List[float]] | None:
+    if not isinstance(local_matrix, (list, tuple)) or len(local_matrix) < 4:
+        return None
+    basis_cols = [
+        [float(local_matrix[0][0]), float(local_matrix[1][0]), float(local_matrix[2][0])],
+        [float(local_matrix[0][1]), float(local_matrix[1][1]), float(local_matrix[2][1])],
+        [float(local_matrix[0][2]), float(local_matrix[1][2]), float(local_matrix[2][2])],
+    ]
+    scale = [_vec_len3(col) for col in basis_cols]
+    rotation_cols: List[List[float]] = []
+    for axis_i, col in enumerate(basis_cols):
+        axis_scale = float(scale[axis_i])
+        if axis_scale > 1.0e-9:
+            rotation_cols.append([float(v) / axis_scale for v in col])
+        else:
+            unit = [0.0, 0.0, 0.0]
+            unit[axis_i] = 1.0
+            rotation_cols.append(unit)
+    rotation_rows = [
+        [rotation_cols[0][0], rotation_cols[1][0], rotation_cols[2][0]],
+        [rotation_cols[0][1], rotation_cols[1][1], rotation_cols[2][1]],
+        [rotation_cols[0][2], rotation_cols[1][2], rotation_cols[2][2]],
+    ]
+    translation = _mat4_translation(local_matrix)
+    return translation, rotation_rows, scale
+
+
+def _compose_affine_matrix_rows(
+    translation: Sequence[float],
+    rotation_basis: Sequence[Sequence[float]],
+    scale: Sequence[float],
+) -> List[List[float]]:
+    rows = [[0.0, 0.0, 0.0, 0.0] for _ in range(4)]
+    for row in range(3):
+        rows[row][3] = float(translation[row]) if row < len(translation) else 0.0
+        for col in range(3):
+            basis = 0.0
+            try:
+                basis = float(rotation_basis[row][col])
+            except Exception:
+                basis = 1.0 if row == col else 0.0
+            scl = float(scale[col]) if col < len(scale) else 1.0
+            rows[row][col] = basis * scl
+    rows[3][3] = 1.0
+    return rows
+
+
+def _off_mat_change_of_basis_rows(variant_name: str) -> List[List[float]] | None:
+    variant_low = _norm_low(variant_name)
+    legacy = {
+        "current": ("xyz", (-1.0, 1.0, -1.0)),
+        "identity": ("xyz", (1.0, 1.0, 1.0)),
+        "flip_xy": ("xyz", (-1.0, -1.0, 1.0)),
+        "flip_xz": ("xyz", (-1.0, 1.0, 1.0)),
+    }
+    perm = ""
+    signs: Tuple[float, float, float] | None = None
+    if variant_low in legacy:
+        perm, signs = legacy[variant_low]
+    else:
+        match = re.fullmatch(r"([xyz]{3}):([+-]1)([+-]1)([+-]1)", variant_low)
+        if match:
+            perm = str(match.group(1))
+            signs = (
+                -1.0 if match.group(2).startswith("-") else 1.0,
+                -1.0 if match.group(3).startswith("-") else 1.0,
+                -1.0 if match.group(4).startswith("-") else 1.0,
+            )
+    if not perm or signs is None:
+        return None
+    axis_index = {"x": 0, "y": 1, "z": 2}
+    rows = [[0.0, 0.0, 0.0, 0.0] for _ in range(4)]
+    for out_axis_i, (out_axis, sign) in enumerate(zip(perm, signs)):
+        rows[out_axis_i][axis_index[out_axis]] = float(sign) * float(WARNO_OFF_MAT_SCALE)
+    rows[3][3] = 1.0
+    return rows
+
+
+def _mat4_inverse_affine(mat: Sequence[Sequence[float]]) -> List[List[float]] | None:
+    try:
+        r = [
+            [float(mat[0][0]), float(mat[0][1]), float(mat[0][2])],
+            [float(mat[1][0]), float(mat[1][1]), float(mat[1][2])],
+            [float(mat[2][0]), float(mat[2][1]), float(mat[2][2])],
+        ]
+        t = [float(mat[0][3]), float(mat[1][3]), float(mat[2][3])]
+    except Exception:
+        return None
+    det = (
+        r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1])
+        - r[0][1] * (r[1][0] * r[2][2] - r[1][2] * r[2][0])
+        + r[0][2] * (r[1][0] * r[2][1] - r[1][1] * r[2][0])
+    )
+    if abs(det) <= 1.0e-12:
+        return None
+    inv_det = 1.0 / det
+    rinv = [
+        [
+            (r[1][1] * r[2][2] - r[1][2] * r[2][1]) * inv_det,
+            (r[0][2] * r[2][1] - r[0][1] * r[2][2]) * inv_det,
+            (r[0][1] * r[1][2] - r[0][2] * r[1][1]) * inv_det,
+        ],
+        [
+            (r[1][2] * r[2][0] - r[1][0] * r[2][2]) * inv_det,
+            (r[0][0] * r[2][2] - r[0][2] * r[2][0]) * inv_det,
+            (r[0][2] * r[1][0] - r[0][0] * r[1][2]) * inv_det,
+        ],
+        [
+            (r[1][0] * r[2][1] - r[1][1] * r[2][0]) * inv_det,
+            (r[0][1] * r[2][0] - r[0][0] * r[2][1]) * inv_det,
+            (r[0][0] * r[1][1] - r[0][1] * r[1][0]) * inv_det,
+        ],
+    ]
+    tinv = [
+        -(rinv[0][0] * t[0] + rinv[0][1] * t[1] + rinv[0][2] * t[2]),
+        -(rinv[1][0] * t[0] + rinv[1][1] * t[1] + rinv[1][2] * t[2]),
+        -(rinv[2][0] * t[0] + rinv[2][1] * t[1] + rinv[2][2] * t[2]),
+    ]
+    out = [
+        [rinv[0][0], rinv[0][1], rinv[0][2], tinv[0]],
+        [rinv[1][0], rinv[1][1], rinv[1][2], tinv[1]],
+        [rinv[2][0], rinv[2][1], rinv[2][2], tinv[2]],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+    return out
+
+
+def _off_mat_stream_section_bounds(node_count: int) -> Tuple[int, int]:
+    if int(node_count) <= 0:
+        return 0, 0
+    stream_count = int(math.ceil(float(node_count) / 3.0))
+    start = stream_count
+    end = min(int(node_count), start + stream_count)
+    return max(0, int(start)), max(0, int(end))
+
+
+def _off_mat_stream_target_index(source_idx: int, block_idx: int, node_count: int) -> int:
+    if int(node_count) <= 0:
+        return -1
+    return int((int(source_idx) * 3 + int(block_idx)) % int(node_count))
+
+
+def _off_mat_block_matrix_rows(block: Sequence[float]) -> List[List[float]] | None:
+    if not isinstance(block, (list, tuple)) or len(block) < 12:
+        return None
+    vals = [float(v) for v in block[:12]]
+    return [
+        [vals[0], vals[1], vals[2], vals[3]],
+        [vals[4], vals[5], vals[6], vals[7]],
+        [vals[8], vals[9], vals[10], vals[11]],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
+def _off_mat_convert_matrix_rows(raw_matrix: Sequence[Sequence[float]], variant_name: str) -> List[List[float]] | None:
+    change = _off_mat_change_of_basis_rows(variant_name)
+    if change is None:
+        return None
+    change_inv = _mat4_inverse_affine(change)
+    if change_inv is None:
+        return None
+    return _mat4_mul(_mat4_mul(change, raw_matrix), change_inv)
 
 LAYOUT_196 = [
     ("vertexFormats", 3),
@@ -81,6 +313,9 @@ NDF_COATING_RX = re.compile(r"""CoatingName\s*=\s*['"]([^'"]+)['"]""", re.IGNORE
 NDF_OPERATOR_UNIT_RX = re.compile(r"""^\s*DepictionOperator_([A-Za-z0-9_]+)_Weapon[0-9]+\s+is\b""", re.IGNORECASE)
 NDF_STRING_RX = re.compile(r"""["']([^"']+)["']""")
 TRACK_TOKEN_RX = re.compile(r"(?i)(?:^|_)(trk|track|chenille)(?:_|$)")
+DEPICTION_OPERATOR_NAME_RX = re.compile(r"(DepictionOperator_[A-Za-z0-9_]+)", re.IGNORECASE)
+DEPICTION_OPERATOR_ASSIGN_RX = re.compile(r"""^\s*(?:template\s+)?(DepictionOperator_[A-Za-z0-9_]+)\b""", re.IGNORECASE)
+DEPICTION_NODE_ASSIGN_RX = re.compile(r"""([A-Za-z0-9_]+)\s*=\s*['"]([^'"]+)['"]""")
 PNG_SIG = b"\x89PNG\r\n\x1a\n"
 
 
@@ -387,6 +622,7 @@ class UnitNdfHintsResolver:
         self._asset_bbox_bones: Dict[str, set[str]] = {}
         self._coating_anchors: Dict[str, set[str]] = {}
         self._operator_anchors: Dict[str, set[str]] = {}
+        self._depiction_units: Dict[str, Dict[str, Any]] = {}
 
     @property
     def is_ready(self) -> bool:
@@ -641,6 +877,107 @@ class UnitNdfHintsResolver:
 
         return coating_anchors, operator_anchors
 
+    def _parse_depictions_structured(self, depictions_file: Path) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        if not depictions_file.exists() or not depictions_file.is_file():
+            return out
+
+        pending_registration = False
+        in_registration = False
+        reg_depth = 0
+        current_key = ""
+        current_anchors: set[str] = set()
+        current_nonfx_anchors: set[str] = set()
+        current_operators: List[str] = []
+
+        def flush_registration() -> None:
+            nonlocal current_key, current_anchors, current_nonfx_anchors, current_operators
+            key = str(current_key or "").strip().lower()
+            if not key:
+                current_anchors = set()
+                current_nonfx_anchors = set()
+                current_operators = []
+                return
+            ops_unique = unique_keep_order(
+                [str(x).strip() for x in current_operators if str(x).strip()]
+            )
+            track_kind = ""
+            joined_ops = " ".join(ops_unique).lower()
+            if "propulsion_continuoustrack" in joined_ops:
+                track_kind = "continuous_track"
+            elif "propulsion_wheels" in joined_ops:
+                track_kind = "wheels"
+            elif "propulsion_" in joined_ops:
+                track_kind = "other"
+            out[key] = {
+                "matched_unit": key,
+                "operators": ops_unique,
+                "weapon_fx_anchors": unique_keep_order(
+                    sorted(a for a in current_anchors if a.startswith("fx_"))
+                ),
+                "subdepictions": (
+                    [{"anchors": unique_keep_order(sorted(current_nonfx_anchors)), "operators": []}]
+                    if current_nonfx_anchors
+                    else []
+                ),
+                "track_kind": track_kind,
+            }
+            current_key = ""
+            current_anchors = set()
+            current_nonfx_anchors = set()
+            current_operators = []
+
+        with depictions_file.open("r", encoding="utf-8", errors="ignore") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+
+                low = line.lower()
+                if not in_registration and low.startswith("unnamed tacticvehicledepictionregistration"):
+                    pending_registration = True
+                    current_key = ""
+                    current_anchors = set()
+                    current_nonfx_anchors = set()
+                    current_operators = []
+                    continue
+
+                if pending_registration and "(" in line:
+                    pending_registration = False
+                    in_registration = True
+                    reg_depth = raw.count("(") - raw.count(")")
+                    continue
+
+                if not in_registration:
+                    continue
+
+                m_key = re.search(r"""BlackHoleKey\s*=\s*['"]([^'"]+)['"]""", line, re.IGNORECASE)
+                if m_key:
+                    current_key = str(m_key.group(1)).strip().lower()
+
+                if "anchor" in low:
+                    for anchor in _ndf_extract_quoted_values(line):
+                        clean = str(anchor).strip().lower()
+                        if not clean:
+                            continue
+                        current_anchors.add(clean)
+                        if not clean.startswith("fx_"):
+                            current_nonfx_anchors.add(clean)
+
+                current_operators.extend(re.findall(r"DepictionOperator_[A-Za-z0-9_]+", line))
+
+                reg_depth += raw.count("(") - raw.count(")")
+                if reg_depth <= 0:
+                    flush_registration()
+                    in_registration = False
+                    pending_registration = False
+                    reg_depth = 0
+
+        if in_registration:
+            flush_registration()
+
+        return out
+
     def _load(self) -> None:
         if self._loaded:
             return
@@ -653,10 +990,21 @@ class UnitNdfHintsResolver:
 
         unite_ndf: Path | None = None
         game_root: Path | None = None
+        depictions_override: Path | None = None
+        game_data_root: Path | None = None
 
         if src.is_file() and src.name.lower() == "unitedescriptor.ndf":
             unite_ndf = src
             game_root = self._guess_game_root()
+            game_data_root = self._find_parent_named(src, "GameData")
+        elif src.is_file() and src.name.lower() == "depictionvehicles.ndf":
+            depictions_override = src
+            game_root = self._guess_game_root()
+            game_data_root = self._find_parent_named(src, "GameData")
+            if game_data_root is not None:
+                candidate = game_data_root / "Generated" / "Gameplay" / "Gfx" / "UniteDescriptor.ndf"
+                if candidate.exists() and candidate.is_file():
+                    unite_ndf = candidate
         elif src.is_dir():
             unite_ndf = self._discover_unite_descriptor(src)
             game_root = src
@@ -679,7 +1027,8 @@ class UnitNdfHintsResolver:
 
         self._source_files.append(str(unite_ndf))
         refmesh_bbox = self._parse_unite_descriptor(unite_ndf)
-        game_data_root = self._find_parent_named(unite_ndf, "GameData")
+        if game_data_root is None:
+            game_data_root = self._find_parent_named(unite_ndf, "GameData")
         if game_data_root is None:
             self._load_error = f"Cannot infer GameData root from: {unite_ndf}"
             return
@@ -694,11 +1043,14 @@ class UnitNdfHintsResolver:
             for asset in assets:
                 self._asset_bbox_bones.setdefault(asset, set()).update(bbox_bones)
 
-        depictions_file = game_data_root / "Generated" / "Gameplay" / "Gfx" / "Depictions" / "DepictionVehicles.ndf"
+        depictions_file = depictions_override or (
+            game_data_root / "Generated" / "Gameplay" / "Gfx" / "Depictions" / "DepictionVehicles.ndf"
+        )
         if depictions_file.exists() and depictions_file.is_file():
             coat, ops = self._parse_depictions_anchors(depictions_file)
             self._coating_anchors = coat
             self._operator_anchors = ops
+            self._depiction_units = self._parse_depictions_structured(depictions_file)
             self._source_files.append(str(depictions_file))
 
     def hints_for_asset(self, asset_path: str) -> Dict[str, Any]:
@@ -731,12 +1083,57 @@ class UnitNdfHintsResolver:
                 bbox_bones.update(bones)
 
         hint_anchors: set[str] = set()
+        matched_units: List[str] = []
+        matched_operators: List[str] = []
+        matched_weapon_fx: List[str] = []
+        matched_subdepictions: List[Dict[str, Any]] = []
+        track_kind = ""
+
+        for key, payload in self._depiction_units.items():
+            if asset_stem and asset_stem not in key:
+                continue
+            if country and not (key.endswith(f"_{country}") or f"_{country}_" in key):
+                continue
+            matched_units.append(key)
+            matched_operators.extend(
+                [str(x).strip() for x in payload.get("operators", []) or [] if str(x).strip()]
+            )
+            matched_weapon_fx.extend(
+                [str(x).strip().lower() for x in payload.get("weapon_fx_anchors", []) or [] if str(x).strip()]
+            )
+            for row in payload.get("subdepictions", []) or []:
+                if not isinstance(row, dict):
+                    continue
+                anchors = [
+                    str(x).strip().lower()
+                    for x in row.get("anchors", []) or []
+                    if str(x).strip()
+                ]
+                operators = [
+                    str(x).strip()
+                    for x in row.get("operators", []) or []
+                    if str(x).strip()
+                ]
+                if anchors or operators:
+                    matched_subdepictions.append(
+                        {
+                            "anchors": unique_keep_order(anchors),
+                            "operators": unique_keep_order(operators),
+                            "weapon_fx_anchors": [],
+                        }
+                    )
+            if not track_kind:
+                track_kind = str(payload.get("track_kind", "") or "").strip().lower()
+
         for key, anchors in self._operator_anchors.items():
             if asset_stem and asset_stem not in key:
                 continue
             if country and not (key.endswith(f"_{country}") or f"_{country}_" in key):
                 continue
             hint_anchors.update(anchors)
+            matched_weapon_fx.extend(
+                [str(x).strip().lower() for x in anchors if str(x).strip().lower().startswith("fx_")]
+            )
         for key, anchors in self._coating_anchors.items():
             if asset_stem and asset_stem not in key:
                 continue
@@ -744,12 +1141,516 @@ class UnitNdfHintsResolver:
                 continue
             hint_anchors.update(anchors)
 
-        out_bones = unique_keep_order([*sorted(bbox_bones), *sorted(hint_anchors)])
+        out_bones = unique_keep_order(
+            [
+                *sorted(bbox_bones),
+                *sorted(hint_anchors),
+                *unique_keep_order(matched_weapon_fx),
+                *[
+                    anchor
+                    for row in matched_subdepictions
+                    for anchor in row.get("anchors", []) or []
+                ],
+            ]
+        )
         return {
             "bones": out_bones,
             "source": "ndf_mirror",
             "error": "",
+            "matched_units": unique_keep_order([x.lower() for x in matched_units if str(x).strip()]),
+            "operators": unique_keep_order(matched_operators),
+            "weapon_fx_anchors": unique_keep_order(matched_weapon_fx),
+            "subdepictions": [
+                row
+                for row in unique_keep_order(
+                    [
+                        json.dumps(row, sort_keys=True, ensure_ascii=False)
+                        for row in matched_subdepictions
+                    ]
+                )
+                for row in [json.loads(row)]
+            ],
+            "track_kind": track_kind,
+            "reference_meshes": [],
         }
+
+
+class DepictionOperatorsResolver:
+    def __init__(self, source_path: Path):
+        self.source_path = Path(source_path)
+        self._loaded = False
+        self._load_error = ""
+        self._contracts: Dict[str, Dict[str, Any]] = {}
+
+    @property
+    def load_error(self) -> str:
+        return self._load_error
+
+    def _flush_contract(
+        self,
+        name: str,
+        type_name: str,
+        operator_id: str,
+        node_fields: Dict[str, str],
+    ) -> None:
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            return
+        nodes = unique_keep_order(
+            [
+                str(value).strip().lower()
+                for value in node_fields.values()
+                if str(value).strip()
+            ]
+        )
+        self._contracts[clean_name] = {
+            "name": clean_name,
+            "type": str(type_name or "").strip(),
+            "operator_id": str(operator_id or "").strip(),
+            "node_fields": dict(node_fields),
+            "nodes": nodes,
+        }
+
+    @staticmethod
+    def _looks_like_node_field(key: str) -> bool:
+        low = str(key or "").strip().lower()
+        if not low:
+            return False
+        if "physicalproperty" in low:
+            return False
+        return ("node" in low) or ("bone" in low)
+
+    @staticmethod
+    def _extract_operator_name(raw: str) -> str:
+        m = DEPICTION_OPERATOR_NAME_RX.search(str(raw or ""))
+        return str(m.group(1)).strip() if m else ""
+
+    def _load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+
+        src = self.source_path
+        if not src.exists() or not src.is_file():
+            self._load_error = f"DepictionOperators source not found: {src}"
+            return
+
+        pending_name = ""
+        in_decl = False
+        decl_depth = 0
+        saw_open_paren = False
+        current_name = ""
+        current_type = ""
+        current_operator_id = ""
+        current_node_fields: Dict[str, str] = {}
+
+        def flush() -> None:
+            nonlocal current_name, current_type, current_operator_id, current_node_fields, saw_open_paren
+            self._flush_contract(current_name, current_type, current_operator_id, current_node_fields)
+            current_name = ""
+            current_type = ""
+            current_operator_id = ""
+            current_node_fields = {}
+            saw_open_paren = False
+
+        try:
+            lines = src.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception as exc:
+            self._load_error = f"Failed to read DepictionOperators: {exc}"
+            return
+
+        for raw in lines:
+            line = str(raw or "").strip()
+            if not line or line.startswith("//"):
+                continue
+
+            if not in_decl:
+                m_assign = DEPICTION_OPERATOR_ASSIGN_RX.match(line)
+                if m_assign:
+                    pending_name = str(m_assign.group(1)).strip()
+
+                if pending_name and " is " in line:
+                    current_name = pending_name
+                    pending_name = ""
+                    tail = line.split(" is ", 1)[1].strip()
+                    current_type = tail.split("(", 1)[0].strip()
+                    current_operator_id = ""
+                    current_node_fields = {}
+                    in_decl = True
+                    decl_depth = 0
+                    saw_open_paren = False
+                elif pending_name and line.lower().startswith("is "):
+                    current_name = pending_name
+                    pending_name = ""
+                    tail = line[3:].strip()
+                    current_type = tail.split("(", 1)[0].strip()
+                    current_operator_id = ""
+                    current_node_fields = {}
+                    in_decl = True
+                    decl_depth = 0
+                    saw_open_paren = False
+                else:
+                    continue
+
+            for key, value in DEPICTION_NODE_ASSIGN_RX.findall(raw):
+                clean_key = str(key or "").strip()
+                clean_val = str(value or "").strip()
+                if not clean_key or not clean_val:
+                    continue
+                if clean_key.lower() == "operatorid":
+                    current_operator_id = clean_val
+                    continue
+                if self._looks_like_node_field(clean_key):
+                    current_node_fields[clean_key] = clean_val.lower()
+
+            open_count = raw.count("(")
+            close_count = raw.count(")")
+            if open_count > 0:
+                saw_open_paren = True
+            decl_depth += open_count - close_count
+            if saw_open_paren and decl_depth <= 0:
+                flush()
+                in_decl = False
+                decl_depth = 0
+
+        if in_decl:
+            flush()
+
+    def contract_for_name(self, operator_name: str) -> Dict[str, Any] | None:
+        self._load()
+        if self._load_error:
+            return None
+        clean = self._extract_operator_name(operator_name)
+        if not clean:
+            return None
+        return self._contracts.get(clean)
+
+
+class GfxManifestResolver:
+    def __init__(
+        self,
+        *,
+        warno_root: Path,
+        modding_suite_root: Path,
+        cache_dir: Path,
+        wrapper_path: Path,
+        gfx_cli_path: Path | None = None,
+        timeout_sec: int = 180,
+        use_gfx_json_manifest: bool = True,
+        legacy_ndf_source: Path | None = None,
+        legacy_operators_source: Path | None = None,
+        enable_operator_semantics: bool = True,
+    ):
+        self.warno_root = Path(warno_root)
+        self.modding_suite_root = Path(modding_suite_root)
+        self.cache_dir = Path(cache_dir)
+        self.wrapper_path = Path(wrapper_path)
+        self.gfx_cli_path = Path(gfx_cli_path) if gfx_cli_path is not None and str(gfx_cli_path).strip() else None
+        self.timeout_sec = max(5, int(timeout_sec))
+        self.use_gfx_json_manifest = bool(use_gfx_json_manifest)
+        self.legacy_ndf_source = Path(legacy_ndf_source) if legacy_ndf_source is not None and str(legacy_ndf_source).strip() else None
+        self.legacy_operators_source = Path(legacy_operators_source) if legacy_operators_source is not None and str(legacy_operators_source).strip() else None
+        self.enable_operator_semantics = bool(enable_operator_semantics)
+        self._legacy_resolver: UnitNdfHintsResolver | None = None
+        self._operator_resolver: DepictionOperatorsResolver | None = None
+
+    @staticmethod
+    def _empty_manifest(asset_norm: str, source: str, error: str, source_files: Sequence[str] | None = None) -> Dict[str, Any]:
+        return {
+            "schema_version": 2,
+            "asset_path": asset_norm,
+            "source_files": list(source_files or []),
+            "matched_units": [],
+            "reference_meshes": [],
+            "operators": [],
+            "turrets": [],
+            "weapon_fx_anchors": [],
+            "subdepictions": [],
+            "required_nodes": [],
+            "fx_nodes": [],
+            "operator_contracts": [],
+            "subdepiction_nodes": [],
+            "role_map": {},
+            "track_kind": "",
+            "source": source,
+            "error": str(error or "").strip(),
+            "semantic_bones": [],
+            "semantic_nodes": [],
+            "transform_debug": [],
+        }
+
+    def _resolve_operator_source(self) -> Path | None:
+        candidates: List[Path] = []
+        if self.legacy_operators_source is not None:
+            candidates.append(self.legacy_operators_source)
+        if self.legacy_ndf_source is not None:
+            game_data_root = UnitNdfHintsResolver._find_parent_named(self.legacy_ndf_source, "GameData")
+            if game_data_root is not None:
+                candidates.append(game_data_root / "Gameplay" / "Gfx" / "Units" / "DepictionOperators.ndf")
+        warno_root = Path(self.warno_root)
+        candidates.extend(
+            [
+                warno_root / "Mods" / "ModData" / "base" / "GameData" / "Gameplay" / "Gfx" / "Units" / "DepictionOperators.ndf",
+                warno_root / "ModData" / "base" / "GameData" / "Gameplay" / "Gfx" / "Units" / "DepictionOperators.ndf",
+                warno_root / "base" / "GameData" / "Gameplay" / "Gfx" / "Units" / "DepictionOperators.ndf",
+                warno_root / "GameData" / "Gameplay" / "Gfx" / "Units" / "DepictionOperators.ndf",
+            ]
+        )
+        for candidate in candidates:
+            try:
+                if candidate.exists() and candidate.is_file():
+                    return candidate
+            except Exception:
+                continue
+        return None
+
+    def _operator_resolver_or_none(self) -> DepictionOperatorsResolver | None:
+        if self._operator_resolver is not None:
+            return self._operator_resolver
+        source = self._resolve_operator_source()
+        if source is None:
+            return None
+        self._operator_resolver = DepictionOperatorsResolver(source)
+        return self._operator_resolver
+
+    @staticmethod
+    def _role_from_contract_field(contract: Dict[str, Any], field_name: str) -> str:
+        low = str(field_name or "").strip().lower()
+        type_low = str(contract.get("type", "") or "").strip().lower()
+        operator_id = str(contract.get("operator_id", "") or "").strip().lower()
+        if "zaxisnode" in low:
+            return "turret_yaw_node"
+        if "yaxisnode" in low:
+            return "turret_pitch_node"
+        if "recoil" in type_low and "node" in low:
+            return "turret_recoil_node"
+        if operator_id in {"tracks", "wheels"} and "node" in low:
+            return "movement_propulsion_node"
+        return ""
+
+    @staticmethod
+    def _append_role(
+        role_map: Dict[str, List[Dict[str, Any]]],
+        node_name: str,
+        *,
+        role: str,
+        source: str,
+        contract: Dict[str, Any] | None = None,
+        field_name: str = "",
+    ) -> None:
+        clean = str(node_name or "").strip().lower()
+        role_clean = str(role or "").strip().lower()
+        if not clean or not role_clean:
+            return
+        entry = {
+            "role": role_clean,
+            "source": str(source or "").strip().lower(),
+            "contract_name": str((contract or {}).get("name", "") or "").strip(),
+            "contract_type": str((contract or {}).get("type", "") or "").strip(),
+            "operator_id": str((contract or {}).get("operator_id", "") or "").strip().lower(),
+            "field_name": str(field_name or "").strip(),
+        }
+        rows = role_map.setdefault(clean, [])
+        key = json.dumps(entry, ensure_ascii=False, sort_keys=True)
+        seen = {
+            json.dumps(dict(row), ensure_ascii=False, sort_keys=True)
+            for row in rows
+            if isinstance(row, dict)
+        }
+        if key not in seen:
+            rows.append(entry)
+
+    def _enrich_manifest_semantics(self, manifest: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(manifest or {})
+        resolver = self._operator_resolver_or_none() if bool(self.enable_operator_semantics) else None
+        operator_contracts: List[Dict[str, Any]] = []
+        required_nodes: List[str] = []
+        role_map: Dict[str, List[Dict[str, Any]]] = {}
+        fx_nodes = unique_keep_order(
+            [
+                str(x).strip().lower()
+                for x in (out.get("weapon_fx_anchors", []) or [])
+                if str(x).strip()
+            ]
+        )
+        subdepiction_nodes: List[str] = []
+
+        def add_required(name: str) -> None:
+            clean = str(name or "").strip().lower()
+            if clean and clean not in required_nodes:
+                required_nodes.append(clean)
+
+        def add_subdepiction(name: str) -> None:
+            clean = str(name or "").strip().lower()
+            if clean and clean not in subdepiction_nodes:
+                subdepiction_nodes.append(clean)
+
+        operator_names: List[str] = [
+            str(x).strip()
+            for x in (out.get("operators", []) or [])
+            if str(x).strip()
+        ]
+        for row in out.get("subdepictions", []) or []:
+            if not isinstance(row, dict):
+                continue
+            for anchor in row.get("anchors", []) or []:
+                add_subdepiction(anchor)
+                self._append_role(role_map, anchor, role="subdepiction_anchor", source="subdepiction")
+            for anchor in row.get("weapon_fx_anchors", []) or []:
+                clean = str(anchor).strip().lower()
+                if clean and clean not in fx_nodes:
+                    fx_nodes.append(clean)
+            operator_names.extend(
+                [str(x).strip() for x in row.get("operators", []) or [] if str(x).strip()]
+            )
+
+        if resolver is not None:
+            seen_contracts: set[str] = set()
+            for operator_name in unique_keep_order(operator_names):
+                contract = resolver.contract_for_name(operator_name)
+                if not contract:
+                    continue
+                contract_name = str(contract.get("name", "")).strip()
+                if not contract_name or contract_name.lower() in seen_contracts:
+                    continue
+                seen_contracts.add(contract_name.lower())
+                operator_contracts.append(contract)
+                for node_name in contract.get("nodes", []) or []:
+                    add_required(node_name)
+                node_fields = contract.get("node_fields", {}) or {}
+                if isinstance(node_fields, dict):
+                    for field_name, node_name in node_fields.items():
+                        role = self._role_from_contract_field(contract, str(field_name or ""))
+                        if role:
+                            self._append_role(
+                                role_map,
+                                str(node_name or "").strip().lower(),
+                                role=role,
+                                source="operator",
+                                contract=contract,
+                                field_name=str(field_name or ""),
+                            )
+                if not out.get("track_kind"):
+                    operator_id = str(contract.get("operator_id", "") or "").strip().lower()
+                    if operator_id == "tracks":
+                        out["track_kind"] = "continuous_track"
+                    elif operator_id == "wheels":
+                        out["track_kind"] = "wheels"
+            source_path = getattr(resolver, "source_path", None)
+            if source_path is not None:
+                source_text = str(source_path)
+                src_files = [str(x) for x in (out.get("source_files", []) or []) if str(x).strip()]
+                if source_text not in src_files:
+                    src_files.append(source_text)
+                    out["source_files"] = src_files
+
+        for fx_name in fx_nodes:
+            self._append_role(role_map, fx_name, role="weapon_fx_anchor", source="depiction")
+
+        out["required_nodes"] = unique_keep_order(required_nodes)
+        out["fx_nodes"] = unique_keep_order(fx_nodes)
+        out["operator_contracts"] = list(operator_contracts)
+        out["subdepiction_nodes"] = unique_keep_order(subdepiction_nodes)
+        out["role_map"] = dict(role_map)
+        semantic_bones = unique_keep_order(required_nodes + fx_nodes + subdepiction_nodes)
+        manifest_semantic_nodes = [
+            row
+            for row in (out.get("semantic_nodes", []) or [])
+            if isinstance(row, dict)
+        ]
+        for row in manifest_semantic_nodes:
+            name = str(row.get("name", "") or "").strip().lower()
+            if name and name not in semantic_bones:
+                semantic_bones.append(name)
+        out["semantic_bones"] = semantic_bones
+        out["semantic_nodes"] = manifest_semantic_nodes
+        out["transform_debug"] = [
+            row
+            for row in (out.get("transform_debug", []) or [])
+            if isinstance(row, dict)
+        ]
+        return out
+
+    def _legacy_manifest(self, asset_norm: str) -> Dict[str, Any]:
+        if self.legacy_ndf_source is None:
+            return self._empty_manifest(asset_norm, "none", "")
+
+        if self._legacy_resolver is None:
+            self._legacy_resolver = UnitNdfHintsResolver(self.legacy_ndf_source)
+
+        hint_payload = self._legacy_resolver.hints_for_asset(asset_norm)
+        bones = [
+            str(x).strip().lower()
+            for x in hint_payload.get("bones", []) or []
+            if str(x).strip()
+        ]
+        manifest = self._empty_manifest(
+            asset_norm,
+            "legacy_ndf_mirror",
+            str(hint_payload.get("error", "") or ""),
+            self._legacy_resolver.source_files,
+        )
+        manifest["matched_units"] = [
+            str(x).strip()
+            for x in hint_payload.get("matched_units", []) or []
+            if str(x).strip()
+        ]
+        manifest["reference_meshes"] = [
+            str(x).strip()
+            for x in hint_payload.get("reference_meshes", []) or []
+            if str(x).strip()
+        ]
+        manifest["operators"] = [
+            str(x).strip()
+            for x in hint_payload.get("operators", []) or []
+            if str(x).strip()
+        ]
+        manifest["weapon_fx_anchors"] = [
+            str(x).strip().lower()
+            for x in hint_payload.get("weapon_fx_anchors", []) or []
+            if str(x).strip()
+        ]
+        manifest["subdepictions"] = [
+            row
+            for row in hint_payload.get("subdepictions", []) or []
+            if isinstance(row, dict)
+        ]
+        manifest["track_kind"] = str(hint_payload.get("track_kind", "") or "").strip().lower()
+        manifest["semantic_bones"] = unique_keep_order(bones)
+        return self._enrich_manifest_semantics(manifest)
+
+    def manifest_for_asset(self, asset_path: str, force_rebuild: bool = False) -> Dict[str, Any]:
+        asset_norm = normalize_asset_path(asset_path)
+        errors: List[str] = []
+
+        if self.use_gfx_json_manifest:
+            try:
+                info = build_or_load_gfx_manifest(
+                    warno_root=self.warno_root,
+                    modding_suite_root=self.modding_suite_root,
+                    asset_path=asset_norm,
+                    cache_dir=self.cache_dir,
+                    wrapper_path=self.wrapper_path,
+                    gfx_cli_path=self.gfx_cli_path,
+                    force_rebuild=force_rebuild,
+                    timeout_sec=self.timeout_sec,
+                )
+                manifest = dict(info.get("gfx_manifest", {}) or {})
+                manifest["source"] = "gfx_manifest"
+                manifest["error"] = ""
+                return self._enrich_manifest_semantics(manifest)
+            except Exception as exc:
+                errors.append(str(exc))
+
+        legacy = self._legacy_manifest(asset_norm)
+        if legacy.get("source") == "legacy_ndf_mirror":
+            legacy_error = str(legacy.get("error", "") or "")
+            if errors and not legacy_error:
+                legacy["error"] = " | ".join(errors)
+            return legacy
+
+        error = " | ".join(x for x in errors if x)
+        return self._empty_manifest(asset_norm, "none", error)
 
 
 def atlas_ref_to_rel_under_assets(ref: str) -> Path:
@@ -1301,8 +2202,17 @@ _WHEEL_BONE_NAME_WORD_RX = re.compile(
 _WHEEL_BONE_NAME_UNSIDED_RX = re.compile(r"^roue_([0-9]+)$", re.IGNORECASE)
 
 
-def _parse_wheel_bone_name(name: str) -> Tuple[str, str, int] | None:
+def _normalize_bone_name_for_tokens(name: str) -> str:
     low = str(name or "").strip().lower()
+    if not low:
+        return ""
+    # Accept multiple separators from different game/build variants:
+    # roue_droite_01, roue.droite.01, roue-droite-01.
+    return re.sub(r"[^a-z0-9]+", "_", low).strip("_")
+
+
+def _parse_wheel_bone_name(name: str) -> Tuple[str, str, int] | None:
+    low = _normalize_bone_name_for_tokens(name)
     if not low:
         return None
     m = _WHEEL_BONE_NAME_SHORT_RX.match(low)
@@ -1325,7 +2235,7 @@ def _parse_wheel_bone_name(name: str) -> Tuple[str, str, int] | None:
 
 
 def _track_side_from_bone_name(name: str) -> str:
-    low = str(name or "").strip().lower()
+    low = _normalize_bone_name_for_tokens(name)
     if not low:
         return ""
     parsed_wheel = _parse_wheel_bone_name(low)
@@ -1347,8 +2257,81 @@ def _track_side_from_bone_name(name: str) -> str:
     return ""
 
 
+def _format_preserved_tokens(raw_low: str) -> str:
+    parts = [tok for tok in str(raw_low or "").split("_") if tok]
+    if not parts:
+        return "Chassis"
+    out: List[str] = []
+    for token in parts:
+        tok_low = str(token).lower()
+        if token.isdigit():
+            out.append(token)
+            continue
+        m_suffix = re.fullmatch(r"([a-z]+)([0-9]+)", token, flags=re.IGNORECASE)
+        if m_suffix:
+            stem = str(m_suffix.group(1) or "")
+            digits = str(m_suffix.group(2) or "")
+            if len(stem) <= 2 and stem.isalpha():
+                out.append(f"{stem.upper()}{digits}")
+            else:
+                out.append(f"{stem[:1].upper()}{stem[1:]}{digits}")
+            continue
+        if tok_low in {"launcher", "pod"}:
+            out.append(tok_low)
+            continue
+        if len(token) <= 2 and token.isalpha():
+            out.append(token.upper())
+            continue
+        out.append(token[:1].upper() + token[1:])
+    return "_".join(out)
+
+
+def _raw_geometry_helper_like_name(name: str) -> bool:
+    low = _normalize_bone_name_for_tokens(name)
+    if not low:
+        return True
+    if low.startswith(("bone_", "fx_", "empty", "cylinder.", "bip01")):
+        return True
+    if low in {
+        "armature",
+        "papyrus",
+        "fake",
+        "pilot",
+        "chassis",
+        "hull",
+        "base",
+        "chassisfake",
+        "chassisarmaturefake",
+    }:
+        return True
+    if low.startswith("armature_"):
+        return True
+    return False
+
+
+def _preserved_raw_geometry_group_name(
+    raw_name: str,
+    triangle_count: int,
+    total_triangles: int,
+    classified_group: str,
+) -> str:
+    low = _normalize_bone_name_for_tokens(raw_name)
+    if not low or str(classified_group or "") != "Chassis":
+        return ""
+    if _raw_geometry_helper_like_name(low):
+        return ""
+    force_validate = low in {"kokon_launcher", "pods_internes"}
+    min_tris = max(48, int(max(1, total_triangles) * 0.012))
+    min_tokens = 1 if force_validate else 2
+    if int(triangle_count) < min_tris:
+        return ""
+    if len([tok for tok in low.split("_") if tok]) < min_tokens:
+        return ""
+    return _format_preserved_tokens(low)
+
+
 def classify_group_from_bone_name(name: str) -> str:
-    low = str(name or "").strip().lower()
+    low = _normalize_bone_name_for_tokens(name)
     if not low:
         return "Chassis"
 
@@ -1364,11 +2347,49 @@ def classify_group_from_bone_name(name: str) -> str:
         if side == "U":
             return f"Roue_{num:02d}"
         return f"Roue_{side}{num}"
+    if low in {"roue_droite", "roue_gauche"}:
+        return "Roue_Droite" if low.endswith("droite") else "Roue_Gauche"
 
     if "chenille_gauche" in low or "track_left" in low or "left_track" in low:
         return "Chenille_Gauche"
     if "chenille_droite" in low or "track_right" in low or "right_track" in low:
         return "Chenille_Droite"
+
+    if re.fullmatch(r"bloc_moteur(?:_[0-9]+)?", low, flags=re.IGNORECASE):
+        parts = [tok for tok in low.split("_") if tok]
+        if parts and parts[-1].isdigit():
+            return f"Bloc_Moteur_{int(parts[-1])}"
+        return "Bloc_Moteur"
+    if re.fullmatch(r"hatch(?:_[0-9]+)?", low, flags=re.IGNORECASE):
+        parts = [tok for tok in low.split("_") if tok]
+        if parts and parts[-1].isdigit():
+            return f"Hatch_{int(parts[-1]):02d}"
+        return "Hatch_01"
+    if re.fullmatch(r"trappe_(?:avant|droite|gauche)", low, flags=re.IGNORECASE):
+        tokens = [tok.capitalize() for tok in low.split("_") if tok]
+        return "_".join(tokens)
+    if low == "window":
+        return "Window"
+    if re.fullmatch(r"helice_ls_[0-9]+", low, flags=re.IGNORECASE):
+        return _format_preserved_tokens(low)
+    if re.fullmatch(r"roue_avant[0-9]*", low, flags=re.IGNORECASE):
+        return _format_preserved_tokens(low)
+    if low == "igla_v_pod":
+        return _format_preserved_tokens(low)
+    if re.fullmatch(r"kokon_launcher_[lr](?:[0-9]+)?", low, flags=re.IGNORECASE):
+        return _format_preserved_tokens(low)
+    if re.fullmatch(r"aileron_[dg]", low, flags=re.IGNORECASE):
+        side = "D" if low.endswith("_d") else "G"
+        return f"Aileron_{side}"
+    if re.fullmatch(r"elevator_[dg]", low, flags=re.IGNORECASE):
+        side = "D" if low.endswith("_d") else "G"
+        return f"Elevator_{side}"
+    if low == "rudder":
+        return "Rudder"
+    if low in {"train_avant", "train_arriere"}:
+        return "Train_Avant" if low.endswith("avant") else "Train_Arriere"
+    if low == "pilot":
+        return "Pilot"
 
     m = re.match(r"^blindage_([dg])_?([0-9]+)$", low, flags=re.IGNORECASE)
     if m:
@@ -1408,6 +2429,487 @@ def classify_group_from_bone_name(name: str) -> str:
     return "Chassis"
 
 
+_RAW_GEOMETRY_PROMOTION_FIXTURES = {
+    "kokon_launcher",
+    "pods_internes",
+}
+
+
+def _raw_node_is_helper_like_for_geometry_promotion(name: str) -> bool:
+    low = _normalize_bone_name_for_tokens(name)
+    if not low:
+        return True
+    if low.startswith("fx_"):
+        return True
+    if low.startswith("bip01"):
+        return True
+    if low in {"armature", "papyrus", "fake"}:
+        return True
+    if low.startswith("armature_"):
+        return True
+    if re.fullmatch(r"empty(?:\.[0-9]+)?", low, flags=re.IGNORECASE):
+        return True
+    if low.startswith("cylinder."):
+        return True
+    return False
+
+
+def _geometry_promotion_group_name(raw_name: str) -> str:
+    return pretty_part_name(str(raw_name or "").strip())
+
+
+def _should_promote_raw_geometry_group(
+    raw_name: str,
+    tri_count: int,
+    total_triangles: int,
+) -> bool:
+    low = _normalize_bone_name_for_tokens(raw_name)
+    if not low:
+        return False
+    if _raw_node_is_helper_like_for_geometry_promotion(low):
+        return False
+    if low in {"chassis", "hull", "base", "chassisfake", "chassisarmaturefake"}:
+        return False
+    if low in _RAW_GEOMETRY_PROMOTION_FIXTURES:
+        return int(tri_count) >= 24
+    min_tris = max(96, int(max(1, int(total_triangles)) * 0.015))
+    return int(tri_count) >= int(min_tris)
+
+
+def _build_group_split_diagnostics(
+    tri_infos: Sequence[Dict[str, Any]],
+    material_role: str = "",
+    material_name: str = "",
+) -> Dict[str, Any]:
+    total = len(tri_infos)
+    raw_counts: Dict[str, int] = {}
+    raw_index_by_name: Dict[str, int] = {}
+    bone_counts: Dict[int, int] = {}
+    for info in tri_infos:
+        raw_name = str(info.get("raw_bone_name", "") or "").strip()
+        raw_low = _normalize_bone_name_for_tokens(raw_name)
+        raw_idx = int(info.get("raw_bone_index", -1))
+        if raw_low:
+            raw_counts[raw_low] = raw_counts.get(raw_low, 0) + 1
+            raw_index_by_name.setdefault(raw_low, raw_idx)
+        if raw_idx >= 0:
+            bone_counts[raw_idx] = bone_counts.get(raw_idx, 0) + 1
+
+    dominant_raw_name = ""
+    dominant_raw_triangles = 0
+    significant_raw_nodes: List[Dict[str, Any]] = []
+    if raw_counts:
+        dominant_raw_name = min(raw_counts.keys(), key=lambda key: (-raw_counts[key], key))
+        dominant_raw_triangles = int(raw_counts.get(dominant_raw_name, 0))
+        min_significant = max(24, int(max(1, total) * 0.10))
+        for raw_low in sorted(raw_counts.keys(), key=lambda key: (-raw_counts[key], key)):
+            count = int(raw_counts[raw_low])
+            if count < min_significant:
+                continue
+            significant_raw_nodes.append(
+                {
+                    "raw_node": str(raw_low),
+                    "raw_node_index": int(raw_index_by_name.get(raw_low, -1)),
+                    "triangles": int(count),
+                    "ratio": round(float(count) / float(max(1, total)), 6),
+                }
+            )
+
+    dominant_raw_ratio = round(float(dominant_raw_triangles) / float(max(1, total)), 6)
+    contamination_verdict = "clean"
+    if len(significant_raw_nodes) > 1 or (dominant_raw_ratio < 0.85 and total >= 48):
+        contamination_verdict = "mixed_raw_nodes"
+
+    dominant_bone_index = -1
+    dominant_bone_triangles = 0
+    if bone_counts:
+        dominant_bone_index = min(bone_counts.keys(), key=lambda idx: (-bone_counts[idx], int(idx)))
+        dominant_bone_triangles = int(bone_counts.get(dominant_bone_index, 0))
+
+    return {
+        "material_role": str(material_role or ""),
+        "material_name": str(material_name or ""),
+        "triangles": int(total),
+        "dominant_raw_node": str(dominant_raw_name),
+        "dominant_raw_node_index": int(raw_index_by_name.get(dominant_raw_name, -1)) if dominant_raw_name else -1,
+        "dominant_raw_node_ratio": float(dominant_raw_ratio),
+        "dominant_bone_index": int(dominant_bone_index),
+        "dominant_bone_ratio": round(float(dominant_bone_triangles) / float(max(1, total)), 6),
+        "significant_raw_nodes": significant_raw_nodes,
+        "contamination_verdict": str(contamination_verdict),
+    }
+
+
+def _bucket_face_components(
+    faces: Sequence[Sequence[int]],
+) -> List[List[int]]:
+    vert_to_faces: Dict[int, List[int]] = {}
+    for face_idx, face in enumerate(faces):
+        for vi in face:
+            vert_to_faces.setdefault(int(vi), []).append(int(face_idx))
+
+    components: List[List[int]] = []
+    visited: set[int] = set()
+    for face_idx in range(len(faces)):
+        if face_idx in visited:
+            continue
+        queue = [int(face_idx)]
+        visited.add(int(face_idx))
+        comp: List[int] = []
+        while queue:
+            cur = queue.pop()
+            comp.append(int(cur))
+            for vi in faces[cur]:
+                for nei in vert_to_faces.get(int(vi), []):
+                    if nei in visited:
+                        continue
+                    visited.add(int(nei))
+                    queue.append(int(nei))
+        if comp:
+            components.append(comp)
+    return components
+
+
+def _polygon_area_3d(vertices: Sequence[Tuple[float, float, float]], face: Sequence[int]) -> float:
+    if len(face) < 3:
+        return 0.0
+    try:
+        p0 = vertices[int(face[0])]
+    except Exception:
+        return 0.0
+    area = 0.0
+    for i in range(1, len(face) - 1):
+        try:
+            p1 = vertices[int(face[i])]
+            p2 = vertices[int(face[i + 1])]
+        except Exception:
+            return 0.0
+        ux = float(p1[0]) - float(p0[0])
+        uy = float(p1[1]) - float(p0[1])
+        uz = float(p1[2]) - float(p0[2])
+        vx = float(p2[0]) - float(p0[0])
+        vy = float(p2[1]) - float(p0[1])
+        vz = float(p2[2]) - float(p0[2])
+        cx = uy * vz - uz * vy
+        cy = uz * vx - ux * vz
+        cz = ux * vy - uy * vx
+        area += 0.5 * math.sqrt(cx * cx + cy * cy + cz * cz)
+    return float(area)
+
+
+def _conservative_quad_merge(
+    vertices: Sequence[Tuple[float, float, float]],
+    faces: Sequence[Sequence[int]],
+    face_mids: Sequence[int],
+) -> Tuple[List[List[int]], List[int], int]:
+    edge_to_faces: Dict[Tuple[int, int], List[int]] = {}
+    tri_faces: List[Tuple[int, int, int] | None] = []
+    for face_idx, face in enumerate(faces):
+        if len(face) != 3:
+            tri_faces.append(None)
+            continue
+        tri = (int(face[0]), int(face[1]), int(face[2]))
+        tri_faces.append(tri)
+        edges = (
+            tuple(sorted((tri[0], tri[1]))),
+            tuple(sorted((tri[1], tri[2]))),
+            tuple(sorted((tri[2], tri[0]))),
+        )
+        for edge in edges:
+            edge_to_faces.setdefault(edge, []).append(int(face_idx))
+
+    used: set[int] = set()
+    out_faces: List[List[int]] = []
+    out_mids: List[int] = []
+    merged_pairs = 0
+
+    def _sub(a: Sequence[float], b: Sequence[float]) -> Tuple[float, float, float]:
+        return (
+            float(a[0]) - float(b[0]),
+            float(a[1]) - float(b[1]),
+            float(a[2]) - float(b[2]),
+        )
+
+    def _cross(a: Sequence[float], b: Sequence[float]) -> Tuple[float, float, float]:
+        return (
+            float(a[1]) * float(b[2]) - float(a[2]) * float(b[1]),
+            float(a[2]) * float(b[0]) - float(a[0]) * float(b[2]),
+            float(a[0]) * float(b[1]) - float(a[1]) * float(b[0]),
+        )
+
+    def _dot(a: Sequence[float], b: Sequence[float]) -> float:
+        return float(a[0]) * float(b[0]) + float(a[1]) * float(b[1]) + float(a[2]) * float(b[2])
+
+    def _norm(v: Sequence[float]) -> float:
+        return math.sqrt(_dot(v, v))
+
+    def _ordered_quad(face_a: Tuple[int, int, int], face_b: Tuple[int, int, int]) -> List[int] | None:
+        verts = sorted({int(v) for v in [*face_a, *face_b]})
+        if len(verts) != 4:
+            return None
+        pts = [vertices[v] for v in verts]
+        centroid = (
+            sum(float(p[0]) for p in pts) / 4.0,
+            sum(float(p[1]) for p in pts) / 4.0,
+            sum(float(p[2]) for p in pts) / 4.0,
+        )
+        n0 = _cross(_sub(vertices[face_a[1]], vertices[face_a[0]]), _sub(vertices[face_a[2]], vertices[face_a[0]]))
+        n1 = _cross(_sub(vertices[face_b[1]], vertices[face_b[0]]), _sub(vertices[face_b[2]], vertices[face_b[0]]))
+        n = (
+            float(n0[0]) + float(n1[0]),
+            float(n0[1]) + float(n1[1]),
+            float(n0[2]) + float(n1[2]),
+        )
+        n_len = _norm(n)
+        if n_len <= 1.0e-12:
+            return None
+        n = (n[0] / n_len, n[1] / n_len, n[2] / n_len)
+
+        axis_u = _sub(vertices[verts[0]], centroid)
+        axis_u_len = _norm(axis_u)
+        if axis_u_len <= 1.0e-12:
+            return None
+        axis_u = (axis_u[0] / axis_u_len, axis_u[1] / axis_u_len, axis_u[2] / axis_u_len)
+        axis_v = _cross(n, axis_u)
+        axis_v_len = _norm(axis_v)
+        if axis_v_len <= 1.0e-12:
+            return None
+        axis_v = (axis_v[0] / axis_v_len, axis_v[1] / axis_v_len, axis_v[2] / axis_v_len)
+
+        polar: List[Tuple[float, int]] = []
+        for v in verts:
+            rel = _sub(vertices[v], centroid)
+            x = _dot(rel, axis_u)
+            y = _dot(rel, axis_v)
+            polar.append((math.atan2(y, x), int(v)))
+        ordered = [int(v) for _angle, v in sorted(polar, key=lambda item: item[0])]
+        if len(set(ordered)) != 4:
+            return None
+
+        boundary_counts: Dict[Tuple[int, int], int] = {}
+        for edge in (
+            tuple(sorted((face_a[0], face_a[1]))),
+            tuple(sorted((face_a[1], face_a[2]))),
+            tuple(sorted((face_a[2], face_a[0]))),
+            tuple(sorted((face_b[0], face_b[1]))),
+            tuple(sorted((face_b[1], face_b[2]))),
+            tuple(sorted((face_b[2], face_b[0]))),
+        ):
+            boundary_counts[edge] = boundary_counts.get(edge, 0) + 1
+        boundary_edges = {edge for edge, count in boundary_counts.items() if count == 1}
+        quad_edges = {
+            tuple(sorted((ordered[0], ordered[1]))),
+            tuple(sorted((ordered[1], ordered[2]))),
+            tuple(sorted((ordered[2], ordered[3]))),
+            tuple(sorted((ordered[3], ordered[0]))),
+        }
+        if quad_edges != boundary_edges:
+            return None
+
+        max_edge = 0.0
+        for i in range(4):
+            p0 = vertices[ordered[i]]
+            p1 = vertices[ordered[(i + 1) % 4]]
+            max_edge = max(max_edge, math.dist(p0, p1))
+        plane_eps = max(1.0e-5, max_edge * 1.0e-4)
+        for v in ordered:
+            rel = _sub(vertices[v], vertices[ordered[0]])
+            if abs(_dot(rel, n)) > plane_eps:
+                return None
+
+        sign = 0.0
+        for i in range(4):
+            p0 = vertices[ordered[i]]
+            p1 = vertices[ordered[(i + 1) % 4]]
+            p2 = vertices[ordered[(i + 2) % 4]]
+            c = _cross(_sub(p1, p0), _sub(p2, p1))
+            s = _dot(c, n)
+            if abs(s) <= 1.0e-10:
+                continue
+            if sign == 0.0:
+                sign = 1.0 if s > 0.0 else -1.0
+            elif s * sign < 0.0:
+                return None
+        return ordered
+
+    candidate_pairs: List[Tuple[float, int, int]] = []
+    for edge, face_ids in edge_to_faces.items():
+        if len(face_ids) != 2:
+            continue
+        fa, fb = int(face_ids[0]), int(face_ids[1])
+        tri_a = tri_faces[fa]
+        tri_b = tri_faces[fb]
+        if tri_a is None or tri_b is None:
+            continue
+        if int(face_mids[fa]) != int(face_mids[fb]):
+            continue
+        n0 = _cross(_sub(vertices[tri_a[1]], vertices[tri_a[0]]), _sub(vertices[tri_a[2]], vertices[tri_a[0]]))
+        n1 = _cross(_sub(vertices[tri_b[1]], vertices[tri_b[0]]), _sub(vertices[tri_b[2]], vertices[tri_b[0]]))
+        n0_len = _norm(n0)
+        n1_len = _norm(n1)
+        if n0_len <= 1.0e-12 or n1_len <= 1.0e-12:
+            continue
+        normal_dot = _dot(n0, n1) / max(1.0e-12, n0_len * n1_len)
+        if normal_dot < 0.9995:
+            continue
+        quad = _ordered_quad(tri_a, tri_b)
+        if quad is None:
+            continue
+        candidate_pairs.append((1.0 - normal_dot, fa, fb))
+
+    candidate_pairs.sort(key=lambda item: (item[0], item[1], item[2]))
+    pair_face_to_quad: Dict[int, List[int]] = {}
+    for _score, fa, fb in candidate_pairs:
+        if fa in used or fb in used:
+            continue
+        tri_a = tri_faces[fa]
+        tri_b = tri_faces[fb]
+        if tri_a is None or tri_b is None:
+            continue
+        quad = _ordered_quad(tri_a, tri_b)
+        if quad is None:
+            continue
+        used.add(int(fa))
+        used.add(int(fb))
+        pair_face_to_quad[int(fa)] = list(quad)
+        pair_face_to_quad[int(fb)] = list(quad)
+        merged_pairs += 1
+
+    emitted_pairs: set[int] = set()
+    for face_idx, face in enumerate(faces):
+        if face_idx in used:
+            if face_idx in emitted_pairs:
+                continue
+            quad = pair_face_to_quad.get(int(face_idx))
+            if quad is None:
+                continue
+            out_faces.append(list(quad))
+            out_mids.append(int(face_mids[face_idx]))
+            for peer_idx, peer_quad in pair_face_to_quad.items():
+                if peer_quad == quad:
+                    emitted_pairs.add(int(peer_idx))
+            continue
+        out_faces.append([int(v) for v in face])
+        out_mids.append(int(face_mids[face_idx]))
+
+    return out_faces, out_mids, int(merged_pairs)
+
+
+def conservative_cleanup_bucket_geometry(
+    bucket: Dict[str, Any],
+) -> Dict[str, Any]:
+    vertices_in = [tuple(map(float, row)) for row in list(bucket.get("vertices", []) or [])]
+    uvs_in = [tuple(map(float, row)) for row in list(bucket.get("uvs", []) or [])]
+    faces_in = [[int(v) for v in face] for face in list(bucket.get("faces", []) or [])]
+    mids_in = [int(mid) for mid in list(bucket.get("face_mids", []) or [])]
+    refs_in = list(bucket.get("source_refs", []) or [])
+
+    diagnostics = {
+        "cleanup_mode": "conservative",
+        "pre_vertex_count": int(len(vertices_in)),
+        "pre_polygon_count": int(len(faces_in)),
+        "pre_component_count": int(len(_bucket_face_components(faces_in))) if faces_in else 0,
+        "welded_vertices": 0,
+        "degenerate_faces_removed": 0,
+        "tiny_components_removed": 0,
+        "quad_pairs_merged": 0,
+    }
+    if not vertices_in or not faces_in:
+        diagnostics["post_vertex_count"] = int(len(vertices_in))
+        diagnostics["post_polygon_count"] = int(len(faces_in))
+        diagnostics["post_component_count"] = int(diagnostics["pre_component_count"])
+        return diagnostics
+
+    pos_eps = 1.0e-6
+    uv_eps = 1.0e-6
+    remap: Dict[int, int] = {}
+    new_vertices: List[Tuple[float, float, float]] = []
+    new_uvs: List[Tuple[float, float]] = []
+    new_refs: List[Any] = []
+    key_to_new: Dict[Tuple[int, int, int, int, int], int] = {}
+    for src_idx, pos in enumerate(vertices_in):
+        uv = uvs_in[src_idx] if src_idx < len(uvs_in) else (0.0, 0.0)
+        key = (
+            int(round(float(pos[0]) / pos_eps)),
+            int(round(float(pos[1]) / pos_eps)),
+            int(round(float(pos[2]) / pos_eps)),
+            int(round(float(uv[0]) / uv_eps)),
+            int(round(float(uv[1]) / uv_eps)),
+        )
+        mapped = key_to_new.get(key)
+        if mapped is None:
+            mapped = len(new_vertices)
+            key_to_new[key] = int(mapped)
+            new_vertices.append(tuple(pos))
+            new_uvs.append(tuple(uv))
+            new_refs.append(refs_in[src_idx] if src_idx < len(refs_in) else (-1, -1))
+        remap[int(src_idx)] = int(mapped)
+    diagnostics["welded_vertices"] = max(0, int(len(vertices_in) - len(new_vertices)))
+
+    cleaned_faces: List[List[int]] = []
+    cleaned_mids: List[int] = []
+    for face_idx, face in enumerate(faces_in):
+        mapped = [int(remap.get(int(vi), -1)) for vi in face]
+        if len(mapped) < 3 or any(int(vi) < 0 for vi in mapped):
+            diagnostics["degenerate_faces_removed"] += 1
+            continue
+        if len(set(mapped)) < 3:
+            diagnostics["degenerate_faces_removed"] += 1
+            continue
+        if _polygon_area_3d(new_vertices, mapped) <= 1.0e-12:
+            diagnostics["degenerate_faces_removed"] += 1
+            continue
+        cleaned_faces.append(list(mapped))
+        cleaned_mids.append(int(mids_in[face_idx]) if face_idx < len(mids_in) else -1)
+
+    kept_face_ids: set[int] = set()
+    components = _bucket_face_components(cleaned_faces)
+    for comp in components:
+        if len(comp) > 2:
+            kept_face_ids.update(int(idx) for idx in comp)
+            continue
+        comp_faces = [cleaned_faces[int(idx)] for idx in comp]
+        comp_verts = sorted({int(vi) for face in comp_faces for vi in face})
+        if len(comp_verts) < 3:
+            diagnostics["tiny_components_removed"] += len(comp)
+            continue
+        xs = [float(new_vertices[vi][0]) for vi in comp_verts]
+        ys = [float(new_vertices[vi][1]) for vi in comp_verts]
+        zs = [float(new_vertices[vi][2]) for vi in comp_verts]
+        bbox_diag = math.sqrt((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2 + (max(zs) - min(zs)) ** 2)
+        total_area = sum(_polygon_area_3d(new_vertices, face) for face in comp_faces)
+        if bbox_diag <= 1.0e-5 or total_area <= 1.0e-10:
+            diagnostics["tiny_components_removed"] += len(comp)
+            continue
+        kept_face_ids.update(int(idx) for idx in comp)
+
+    if len(kept_face_ids) != len(cleaned_faces):
+        next_faces: List[List[int]] = []
+        next_mids: List[int] = []
+        for idx, face in enumerate(cleaned_faces):
+            if idx not in kept_face_ids:
+                continue
+            next_faces.append(face)
+            next_mids.append(int(cleaned_mids[idx]))
+        cleaned_faces = next_faces
+        cleaned_mids = next_mids
+
+    quad_faces, quad_mids, quad_pairs = _conservative_quad_merge(new_vertices, cleaned_faces, cleaned_mids)
+    diagnostics["quad_pairs_merged"] = int(quad_pairs)
+
+    bucket["vertices"] = [tuple(v) for v in new_vertices]
+    bucket["uvs"] = [tuple(uv) for uv in new_uvs]
+    bucket["source_refs"] = list(new_refs)
+    bucket["faces"] = [list(face) for face in quad_faces]
+    bucket["face_mids"] = [int(mid) for mid in quad_mids]
+    bucket["map"] = {}
+
+    diagnostics["post_vertex_count"] = int(len(bucket["vertices"]))
+    diagnostics["post_polygon_count"] = int(len(bucket["faces"]))
+    diagnostics["post_component_count"] = int(len(_bucket_face_components(bucket["faces"]))) if bucket["faces"] else 0
+    return diagnostics
+
+
 def resolve_center_wheel_bone_index(
     elev_idx: int,
     bone_name_by_index: Dict[int, str],
@@ -1422,7 +2924,7 @@ def resolve_center_wheel_bone_index(
 
     target_low = f"roue_{side.lower()}{num}"
     for bidx, raw_name in bone_name_by_index.items():
-        if str(raw_name or "").strip().lower() == target_low:
+        if _normalize_bone_name_for_tokens(str(raw_name or "")) == target_low:
             return int(bidx)
     return int(elev_idx)
 
@@ -1433,6 +2935,7 @@ def split_faces_by_bone_deterministic(
     bone_parent_by_index: Dict[int, int],
     material_role: str = "",
     material_name: str = "",
+    part_index: int = -1,
 ) -> List[Dict[str, Any]]:
     idx = part.get("indices", [])
     xyz = part.get("vertices", {}).get("xyz", [])
@@ -1518,6 +3021,9 @@ def split_faces_by_bone_deterministic(
                 "group_name": str(group_name),
                 "group_bone_index": int(group_bone_index),
                 "tri_side": str(tri_side or ""),
+                "raw_bone_name": str(raw_bone_name),
+                "raw_bone_name_low": _normalize_bone_name_for_tokens(raw_bone_name),
+                "group_name_source": "classifier",
             }
         )
 
@@ -1541,6 +3047,40 @@ def split_faces_by_bone_deterministic(
     part_track_side = _pick_track_side()
 
     grouped: Dict[str, Dict[str, Any]] = {}
+    raw_group_stats: Dict[str, Dict[str, Any]] = {}
+    total_triangles = len(tri_infos)
+    for info in tri_infos:
+        raw_low = str(info.get("raw_bone_name_low", "") or "")
+        if not raw_low:
+            continue
+        row = raw_group_stats.get(raw_low)
+        if row is None:
+            row = {
+                "raw_name": str(info.get("raw_bone_name", "") or raw_low),
+                "triangles": 0,
+                "groups": {},
+            }
+            raw_group_stats[raw_low] = row
+        row["triangles"] = int(row.get("triangles", 0)) + 1
+        groups_map = row["groups"]
+        group_name = str(info.get("group_name", "") or "Chassis")
+        groups_map[group_name] = int(groups_map.get(group_name, 0)) + 1
+
+    preserved_group_name_by_raw_low: Dict[str, str] = {}
+    for raw_low, row in raw_group_stats.items():
+        groups_map = dict(row.get("groups", {}) or {})
+        dominant_group = min(
+            groups_map.keys(),
+            key=lambda key: (-int(groups_map.get(key, 0)), str(key).lower()),
+        ) if groups_map else "Chassis"
+        preserved_group_name = _preserved_raw_geometry_group_name(
+            raw_name=str(row.get("raw_name", "") or raw_low),
+            triangle_count=int(row.get("triangles", 0)),
+            total_triangles=int(total_triangles),
+            classified_group=str(dominant_group),
+        )
+        if preserved_group_name:
+            preserved_group_name_by_raw_low[str(raw_low)] = str(preserved_group_name)
 
     # Secondary deterministic signal for tracks: if caller could not mark track role,
     # but every classified triangle resolves to roue_* and the material name contains
@@ -1614,6 +3154,12 @@ def split_faces_by_bone_deterministic(
         for info in tri_infos:
             group_name = str(info.get("group_name", ""))
             group_bone_index = int(info.get("group_bone_index", -1))
+            raw_low = str(info.get("raw_bone_name_low", "") or "")
+            preserved_group_name = preserved_group_name_by_raw_low.get(raw_low, "")
+            group_name_source = str(info.get("group_name_source", "") or "classifier")
+            if preserved_group_name:
+                group_name = str(preserved_group_name)
+                group_name_source = "raw_geometry_node"
             key = sanitize_material_name(group_name).lower()
             payload = grouped.get(key)
             if payload is None:
@@ -1622,10 +3168,15 @@ def split_faces_by_bone_deterministic(
                     "group_name_sanitized": sanitize_material_name(group_name),
                     "group_bone_index": int(group_bone_index),
                     "tris": [],
+                    "_tri_infos": [],
                 }
                 grouped[key] = payload
             elif int(payload.get("group_bone_index", -1)) < 0 and int(group_bone_index) >= 0:
                 payload["group_bone_index"] = int(group_bone_index)
+            info_copy = dict(info)
+            info_copy["group_name"] = str(group_name)
+            info_copy["group_name_source"] = str(group_name_source)
+            payload["_tri_infos"].append(info_copy)
             payload["tris"].append(info["tri"])
 
     for key in sorted(grouped.keys()):
@@ -1635,8 +3186,460 @@ def split_faces_by_bone_deterministic(
         tris = payload.get("tris", [])
         if not isinstance(tris, list) or not tris:
             continue
+        tri_group_infos = list(payload.pop("_tri_infos", []) or [])
+        raw_node_triangles: Dict[str, int] = {}
+        raw_name_by_low: Dict[str, str] = {}
+        source_counts: Dict[str, int] = {}
+        for info in tri_group_infos:
+            raw_low = str(info.get("raw_bone_name_low", "") or "")
+            raw_name = str(info.get("raw_bone_name", "") or raw_low or "unknown")
+            if raw_low:
+                raw_node_triangles[raw_low] = int(raw_node_triangles.get(raw_low, 0)) + 1
+                raw_name_by_low[raw_low] = raw_name
+            src = str(info.get("group_name_source", "") or "classifier")
+            source_counts[src] = int(source_counts.get(src, 0)) + 1
+        dominant_raw_low = min(
+            raw_node_triangles.keys(),
+            key=lambda raw_low: (-int(raw_node_triangles.get(raw_low, 0)), str(raw_low)),
+        ) if raw_node_triangles else ""
+        dominant_raw_triangles = int(raw_node_triangles.get(dominant_raw_low, 0))
+        foreign_triangles = max(0, int(len(tris)) - dominant_raw_triangles)
+        materialization_source = min(
+            source_counts.keys(),
+            key=lambda src: (-int(source_counts.get(src, 0)), str(src).lower()),
+        ) if source_counts else "classifier"
+        payload["diagnostics"] = {
+            "part_index": int(part_index),
+            "material_role": str(role),
+            "material_name": str(material_name or ""),
+            "triangle_count": int(len(tris)),
+            "group_name_source": str(materialization_source),
+            "dominant_raw_node": str(raw_name_by_low.get(dominant_raw_low, dominant_raw_low)),
+            "dominant_raw_triangles": int(dominant_raw_triangles),
+            "foreign_raw_triangles": int(foreign_triangles),
+            "contamination_verdict": "contaminated"
+            if foreign_triangles >= max(24, int(len(tris) * 0.08))
+            else "stable",
+            "raw_node_triangles": {
+                str(raw_name_by_low.get(raw_low, raw_low)): int(count)
+                for raw_low, count in sorted(
+                    raw_node_triangles.items(),
+                    key=lambda item: (-int(item[1]), str(item[0])),
+                )
+            },
+        }
         out.append(payload)
     return out
+
+
+def cleanup_bucket_geometry(
+    vertices: Sequence[Sequence[float]],
+    uvs: Sequence[Sequence[float]],
+    faces: Sequence[Sequence[int]],
+    face_mids: Sequence[int] | None = None,
+    source_refs: Sequence[Sequence[int]] | None = None,
+    group_name: str = "",
+) -> Dict[str, Any]:
+    vertex_rows = [
+        (
+            float(row[0]) if len(row) >= 1 else 0.0,
+            float(row[1]) if len(row) >= 2 else 0.0,
+            float(row[2]) if len(row) >= 3 else 0.0,
+        )
+        for row in list(vertices or [])
+    ]
+    uv_rows = [
+        (
+            float(row[0]) if len(row) >= 1 else 0.0,
+            float(row[1]) if len(row) >= 2 else 0.0,
+        )
+        for row in list(uvs or [])
+    ]
+    if len(uv_rows) < len(vertex_rows):
+        uv_rows.extend([(0.0, 0.0)] * (len(vertex_rows) - len(uv_rows)))
+    src_rows = [
+        (
+            int(row[0]) if len(row) >= 1 else -1,
+            int(row[1]) if len(row) >= 2 else -1,
+        )
+        for row in list(source_refs or [])
+    ]
+    if len(src_rows) < len(vertex_rows):
+        src_rows.extend([(-1, -1)] * (len(vertex_rows) - len(src_rows)))
+    mids_rows = [int(mid) for mid in list(face_mids or [])]
+    if len(mids_rows) < len(faces):
+        mids_rows.extend([-1] * (len(faces) - len(mids_rows)))
+
+    def _polygon_edges(face: Sequence[int]) -> List[Tuple[int, int]]:
+        out: List[Tuple[int, int]] = []
+        if len(face) < 2:
+            return out
+        for idx in range(len(face)):
+            a = int(face[idx])
+            b = int(face[(idx + 1) % len(face)])
+            out.append((a, b))
+        return out
+
+    def _triangle_area(a: Sequence[float], b: Sequence[float], c: Sequence[float]) -> float:
+        ab = (
+            float(b[0]) - float(a[0]),
+            float(b[1]) - float(a[1]),
+            float(b[2]) - float(a[2]),
+        )
+        ac = (
+            float(c[0]) - float(a[0]),
+            float(c[1]) - float(a[1]),
+            float(c[2]) - float(a[2]),
+        )
+        cx = ab[1] * ac[2] - ab[2] * ac[1]
+        cy = ab[2] * ac[0] - ab[0] * ac[2]
+        cz = ab[0] * ac[1] - ab[1] * ac[0]
+        return 0.5 * math.sqrt(cx * cx + cy * cy + cz * cz)
+
+    def _polygon_area(face: Sequence[int]) -> float:
+        if len(face) < 3:
+            return 0.0
+        try:
+            anchor = vertex_rows[int(face[0])]
+        except Exception:
+            return 0.0
+        area = 0.0
+        for idx in range(1, len(face) - 1):
+            try:
+                area += _triangle_area(anchor, vertex_rows[int(face[idx])], vertex_rows[int(face[idx + 1])])
+            except Exception:
+                return 0.0
+        return float(area)
+
+    def _component_groups(face_rows: Sequence[Sequence[int]]) -> List[List[int]]:
+        edge_to_faces: Dict[Tuple[int, int], List[int]] = {}
+        for face_i, face in enumerate(face_rows):
+            for a, b in _polygon_edges(face):
+                edge = (min(int(a), int(b)), max(int(a), int(b)))
+                edge_to_faces.setdefault(edge, []).append(int(face_i))
+        adjacency: Dict[int, set[int]] = {}
+        for face_ids in edge_to_faces.values():
+            if len(face_ids) < 2:
+                continue
+            for face_id in face_ids:
+                adjacency.setdefault(int(face_id), set()).update(int(other) for other in face_ids if int(other) != int(face_id))
+        visited: set[int] = set()
+        groups: List[List[int]] = []
+        for face_i in range(len(face_rows)):
+            if face_i in visited:
+                continue
+            queue = [int(face_i)]
+            visited.add(int(face_i))
+            group: List[int] = []
+            while queue:
+                cur = queue.pop()
+                group.append(int(cur))
+                for nxt in sorted(adjacency.get(int(cur), set())):
+                    if nxt in visited:
+                        continue
+                    visited.add(int(nxt))
+                    queue.append(int(nxt))
+            groups.append(group)
+        return groups
+
+    def _compact(
+        face_rows: Sequence[Sequence[int]],
+        mid_rows: Sequence[int],
+    ) -> Tuple[List[Tuple[float, float, float]], List[Tuple[float, float]], List[Tuple[int, int]], List[Tuple[int, ...]], List[int]]:
+        used: set[int] = set()
+        for face in face_rows:
+            for vi in face:
+                if 0 <= int(vi) < len(vertex_rows):
+                    used.add(int(vi))
+        order = sorted(used)
+        remap = {old: new for new, old in enumerate(order)}
+        out_vertices = [vertex_rows[idx] for idx in order]
+        out_uvs = [uv_rows[idx] for idx in order]
+        out_refs = [src_rows[idx] for idx in order]
+        out_faces: List[Tuple[int, ...]] = []
+        out_mids: List[int] = []
+        for face_i, face in enumerate(face_rows):
+            mapped = tuple(int(remap[int(vi)]) for vi in face if int(vi) in remap)
+            if len(mapped) >= 3:
+                out_faces.append(mapped)
+                out_mids.append(int(mid_rows[face_i]) if face_i < len(mid_rows) else -1)
+        return out_vertices, out_uvs, out_refs, out_faces, out_mids
+
+    epsilon = 1.0e-6
+    welded_vertices: List[Tuple[float, float, float]] = []
+    welded_uvs: List[Tuple[float, float]] = []
+    welded_refs: List[Tuple[int, int]] = []
+    weld_map: Dict[Tuple[int, int, int, int, int], int] = {}
+    old_to_new: Dict[int, int] = {}
+    for old_idx, pos in enumerate(vertex_rows):
+        uv_row = uv_rows[old_idx] if old_idx < len(uv_rows) else (0.0, 0.0)
+        key = (
+            int(round(float(pos[0]) / epsilon)),
+            int(round(float(pos[1]) / epsilon)),
+            int(round(float(pos[2]) / epsilon)),
+            int(round(float(uv_row[0]) / epsilon)),
+            int(round(float(uv_row[1]) / epsilon)),
+        )
+        mapped = weld_map.get(key)
+        if mapped is None:
+            mapped = len(welded_vertices)
+            weld_map[key] = mapped
+            welded_vertices.append(pos)
+            welded_uvs.append(uv_row)
+            welded_refs.append(src_rows[old_idx] if old_idx < len(src_rows) else (-1, -1))
+        old_to_new[int(old_idx)] = int(mapped)
+
+    face_rows: List[Tuple[int, ...]] = []
+    mid_rows: List[int] = []
+    degenerate_removed = 0
+    for face_i, face in enumerate(list(faces or [])):
+        mapped = tuple(int(old_to_new.get(int(vi), -1)) for vi in list(face or []))
+        if len(mapped) < 3:
+            degenerate_removed += 1
+            continue
+        if len(set(mapped)) < 3:
+            degenerate_removed += 1
+            continue
+        if any(int(vi) < 0 or int(vi) >= len(welded_vertices) for vi in mapped):
+            degenerate_removed += 1
+            continue
+        area = 0.0
+        try:
+            anchor = welded_vertices[int(mapped[0])]
+            for idx in range(1, len(mapped) - 1):
+                area += _triangle_area(anchor, welded_vertices[int(mapped[idx])], welded_vertices[int(mapped[idx + 1])])
+        except Exception:
+            area = 0.0
+        if area <= 1.0e-10:
+            degenerate_removed += 1
+            continue
+        face_rows.append(mapped)
+        mid_rows.append(int(mids_rows[face_i]) if face_i < len(mids_rows) else -1)
+
+    vertex_rows = welded_vertices
+    uv_rows = welded_uvs
+    src_rows = welded_refs
+    pre_component_count = len(_component_groups(face_rows))
+    total_area = sum(_polygon_area(face) for face in face_rows)
+    used_vertices = sorted({int(vi) for face in face_rows for vi in face})
+    if used_vertices:
+        xs = [vertex_rows[idx][0] for idx in used_vertices]
+        ys = [vertex_rows[idx][1] for idx in used_vertices]
+        zs = [vertex_rows[idx][2] for idx in used_vertices]
+        total_diag = math.dist((min(xs), min(ys), min(zs)), (max(xs), max(ys), max(zs)))
+    else:
+        total_diag = 0.0
+
+    dropped_components = 0
+    components = _component_groups(face_rows)
+    if len(components) > 1:
+        keep_face_ids: set[int] = set()
+        area_floor = max(1.0e-8, float(total_area) * 0.0004)
+        diag_floor = max(0.0025, float(total_diag) * 0.015)
+        for comp in components:
+            comp_faces = [face_rows[idx] for idx in comp]
+            comp_vertices = sorted({int(vi) for face in comp_faces for vi in face})
+            comp_area = sum(_polygon_area(face) for face in comp_faces)
+            if comp_vertices:
+                xs = [vertex_rows[idx][0] for idx in comp_vertices]
+                ys = [vertex_rows[idx][1] for idx in comp_vertices]
+                zs = [vertex_rows[idx][2] for idx in comp_vertices]
+                comp_diag = math.dist((min(xs), min(ys), min(zs)), (max(xs), max(ys), max(zs)))
+            else:
+                comp_diag = 0.0
+            should_drop = (
+                len(comp_faces) <= 2
+                and len(comp_vertices) <= 6
+                and comp_area <= area_floor
+                and comp_diag <= diag_floor
+            )
+            if should_drop:
+                dropped_components += 1
+                continue
+            keep_face_ids.update(int(idx) for idx in comp)
+        if keep_face_ids:
+            kept_faces: List[Tuple[int, ...]] = []
+            kept_mids: List[int] = []
+            for face_i, face in enumerate(face_rows):
+                if face_i not in keep_face_ids:
+                    continue
+                kept_faces.append(face)
+                kept_mids.append(mid_rows[face_i])
+            face_rows = kept_faces
+            mid_rows = kept_mids
+            vertex_rows, uv_rows, src_rows, face_rows, mid_rows = _compact(face_rows, mid_rows)
+
+    def _face_normal(face: Sequence[int]) -> Tuple[float, float, float]:
+        if len(face) < 3:
+            return (0.0, 0.0, 0.0)
+        a = vertex_rows[int(face[0])]
+        b = vertex_rows[int(face[1])]
+        c = vertex_rows[int(face[2])]
+        ab = (
+            float(b[0]) - float(a[0]),
+            float(b[1]) - float(a[1]),
+            float(b[2]) - float(a[2]),
+        )
+        ac = (
+            float(c[0]) - float(a[0]),
+            float(c[1]) - float(a[1]),
+            float(c[2]) - float(a[2]),
+        )
+        nx = ab[1] * ac[2] - ab[2] * ac[1]
+        ny = ab[2] * ac[0] - ab[0] * ac[2]
+        nz = ab[0] * ac[1] - ab[1] * ac[0]
+        ln = math.sqrt(nx * nx + ny * ny + nz * nz)
+        if ln <= 1.0e-12:
+            return (0.0, 0.0, 0.0)
+        return (nx / ln, ny / ln, nz / ln)
+
+    def _safe_quad_from_pair(face_a: Sequence[int], face_b: Sequence[int]) -> Tuple[int, int, int, int] | None:
+        if len(face_a) != 3 or len(face_b) != 3:
+            return None
+        shared = sorted(set(int(v) for v in face_a) & set(int(v) for v in face_b))
+        if len(shared) != 2:
+            return None
+        unique = [int(v) for v in list(face_a) + list(face_b) if int(v) not in shared]
+        if len(unique) != 2:
+            return None
+        boundary_counts: Dict[Tuple[int, int], int] = {}
+        for edge in _polygon_edges(face_a):
+            key = (min(int(edge[0]), int(edge[1])), max(int(edge[0]), int(edge[1])))
+            boundary_counts[key] = int(boundary_counts.get(key, 0)) + 1
+        for edge in _polygon_edges(face_b):
+            key = (min(int(edge[0]), int(edge[1])), max(int(edge[0]), int(edge[1])))
+            boundary_counts[key] = int(boundary_counts.get(key, 0)) + 1
+        boundary_edges = [edge for edge, count in boundary_counts.items() if int(count) == 1]
+        if len(boundary_edges) != 4:
+            return None
+        adjacency: Dict[int, List[int]] = {}
+        for a, b in boundary_edges:
+            adjacency.setdefault(int(a), []).append(int(b))
+            adjacency.setdefault(int(b), []).append(int(a))
+        if len(adjacency) != 4 or any(len(nei) != 2 for nei in adjacency.values()):
+            return None
+        start = min(adjacency.keys())
+        cycle = [int(start)]
+        prev = None
+        cur = int(start)
+        for _ in range(3):
+            candidates = [n for n in adjacency[cur] if n != prev]
+            if not candidates:
+                return None
+            nxt = min(candidates)
+            cycle.append(int(nxt))
+            prev, cur = cur, nxt
+        if len(set(cycle)) != 4:
+            return None
+        if start not in adjacency.get(int(cycle[-1]), []):
+            return None
+        norm_a = _face_normal(face_a)
+        norm_b = _face_normal(face_b)
+        dot = sum(float(norm_a[i]) * float(norm_b[i]) for i in range(3))
+        if dot < 0.9990:
+            return None
+        avg = (
+            norm_a[0] + norm_b[0],
+            norm_a[1] + norm_b[1],
+            norm_a[2] + norm_b[2],
+        )
+        avg_len = math.sqrt(avg[0] * avg[0] + avg[1] * avg[1] + avg[2] * avg[2])
+        if avg_len <= 1.0e-12:
+            return None
+        avg = (avg[0] / avg_len, avg[1] / avg_len, avg[2] / avg_len)
+        quad = tuple(int(v) for v in cycle)
+        for idx in range(4):
+            p0 = vertex_rows[int(quad[idx])]
+            p1 = vertex_rows[int(quad[(idx + 1) % 4])]
+            p2 = vertex_rows[int(quad[(idx + 2) % 4])]
+            e1 = (
+                float(p1[0]) - float(p0[0]),
+                float(p1[1]) - float(p0[1]),
+                float(p1[2]) - float(p0[2]),
+            )
+            e2 = (
+                float(p2[0]) - float(p1[0]),
+                float(p2[1]) - float(p1[1]),
+                float(p2[2]) - float(p1[2]),
+            )
+            cx = e1[1] * e2[2] - e1[2] * e2[1]
+            cy = e1[2] * e2[0] - e1[0] * e2[2]
+            cz = e1[0] * e2[1] - e1[1] * e2[0]
+            if (cx * avg[0] + cy * avg[1] + cz * avg[2]) <= 1.0e-10:
+                return None
+        if _polygon_area(quad) <= 1.0e-10:
+            return None
+        return quad
+
+    used_faces: set[int] = set()
+    merged_faces: List[Tuple[int, ...]] = []
+    merged_mids: List[int] = []
+    quad_merges = 0
+    edge_to_faces: Dict[Tuple[int, int], List[int]] = {}
+    for face_i, face in enumerate(face_rows):
+        if len(face) != 3:
+            continue
+        for a, b in _polygon_edges(face):
+            edge = (min(int(a), int(b)), max(int(a), int(b)))
+            edge_to_faces.setdefault(edge, []).append(int(face_i))
+    for face_i, face in enumerate(face_rows):
+        if face_i in used_faces:
+            continue
+        if len(face) != 3:
+            merged_faces.append(tuple(face))
+            merged_mids.append(mid_rows[face_i] if face_i < len(mid_rows) else -1)
+            used_faces.add(int(face_i))
+            continue
+        best_pair = -1
+        for a, b in _polygon_edges(face):
+            edge = (min(int(a), int(b)), max(int(a), int(b)))
+            candidates = edge_to_faces.get(edge, [])
+            if len(candidates) != 2:
+                continue
+            other = candidates[0] if candidates[1] == face_i else candidates[1]
+            if other == face_i or other in used_faces:
+                continue
+            if other >= len(face_rows) or len(face_rows[other]) != 3:
+                continue
+            if int(mid_rows[other]) != int(mid_rows[face_i]):
+                continue
+            best_pair = int(other)
+            break
+        if best_pair >= 0:
+            quad = _safe_quad_from_pair(face, face_rows[best_pair])
+            if quad is not None:
+                merged_faces.append(tuple(quad))
+                merged_mids.append(mid_rows[face_i] if face_i < len(mid_rows) else -1)
+                used_faces.add(int(face_i))
+                used_faces.add(int(best_pair))
+                quad_merges += 1
+                continue
+        merged_faces.append(tuple(face))
+        merged_mids.append(mid_rows[face_i] if face_i < len(mid_rows) else -1)
+        used_faces.add(int(face_i))
+
+    vertex_rows, uv_rows, src_rows, merged_faces, merged_mids = _compact(merged_faces, merged_mids)
+    post_component_count = len(_component_groups(merged_faces))
+    diagnostics = {
+        "group_name": str(group_name or ""),
+        "vertex_count_pre": int(len(vertices or [])),
+        "polygon_count_pre": int(len(faces or [])),
+        "vertex_count_post": int(len(vertex_rows)),
+        "polygon_count_post": int(len(merged_faces)),
+        "component_count_pre": int(pre_component_count),
+        "component_count_post": int(post_component_count),
+        "degenerate_polygons_removed": int(degenerate_removed),
+        "tiny_components_removed": int(dropped_components),
+        "quad_merges": int(quad_merges),
+    }
+    return {
+        "vertices": list(vertex_rows),
+        "uvs": list(uv_rows),
+        "source_refs": list(src_rows),
+        "faces": list(merged_faces),
+        "face_mids": list(merged_mids),
+        "diagnostics": diagnostics,
+    }
 
 
 def split_faces_by_bone_top_level(
@@ -3514,6 +5517,8 @@ class SpkMeshExtractor:
         self._node_blob_cache: Dict[int, bytes] = {}
         self._node_names_cache: Dict[int, List[str]] = {}
         self._node_parents_cache: Dict[int, List[int]] = {}
+        self._node_off_mat_points_cache: Dict[int, List[List[Tuple[float, float, float]]]] = {}
+        self._node_off_mat_blocks_cache: Dict[int, List[List[List[float]]]] = {}
 
         self._parse_header()
         self._parse_fat()
@@ -4521,6 +6526,346 @@ class SpkMeshExtractor:
         names = [n for n in fallback_names if n]
         self._node_names_cache[node_index] = names
         return names
+
+    def parse_node_off_mat_points(self, node_index: int) -> List[List[Tuple[float, float, float]]]:
+        cached = self._node_off_mat_points_cache.get(node_index)
+        if cached is not None:
+            return cached
+
+        blob = self.get_node_blob(node_index)
+        if not blob:
+            self._node_off_mat_points_cache[node_index] = []
+            return []
+
+        layout = self._parse_node_blob_layout(blob)
+        if layout is None:
+            self._node_off_mat_points_cache[node_index] = []
+            return []
+        node_count, off_mat, off_parent, _off_names = layout
+
+        span = int(off_parent) - int(off_mat)
+        if node_count <= 0 or span <= 0 or span % node_count != 0:
+            self._node_off_mat_points_cache[node_index] = []
+            return []
+        stride = span // node_count
+        if stride <= 0 or stride % 4 != 0:
+            self._node_off_mat_points_cache[node_index] = []
+            return []
+
+        floats_per_node = stride // 4
+        block_count = floats_per_node // 12
+        if block_count <= 0:
+            self._node_off_mat_points_cache[node_index] = []
+            return []
+
+        out: List[List[Tuple[float, float, float]]] = []
+        unpack_fmt = f"<{floats_per_node}f"
+        for idx in range(node_count):
+            try:
+                vals = struct.unpack_from(unpack_fmt, blob, off_mat + idx * stride)
+            except Exception:
+                out = []
+                break
+            pts: List[Tuple[float, float, float]] = []
+            for block_idx in range(block_count):
+                base = block_idx * 12
+                try:
+                    tx = float(vals[base + 3])
+                    ty = float(vals[base + 7])
+                    tz = float(vals[base + 11])
+                except Exception:
+                    continue
+                pts.append((tx, ty, tz))
+            out.append(pts)
+
+        self._node_off_mat_points_cache[node_index] = out
+        return out
+
+    def parse_node_off_mat_blocks(self, node_index: int) -> List[List[List[float]]]:
+        cached = self._node_off_mat_blocks_cache.get(node_index)
+        if cached is not None:
+            return cached
+
+        blob = self.get_node_blob(node_index)
+        if not blob:
+            self._node_off_mat_blocks_cache[node_index] = []
+            return []
+
+        layout = self._parse_node_blob_layout(blob)
+        if layout is None:
+            self._node_off_mat_blocks_cache[node_index] = []
+            return []
+        node_count, off_mat, off_parent, _off_names = layout
+
+        span = int(off_parent) - int(off_mat)
+        if node_count <= 0 or span <= 0 or span % node_count != 0:
+            self._node_off_mat_blocks_cache[node_index] = []
+            return []
+        stride = span // node_count
+        if stride <= 0 or stride % 4 != 0:
+            self._node_off_mat_blocks_cache[node_index] = []
+            return []
+
+        floats_per_node = stride // 4
+        block_count = floats_per_node // 12
+        if block_count <= 0:
+            self._node_off_mat_blocks_cache[node_index] = []
+            return []
+
+        out: List[List[List[float]]] = []
+        unpack_fmt = f"<{floats_per_node}f"
+        for idx in range(node_count):
+            try:
+                vals = struct.unpack_from(unpack_fmt, blob, off_mat + idx * stride)
+            except Exception:
+                out = []
+                break
+            node_blocks: List[List[float]] = []
+            for block_idx in range(block_count):
+                base = block_idx * 12
+                try:
+                    node_blocks.append([float(v) for v in vals[base : base + 12]])
+                except Exception:
+                    continue
+            out.append(node_blocks)
+
+        self._node_off_mat_blocks_cache[node_index] = out
+        return out
+
+    def parse_raw_scene_graph(self, node_index: int) -> RawSceneGraph | None:
+        names = list(self.parse_node_names(node_index))
+        if not names:
+            return None
+        parents = list(self.parse_node_parent_indices(node_index))
+        off_mat_points = list(self.parse_node_off_mat_points(node_index))
+        off_mat_blocks = list(self.parse_node_off_mat_blocks(node_index))
+        node_count = len(names)
+        if len(parents) < node_count:
+            parents.extend([-1] * (node_count - len(parents)))
+        if len(off_mat_points) < node_count:
+            off_mat_points.extend([[] for _ in range(node_count - len(off_mat_points))])
+        if len(off_mat_blocks) < node_count:
+            off_mat_blocks.extend([[] for _ in range(node_count - len(off_mat_blocks))])
+
+        def _matrix_signature_rows(matrix_rows: Sequence[Sequence[float]] | None, digits: int = 6) -> tuple[tuple[float, ...], ...] | None:
+            if not isinstance(matrix_rows, (list, tuple)):
+                return None
+            rows: list[tuple[float, ...]] = []
+            for row in matrix_rows:
+                if not isinstance(row, (list, tuple)):
+                    return None
+                vals: list[float] = []
+                for value in row:
+                    try:
+                        vals.append(round(float(value), digits))
+                    except Exception:
+                        return None
+                rows.append(tuple(vals))
+            return tuple(rows)
+
+        def _pick_unique_transform_candidate(candidates: Sequence[RawNodeTransform]) -> RawNodeTransform | None:
+            if len(candidates) == 1:
+                return candidates[0]
+            unique_by_matrix: dict[tuple[tuple[float, ...], ...], RawNodeTransform] = {}
+            for candidate in candidates:
+                sig = _matrix_signature_rows(getattr(candidate, "matrix_local", None))
+                if sig is None:
+                    return None
+                if sig not in unique_by_matrix:
+                    unique_by_matrix[sig] = candidate
+            if len(unique_by_matrix) == 1:
+                return next(iter(unique_by_matrix.values()))
+            return None
+
+        records: List[RawNodeRecord] = []
+        for idx in range(node_count):
+            raw_name = str(names[idx] or "").strip()
+            point_rows: List[List[float]] = []
+            for raw_point in off_mat_points[idx] or []:
+                if not isinstance(raw_point, (list, tuple)) or len(raw_point) < 3:
+                    continue
+                try:
+                    point_rows.append(
+                        [
+                            round(-float(raw_point[0]) * float(WARNO_OFF_MAT_SCALE), 9),
+                            round(float(raw_point[1]) * float(WARNO_OFF_MAT_SCALE), 9),
+                            round(-float(raw_point[2]) * float(WARNO_OFF_MAT_SCALE), 9),
+                        ]
+                    )
+                except Exception:
+                    continue
+            block_rows: List[List[float]] = []
+            own_transform_candidates: List[RawNodeTransform] = []
+            for block_idx, raw_block in enumerate(off_mat_blocks[idx] or []):
+                if not isinstance(raw_block, (list, tuple)) or len(raw_block) < 12:
+                    continue
+                try:
+                    block_vals = [float(v) for v in raw_block[:12]]
+                except Exception:
+                    continue
+                block_rows.append(block_vals)
+                raw_matrix = _off_mat_block_matrix_rows(block_vals)
+                if raw_matrix is None:
+                    continue
+                blender_matrix = _off_mat_convert_matrix_rows(raw_matrix, "xyz:+1-1+1")
+                if blender_matrix is None:
+                    continue
+                decomp = _decompose_affine_matrix_rows(blender_matrix)
+                if decomp is None:
+                    continue
+                translation, rotation_basis, scale = decomp
+                own_transform_candidates.append(
+                    RawNodeTransform(
+                        source="own_block",
+                        block_index=int(block_idx),
+                        translation=[float(v) for v in translation],
+                        rotation_basis=[[float(v) for v in row] for row in rotation_basis],
+                        scale=[float(v) for v in scale],
+                        matrix_local=[[float(v) for v in row] for row in blender_matrix],
+                    )
+                )
+            records.append(
+                RawNodeRecord(
+                    index=int(idx),
+                    raw_name=raw_name,
+                    safe_name=_safe_name_text(raw_name),
+                    parent_index=int(parents[idx]) if idx < len(parents) else -1,
+                    off_mat_points=point_rows,
+                    off_mat_blocks=block_rows,
+                    own_transform_candidates=own_transform_candidates,
+                )
+            )
+
+        stream_start_index, stream_end_index = _off_mat_stream_section_bounds(node_count)
+        for source_idx in range(int(stream_start_index), int(stream_end_index)):
+            if source_idx < 0 or source_idx >= len(records):
+                continue
+            source_record = records[int(source_idx)]
+            for transform in source_record.own_transform_candidates:
+                target_idx = _off_mat_stream_target_index(int(source_idx), int(transform.block_index), node_count)
+                if target_idx < 0 or target_idx >= len(records):
+                    continue
+                records[int(target_idx)].stream_transform_candidates.append(
+                    RawNodeTransform(
+                        source="stream_local",
+                        block_index=int(transform.block_index),
+                        translation=list(transform.translation),
+                        rotation_basis=[list(row) for row in transform.rotation_basis],
+                        scale=list(transform.scale),
+                        matrix_local=[list(row) for row in transform.matrix_local],
+                    )
+                )
+
+        for record in records:
+            unique_stream = _pick_unique_transform_candidate(record.stream_transform_candidates)
+            if unique_stream is not None:
+                record.local_transform = unique_stream
+
+        world_matrix_by_index: Dict[int, List[List[float]]] = {}
+        deterministic_world_point_by_index: Dict[int, List[float]] = {}
+
+        for record in records:
+            if record.parent_index >= 0:
+                continue
+            if record.local_transform is not None:
+                world_matrix_by_index[int(record.index)] = [list(row) for row in record.local_transform.matrix_local]
+                deterministic_world_point_by_index[int(record.index)] = _mat4_translation(record.local_transform.matrix_local)
+                continue
+            if len(record.off_mat_points) == 1:
+                point = [float(v) for v in record.off_mat_points[0][:3]]
+                record.world_translation = list(point)
+                deterministic_world_point_by_index[int(record.index)] = list(point)
+                world_matrix_by_index[int(record.index)] = _compose_affine_matrix_rows(
+                    point,
+                    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                    [1.0, 1.0, 1.0],
+                )
+            else:
+                record.deterministic_miss = record.deterministic_miss or "missing_root_world"
+
+        changed = True
+        for _ in range(max(1, len(records) + 1)):
+            if not changed:
+                break
+            changed = False
+            for record in records:
+                idx = int(record.index)
+                if idx in world_matrix_by_index:
+                    continue
+                parent_idx = int(record.parent_index)
+                parent_world = world_matrix_by_index.get(parent_idx)
+                if parent_world is None:
+                    continue
+                if record.local_transform is not None:
+                    world_matrix = _mat4_mul(parent_world, record.local_transform.matrix_local)
+                    world_matrix_by_index[idx] = world_matrix
+                    deterministic_world_point_by_index[idx] = _mat4_translation(world_matrix)
+                    changed = True
+                    continue
+                if record.own_transform_candidates:
+                    local_candidate = record.own_transform_candidates[0]
+                    record.local_transform = RawNodeTransform(
+                        source="own_block_local_fallback",
+                        block_index=int(local_candidate.block_index),
+                        translation=[float(v) for v in local_candidate.translation],
+                        rotation_basis=[[float(v) for v in row] for row in local_candidate.rotation_basis],
+                        scale=[float(v) for v in local_candidate.scale],
+                        matrix_local=[[float(v) for v in row] for row in local_candidate.matrix_local],
+                    )
+                    world_matrix = _mat4_mul(parent_world, record.local_transform.matrix_local)
+                    world_matrix_by_index[idx] = world_matrix
+                    deterministic_world_point_by_index[idx] = _mat4_translation(world_matrix)
+                    changed = True
+                    continue
+                if len(record.off_mat_points) == 1:
+                    child_world = _compose_affine_matrix_rows(
+                        record.off_mat_points[0],
+                        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                        [1.0, 1.0, 1.0],
+                    )
+                    parent_world_inv = _mat4_inverse_affine(parent_world)
+                    if parent_world_inv is None:
+                        record.deterministic_miss = record.deterministic_miss or "parent_inverse_failed"
+                        continue
+                    local_matrix = _mat4_mul(parent_world_inv, child_world)
+                    decomp = _decompose_affine_matrix_rows(local_matrix)
+                    if decomp is None:
+                        record.deterministic_miss = record.deterministic_miss or "local_decompose_failed"
+                        continue
+                    translation, rotation_basis, scale = decomp
+                    record.local_transform = RawNodeTransform(
+                        source="single_world_point",
+                        block_index=0,
+                        translation=[float(v) for v in translation],
+                        rotation_basis=[[float(v) for v in row] for row in rotation_basis],
+                        scale=[float(v) for v in scale],
+                        matrix_local=[[float(v) for v in row] for row in local_matrix],
+                        world_translation=[float(v) for v in record.off_mat_points[0][:3]],
+                    )
+                    world_matrix_by_index[idx] = child_world
+                    deterministic_world_point_by_index[idx] = [float(v) for v in record.off_mat_points[0][:3]]
+                    changed = True
+
+        for record in records:
+            idx = int(record.index)
+            world_point = deterministic_world_point_by_index.get(idx)
+            if world_point is not None:
+                record.world_translation = [float(v) for v in world_point[:3]]
+                if record.local_transform is not None and record.local_transform.world_translation is None:
+                    record.local_transform.world_translation = [float(v) for v in world_point[:3]]
+            elif not record.deterministic_miss:
+                if record.local_transform is None:
+                    record.deterministic_miss = "missing_local_transform"
+                else:
+                    record.deterministic_miss = "missing_world_transform"
+
+        return RawSceneGraph(
+            node_index=int(node_index),
+            node_count=int(node_count),
+            stream_start_index=int(stream_start_index),
+            stream_end_index=int(stream_end_index),
+            records=records,
+        )
 
     def find_node_names_for_asset(self, asset_path: str) -> List[str]:
         hit = self.find_best_fat_entry_for_asset(asset_path)
@@ -5539,6 +7884,7 @@ class ZZDatResolver:
 
 _ZZ_RESOLVER_CACHE: Dict[Tuple[Tuple[str, int, int], ...], ZZDatResolver] = {}
 _ATLAS_JSON_CACHE: Dict[Tuple[str, str, int, int, str], Dict[str, Any]] = {}
+_GFX_JSON_CACHE: Dict[Tuple[str, str, int, int, str], Dict[str, Any]] = {}
 
 
 def get_zz_runtime_resolver(warno_root: Path) -> ZZDatResolver:
@@ -5562,6 +7908,10 @@ def get_zz_runtime_resolver(warno_root: Path) -> ZZDatResolver:
 
 def clear_atlas_json_cache() -> None:
     _ATLAS_JSON_CACHE.clear()
+
+
+def clear_gfx_json_cache() -> None:
+    _GFX_JSON_CACHE.clear()
 
 
 def _normalize_logical_ref(path: str) -> str:
@@ -5713,6 +8063,16 @@ def _resolve_atlas_wrapper(wrapper_path: Path) -> Path:
     return p
 
 
+def _resolve_gfx_wrapper(wrapper_path: Path) -> Path:
+    p = Path(wrapper_path)
+    if p.exists() and p.is_file():
+        return p
+    alt = Path(__file__).with_name("modding_suite_gfx_export.py")
+    if alt.exists() and alt.is_file():
+        return alt
+    return p
+
+
 def build_or_load_atlas_texture_map(
     warno_root: Path,
     modding_suite_root: Path,
@@ -5819,6 +8179,135 @@ def build_or_load_atlas_texture_map(
     }
     _ATLAS_JSON_CACHE.clear()
     _ATLAS_JSON_CACHE[cache_key] = dict(result)
+    return dict(result)
+
+
+def build_or_load_gfx_manifest(
+    warno_root: Path,
+    modding_suite_root: Path,
+    asset_path: str,
+    cache_dir: Path,
+    wrapper_path: Path,
+    gfx_cli_path: Path | None = None,
+    force_rebuild: bool = False,
+    timeout_sec: int = 180,
+) -> Dict[str, Any]:
+    asset_norm = normalize_asset_path(str(asset_path or "")).strip()
+    if not asset_norm:
+        raise RuntimeError("GFX manifest build failed: empty asset path")
+
+    cache_root = Path(cache_dir)
+    cache_root.mkdir(parents=True, exist_ok=True)
+    rel = Path(*PurePosixPath(asset_norm).parts).with_suffix(".gfx_manifest.json")
+    out_json = cache_root / rel
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+
+    wrapper = _resolve_gfx_wrapper(wrapper_path)
+    if not wrapper.exists() or not wrapper.is_file():
+        raise RuntimeError(f"GFX manifest wrapper not found: {wrapper}")
+
+    need_export = force_rebuild or not out_json.exists()
+    if need_export:
+        temp_out = out_json.with_suffix(".tmp.json")
+        cmd_tail = [
+            str(wrapper),
+            "--warno-root",
+            str(warno_root),
+            "--modding-suite-root",
+            str(modding_suite_root),
+            "--asset-path",
+            asset_norm,
+            "--out-json",
+            str(temp_out),
+            "--cache-dir",
+            str(cache_root),
+            "--timeout-sec",
+            str(max(5, int(timeout_sec))),
+        ]
+        if gfx_cli_path is not None and str(gfx_cli_path).strip():
+            cmd_tail.extend(["--gfx-cli", str(gfx_cli_path)])
+        errors: List[str] = []
+        for py_cmd in _python_cmd_candidates_for_wrapper():
+            cmd = [*py_cmd, *cmd_tail]
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=max(10, int(timeout_sec) + 10),
+                )
+            except subprocess.TimeoutExpired:
+                errors.append(f"[{' '.join(py_cmd)}] timeout>{int(timeout_sec) + 10}s")
+                continue
+            if proc.returncode == 0 and temp_out.exists():
+                temp_out.replace(out_json)
+                errors = []
+                break
+            msg = (proc.stderr or proc.stdout or "").strip()
+            errors.append(f"[{' '.join(py_cmd)}] rc={proc.returncode}: {msg}")
+        if errors:
+            raise RuntimeError("GFX manifest export failed: " + " | ".join(errors[:2]))
+
+    sig = _atlas_map_signature(out_json)
+    try:
+        data = json.loads(out_json.read_text(encoding="utf-8-sig"))
+    except Exception as exc:
+        raise RuntimeError(f"GFX manifest parse failed: {out_json}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"GFX manifest has invalid root object: {out_json}")
+    schema_version = int(data.get("schema_version", 0) or 0)
+    if schema_version not in {1, 2}:
+        raise RuntimeError(
+            f"GFX manifest schema mismatch: expected schema_version in {{1,2}}, got {data.get('schema_version')}"
+        )
+    for req_key in (
+        "asset_path",
+        "source_files",
+        "matched_units",
+        "reference_meshes",
+        "operators",
+        "turrets",
+        "weapon_fx_anchors",
+        "subdepictions",
+        "track_kind",
+    ):
+        if req_key not in data:
+            raise RuntimeError(f"GFX manifest schema mismatch: missing {req_key}")
+    if schema_version >= 2:
+        if "semantic_nodes" not in data:
+            raise RuntimeError("GFX manifest schema mismatch: missing semantic_nodes")
+        if "transform_debug" not in data:
+            raise RuntimeError("GFX manifest schema mismatch: missing transform_debug")
+
+    cli_version = str(data.get("cli_version", "") or "").strip() or "unknown"
+    cache_key = (asset_norm.lower(), sig[0], sig[1], sig[2], cli_version)
+    cached = _GFX_JSON_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+
+    result = {
+        "asset_path": asset_norm,
+        "gfx_manifest_path": str(out_json),
+        "gfx_manifest": data,
+        "gfx_cli_version": cli_version,
+        "gfx_signature": {
+            "path": sig[0],
+            "mtime_ns": int(sig[1]),
+            "size": int(sig[2]),
+        },
+        "source_files": list(data.get("source_files", []) or []),
+        "matched_units": list(data.get("matched_units", []) or []),
+        "reference_meshes": list(data.get("reference_meshes", []) or []),
+        "operators": list(data.get("operators", []) or []),
+        "turrets": list(data.get("turrets", []) or []),
+        "weapon_fx_anchors": list(data.get("weapon_fx_anchors", []) or []),
+        "subdepictions": list(data.get("subdepictions", []) or []),
+        "track_kind": str(data.get("track_kind", "") or ""),
+        "semantic_nodes": list(data.get("semantic_nodes", []) or []),
+        "transform_debug": list(data.get("transform_debug", []) or []),
+    }
+    _GFX_JSON_CACHE.clear()
+    _GFX_JSON_CACHE[cache_key] = dict(result)
     return dict(result)
 
 
