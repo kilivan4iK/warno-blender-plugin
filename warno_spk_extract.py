@@ -8317,18 +8317,28 @@ def prepare_runtime_sources_from_zz(warno_root: Path, runtime_root: Path) -> Dic
     runtime.mkdir(parents=True, exist_ok=True)
     resolver = get_zz_runtime_resolver(root)
 
-    all_pack_spk_hits = resolver.find_all_by_suffix(
-        suffixes=[".spk"],
-        must_contain=["pc/mesh/pack/"],
-    )
-    if not all_pack_spk_hits:
-        # Fallback for package variants where path tokens differ.
-        all_pack_spk_hits = resolver.find_all_by_suffix(
+    # WARNO DLC delta packs (v188908+) renamed the dictionary entry from the
+    # legacy "PC/Mesh/Pack/Base.spk" to a short "MeshPack/Base.spk", which our
+    # old strict prefix filter dropped silently. We accept both formats by
+    # matching any dictionary path that contains both "mesh" and "pack" tokens
+    # and ends with ".spk", and we de-duplicate by raw path so legacy and DLC
+    # variants of the same SPK both get extracted side-by-side.
+    seen_paths: set[str] = set()
+    all_pack_spk_hits: List[Dict[str, Any]] = []
+    for must in (["pc/mesh/pack/"], ["meshpack/"], ["mesh", "pack"]):
+        for hit in resolver.find_all_by_suffix(
             suffixes=[".spk"],
-            must_contain=["mesh", "pack"],
-        )
+            must_contain=must,
+        ):
+            key = str(hit.get("path", "")).strip().lower()
+            if not key or key in seen_paths:
+                continue
+            seen_paths.add(key)
+            all_pack_spk_hits.append(hit)
     if not all_pack_spk_hits:
-        raise FileNotFoundError("No SPK files were found under pc/mesh/pack in WARNO ZZ.dat")
+        raise FileNotFoundError(
+            "No SPK files were found under pc/mesh/pack/ or meshpack/ in WARNO ZZ.dat"
+        )
 
     extracted_spk_paths: List[Path] = []
     for hit in all_pack_spk_hits:
