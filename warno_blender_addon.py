@@ -27,6 +27,7 @@ import bmesh
 import bpy
 from bpy.app.handlers import persistent
 from bpy.props import BoolProperty
+from bpy.props import CollectionProperty
 from bpy.props import EnumProperty
 from bpy.props import FloatProperty
 from bpy.props import IntProperty
@@ -35,6 +36,7 @@ from bpy.props import StringProperty
 from bpy.types import Operator
 from bpy.types import Panel
 from bpy.types import PropertyGroup
+from bpy.types import UIList
 from mathutils import Matrix
 from mathutils import Vector
 
@@ -2325,6 +2327,240 @@ def _update_selected_asset_lod(self: "WARNOImporterSettings", _context):
         self.asset_sync_lock = False
 
 
+# =====================================================================
+# Tree-view Asset Browser
+# =====================================================================
+# A flat-list UIList that visually renders the asset folder tree from
+# mesh_assets_index.v2.json with expand/collapse, depth-based indent,
+# folder counters and a live search filter. Replaces the legacy 5-dropdown
+# WARNO_OT_PickAssetBrowser (kept registered for backward compatibility).
+
+
+class WARNOBrowserNode(PropertyGroup):
+    """One row in the tree-view UIList. The full tree is materialised as a
+    flat collection so Blender's UIList virtual rendering can scroll it
+    efficiently even for 7000+ entries."""
+    display_name: StringProperty()
+    path_key: StringProperty()
+    is_folder: BoolProperty()
+    is_model: BoolProperty()
+    is_lod: BoolProperty()
+    is_expanded: BoolProperty()
+    depth: IntProperty(default=0)
+    parent_key: StringProperty()
+    model_primary: StringProperty()
+    lod_variant: StringProperty()
+    asset_count: IntProperty(default=0)
+
+
+def _browser_count_models(node: Dict[str, Any]) -> int:
+    """Recursively count model entries under a folder_tree node."""
+    if not isinstance(node, dict):
+        return 0
+    count = 0
+    models = node.get("models", [])
+    if isinstance(models, list):
+        count += len(models)
+    children = node.get("children", [])
+    if isinstance(children, list):
+        for ch in children:
+            count += _browser_count_models(ch)
+    return count
+
+
+def _browser_node_matches_search(node: Dict[str, Any], search_low: str) -> bool:
+    """True if this node, any of its descendants, or any of its model
+    primaries contains the lowercased search token."""
+    if not search_low:
+        return True
+    if not isinstance(node, dict):
+        return False
+    name_low = str(node.get("name", "")).lower()
+    key_low = str(node.get("key", "")).lower()
+    if search_low in name_low or search_low in key_low:
+        return True
+    models = node.get("models", [])
+    if isinstance(models, list):
+        for m in models:
+            if not isinstance(m, dict):
+                continue
+            if search_low in str(m.get("primary", "")).lower():
+                return True
+            for lod in m.get("lods", []) or []:
+                if search_low in str(lod).lower():
+                    return True
+    children = node.get("children", [])
+    if isinstance(children, list):
+        for ch in children:
+            if _browser_node_matches_search(ch, search_low):
+                return True
+    return False
+
+
+def _browser_serialize_expanded(settings) -> set[str]:
+    raw = str(getattr(settings, "browser_expanded_keys", "") or "[]")
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return {str(s) for s in data if isinstance(s, str)}
+    except Exception:
+        pass
+    return set()
+
+
+def _browser_save_expanded(settings, expanded: set[str]) -> None:
+    try:
+        settings.browser_expanded_keys = json.dumps(sorted(expanded))
+    except Exception:
+        pass
+
+
+def _browser_flatten_tree(
+    tree: Sequence[Dict[str, Any]],
+    expanded: set[str],
+    search_low: str,
+    show_lods: bool,
+) -> List[Dict[str, Any]]:
+    """Linearise the recursive folder_tree into a flat list of dicts ready to
+    populate the CollectionProperty. When `search_low` is non-empty, branches
+    that have no descendant match are pruned and matching branches are
+    auto-expanded so results are immediately visible."""
+    out: List[Dict[str, Any]] = []
+    auto_expand = bool(search_low)
+
+    def _node_model_matches(model_primary: str, lods: Sequence[str]) -> bool:
+        if not search_low:
+            return True
+        if search_low in model_primary.lower():
+            return True
+        for lod in lods:
+            if search_low in str(lod).lower():
+                return True
+        return False
+
+    def visit(node: Dict[str, Any], depth: int, parent_key: str) -> None:
+        if not isinstance(node, dict):
+            return
+        if search_low and not _browser_node_matches_search(node, search_low):
+            return
+        path_key = str(node.get("key", "")).strip()
+        name = str(node.get("name", "")).strip() or path_key.rsplit("/", 1)[-1]
+        is_expanded = auto_expand or (path_key in expanded)
+        children = node.get("children", []) if isinstance(node.get("children", []), list) else []
+        models = node.get("models", []) if isinstance(node.get("models", []), list) else []
+        out.append({
+            "display_name": name,
+            "path_key": path_key,
+            "is_folder": True,
+            "is_model": False,
+            "is_lod": False,
+            "is_expanded": is_expanded,
+            "depth": depth,
+            "parent_key": parent_key,
+            "model_primary": "",
+            "lod_variant": "",
+            "asset_count": _browser_count_models(node),
+        })
+        if not is_expanded:
+            return
+        for ch in children:
+            visit(ch, depth + 1, path_key)
+        for m in models:
+            if not isinstance(m, dict):
+                continue
+            primary = str(m.get("primary", "")).strip()
+            if not primary:
+                continue
+            lods = [str(v).strip() for v in m.get("lods", []) if str(v).strip()]
+            if not _node_model_matches(primary, lods):
+                continue
+            label = primary.rsplit("/", 1)[-1]
+            if label.lower().endswith(".fbx"):
+                label = label[:-4]
+            out.append({
+                "display_name": label,
+                "path_key": primary,
+                "is_folder": False,
+                "is_model": True,
+                "is_lod": False,
+                "is_expanded": False,
+                "depth": depth + 1,
+                "parent_key": path_key,
+                "model_primary": primary,
+                "lod_variant": "",
+                "asset_count": len(lods) + 1,
+            })
+            if show_lods and lods:
+                for lod in lods:
+                    lod_label = lod.rsplit("/", 1)[-1]
+                    if lod_label.lower().endswith(".fbx"):
+                        lod_label = lod_label[:-4]
+                    out.append({
+                        "display_name": lod_label,
+                        "path_key": lod,
+                        "is_folder": False,
+                        "is_model": False,
+                        "is_lod": True,
+                        "is_expanded": False,
+                        "depth": depth + 2,
+                        "parent_key": primary,
+                        "model_primary": primary,
+                        "lod_variant": lod,
+                        "asset_count": 0,
+                    })
+
+    for root in tree or []:
+        visit(root, 0, "")
+    return out
+
+
+def _browser_populate_nodes(settings, index_data: Dict[str, Any]) -> None:
+    """Refresh `settings.browser_nodes` from the cached folder_tree payload."""
+    tree = []
+    if isinstance(index_data, dict):
+        tree_raw = index_data.get("folder_tree", [])
+        if isinstance(tree_raw, list):
+            tree = tree_raw
+    expanded = _browser_serialize_expanded(settings)
+    search = str(getattr(settings, "browser_search", "") or "").strip().lower()
+    show_lods = bool(getattr(settings, "browser_show_lods", True))
+    flat = _browser_flatten_tree(tree, expanded, search, show_lods)
+    nodes = settings.browser_nodes
+    nodes.clear()
+    for item in flat:
+        n = nodes.add()
+        for key, value in item.items():
+            try:
+                setattr(n, key, value)
+            except Exception:
+                pass
+    n_total = len(nodes)
+    if settings.browser_active_index >= n_total:
+        settings.browser_active_index = max(0, n_total - 1)
+
+
+def _browser_refresh_from_settings(settings) -> None:
+    """Try to refresh browser_nodes from the on-disk asset index without
+    triggering a full rescan; safe no-op when nothing is cached yet."""
+    try:
+        index_path = _asset_index_path(settings)
+        cached = _load_asset_index_file(index_path)
+        if cached is None:
+            return
+        _browser_populate_nodes(settings, cached)
+    except Exception:
+        pass
+
+
+def _browser_update_search(self, _context):
+    """PropertyUpdate callback: re-flatten tree on every keystroke."""
+    _browser_refresh_from_settings(self)
+
+
+def _browser_update_show_lods(self, _context):
+    _browser_refresh_from_settings(self)
+
+
 class WARNOImporterSettings(PropertyGroup):
     project_root: StringProperty(
         name="Project Root",
@@ -2450,6 +2686,27 @@ class WARNOImporterSettings(PropertyGroup):
     asset_group_cache_json: StringProperty(default="[]", options={"HIDDEN"})
     asset_folder_cache_json: StringProperty(default="[]", options={"HIDDEN"})
     asset_sync_lock: BoolProperty(default=False, options={"HIDDEN"})
+
+    # ---- Tree-view Asset Browser state (persisted per-scene) ----
+    browser_nodes: CollectionProperty(type=WARNOBrowserNode, options={"HIDDEN"})
+    browser_active_index: IntProperty(default=0, options={"HIDDEN"})
+    browser_expanded_keys: StringProperty(
+        default="[]",
+        options={"HIDDEN"},
+        description="JSON list of folder path_keys currently expanded in the tree browser",
+    )
+    browser_search: StringProperty(
+        name="Search",
+        default="",
+        description="Filter the asset tree by name (case-insensitive). Auto-expands matching branches.",
+        update=_browser_update_search,
+    )
+    browser_show_lods: BoolProperty(
+        name="Show LODs",
+        default=False,
+        description="Show LOW/MID LOD variants under each model in the tree",
+        update=_browser_update_show_lods,
+    )
     selected_asset: StringProperty(
         name="Asset",
         description="Asset path to import",
@@ -4008,6 +4265,83 @@ def _collect_zz_candidates_for_ref(zz_resolver, ref: str) -> List[str]:
     return list(dict.fromkeys(out))
 
 
+def _filter_atlas_targets_by_materials(
+    atlas_map_index: Dict[str, List[Dict[str, Any]]] | None,
+    material_name_by_id: Dict[int, str] | None,
+    asset_hint: str = "",
+) -> List[str] | None:
+    """For composite assets (typically WARNO DECORS like HLM_10_L.fbx) the
+    atlas JSON aggregates textures from many sibling FBX (e.g. 11 building
+    blocks for one HLM building), so the legacy 'union all atlas targets'
+    behavior of _resolve_material_maps explodes 5 real refs into 45.
+
+    This helper returns the subset of atlas target refs whose owning
+    texture entry's source_asset_path matches one of the SPK material
+    names by stem. Returns None when no filtering signal is available
+    (caller falls back to the legacy 'use everything' behavior so we
+    never accidentally regress UNITS where SPK already provides full refs).
+    """
+    if not atlas_map_index or not material_name_by_id:
+        return None
+
+    wanted_stems: set[str] = set()
+    for mat_name in material_name_by_id.values():
+        s = str(mat_name or "").strip().lower()
+        if not s:
+            continue
+        # Strip our per-asset namespace prefix if present
+        s = _warno_strip_namespace(s)
+        # Strip in-import dedup suffix '_2' / '_3'
+        s = re.sub(r"_\d+$", "", s)
+        if s:
+            wanted_stems.add(s)
+    if not wanted_stems:
+        return None
+
+    # Also keep the asset's own stem as a wanted token so its primary
+    # texture set is never filtered out even when SPK material name
+    # doesn't reflect it (rare path).
+    asset_stem = _warno_asset_namespace(asset_hint).lower()
+    if asset_stem:
+        wanted_stems.add(asset_stem)
+
+    seen_entries: set[int] = set()
+    relevant_targets: List[str] = []
+    target_seen: set[str] = set()
+    matched_any = False
+    for entries_list in atlas_map_index.values():
+        for entry in entries_list:
+            eid = id(entry)
+            if eid in seen_entries:
+                continue
+            seen_entries.add(eid)
+            src = str(entry.get("source_asset_path", "")).strip()
+            if not src:
+                # Older atlas exports without source_asset_path; can't filter.
+                return None
+            stem = src.rsplit("/", 1)[-1]
+            if "." in stem:
+                stem = stem.rsplit(".", 1)[0]
+            stem_low = stem.lower()
+            matched = any(
+                w == stem_low or w in stem_low or stem_low in w
+                for w in wanted_stems
+            )
+            if not matched:
+                continue
+            matched_any = True
+            tgt = str(entry.get("target_logical_rel", "")).strip()
+            if tgt and tgt not in target_seen:
+                target_seen.add(tgt)
+                relevant_targets.append(tgt)
+
+    if not matched_any:
+        # No SPK material maps to any atlas source. Fall back to legacy
+        # behavior so a corner case can't silently leave the asset bare.
+        return None
+    return relevant_targets
+
+
 def _resolve_material_maps(
     extractor_mod,
     spk,
@@ -4191,13 +4525,34 @@ def _resolve_material_maps(
                 stage="texture",
             )
         if atlas_map_targets:
+            # WARNO DECORS atlases pack textures for many sibling FBX into one
+            # composite atlas. Without filtering, strict mode would extract all
+            # of them (e.g. 45 PNG for HLM_10_L.fbx where only ~5 are actually
+            # referenced by the imported geometry). Try to narrow the target
+            # list to those whose source FBX matches an SPK material name; on
+            # any uncertainty fall back to the full target list so we never
+            # accidentally drop required textures for a regular UNIT asset.
+            filtered_targets = _filter_atlas_targets_by_materials(
+                atlas_map_index=atlas_map_index,
+                material_name_by_id=material_name_by_id,
+                asset_hint=asset,
+            )
+            targets_to_use = (
+                filtered_targets
+                if filtered_targets is not None and filtered_targets
+                else atlas_map_targets
+            )
             refs_before = len(refs)
-            refs = extractor_mod.unique_keep_order([*refs, *atlas_map_targets]) if hasattr(extractor_mod, "unique_keep_order") else list(dict.fromkeys([*refs, *atlas_map_targets]))
+            refs = extractor_mod.unique_keep_order([*refs, *targets_to_use]) if hasattr(extractor_mod, "unique_keep_order") else list(dict.fromkeys([*refs, *targets_to_use]))
             refs_added = len(refs) - refs_before
             if refs_added > 0:
+                if filtered_targets is not None and len(filtered_targets) < len(atlas_map_targets):
+                    note = f" (filtered {len(atlas_map_targets)} -> {len(filtered_targets)} by material match)"
+                else:
+                    note = ""
                 _warno_log(
                     settings,
-                    f"strict atlas refs extended from atlas targets: +{refs_added}",
+                    f"strict atlas refs extended from atlas targets: +{refs_added}{note}",
                     stage="refs_resolve",
                 )
     if atlas_json_enabled and not refs:
@@ -6716,20 +7071,198 @@ def _is_aircraft_control_surface_name(raw_name: str) -> bool:
     return low == "rudder" or low.startswith("aileron_") or low.startswith("elevator_")
 
 
-def _ensure_window_material_name(obj: bpy.types.Object) -> bool:
+# ===== Per-asset Blender datablock namespacing =====
+# Different WARNO units historically reused the same Blender material name
+# (e.g. "Vitre" for any glass, "Mi_24V" for the body). Blender's data API
+# resolves identical names to the same datablock, which caused freshly
+# imported units to silently inherit textures/nodes from a previously
+# imported (and possibly already-deleted) unit. We avoid that by prefixing
+# every material with a sanitized asset namespace so each unit owns its
+# own copy of "Vitre", "Mi_24V" etc.
+_WARNO_MATERIAL_NS_SEP = "__"
+
+# Material names that the WARNO asset cooker requires verbatim — namespacing
+# them with our '<asset>__' prefix breaks the in-game export. These materials
+# are always created with their raw name globally; latest import wins for
+# the node-tree contents (acceptable trade-off documented to the user).
+_WARNO_RESERVED_MATERIAL_NAMES: set[str] = {"vitre"}
+
+
+def _warno_asset_namespace(asset_hint: str) -> str:
+    """Derive a sanitized per-asset namespace string from an asset path,
+    e.g. 'Assets/3D/Units/US/Vehicule/M1038_Humvee/M1038_Humvee.fbx'
+    -> 'M1038_Humvee'. Returns '' when the hint is empty so callers can
+    fall back to the legacy unnamespaced behavior."""
+    raw = str(asset_hint or "").strip().replace("\\", "/")
+    if not raw:
+        return ""
+    stem = raw.rsplit("/", 1)[-1]
+    if "." in stem:
+        stem = stem.rsplit(".", 1)[0]
+    cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", stem).strip("_")
+    return cleaned
+
+
+def _warno_namespaced_material_name(namespace: str, raw_name: str) -> str:
+    """Combine an asset namespace with a raw material name, e.g.
+    ('M1038_Humvee', 'Vitre') -> 'M1038_Humvee__Vitre'.
+
+    Special cases (no namespace prefix is added):
+      - raw is already prefixed with our namespace separator (idempotent).
+      - raw equals the asset namespace itself (would dup the stem,
+        e.g. 'Infanterie_Test__Infanterie_Test').
+
+    WARNO-reserved names like 'Vitre' DO get the namespace at this stage —
+    the post-import pass `_warno_finalize_reserved_material_names` then
+    renames the populated material back to 'Vitre' once its node-tree
+    holds the right asset's textures. This avoids accidental texture
+    sharing while still complying with the cooker's name requirement.
+
+    Returns raw_name unchanged when namespace is empty.
+    """
+    raw = str(raw_name or "").strip() or "Material"
+    ns = str(namespace or "").strip()
+    if not ns:
+        return raw
+    if raw.startswith(ns + _WARNO_MATERIAL_NS_SEP):
+        return raw
+    if raw.lower() == ns.lower():
+        return raw
+    return f"{ns}{_WARNO_MATERIAL_NS_SEP}{raw}"
+
+
+def _warno_finalize_reserved_material_names(asset_hint: str) -> int:
+    """Post-import pass: rename namespaced reserved materials (e.g.
+    'M1038_Humvee__Vitre') back to their canonical name ('Vitre') so the
+    WARNO asset cooker accepts the exported FBX.
+
+    Existing global material with the canonical name (left over from a
+    previously-imported unit) is "parked" under '<old_asset>__<canonical>'
+    so its references on already-placed objects stay intact and that
+    material's node-tree (with the OTHER unit's textures) is preserved.
+
+    Returns the number of materials successfully renamed.
+    """
+    namespace = _warno_asset_namespace(asset_hint)
+    if not namespace:
+        return 0
+    sep = _WARNO_MATERIAL_NS_SEP
+    renamed = 0
+    for reserved_low in _WARNO_RESERVED_MATERIAL_NAMES:
+        cap = reserved_low.capitalize() if reserved_low else ""
+        candidates_for_new = [
+            f"{namespace}{sep}{cap}",
+            f"{namespace}{sep}{reserved_low}",
+            f"{namespace}{sep}{reserved_low.upper()}",
+        ]
+        new_mat = None
+        for cand in candidates_for_new:
+            new_mat = bpy.data.materials.get(cand)
+            if new_mat is not None:
+                break
+        if new_mat is None:
+            continue
+
+        canonical_name = cap or reserved_low
+        existing = bpy.data.materials.get(canonical_name)
+        if existing is not None and existing is not new_mat:
+            old_asset = str(existing.get("warno_asset", "") or "").strip() or "previous"
+            parked_base = f"{old_asset}{sep}{canonical_name}"
+            parked_name = parked_base
+            counter = 1
+            while bpy.data.materials.get(parked_name) is not None and counter < 1000:
+                parked_name = f"{parked_base}_{counter}"
+                counter += 1
+            try:
+                existing.name = parked_name
+            except Exception:
+                continue
+
+        try:
+            new_mat.name = canonical_name
+            new_mat["warno_asset"] = namespace
+            renamed += 1
+        except Exception:
+            continue
+    return renamed
+
+
+def _warno_strip_namespace(name: str) -> str:
+    """Reverse of _warno_namespaced_material_name: if the given Blender
+    datablock name carries the asset-namespace prefix (e.g. 'M1038_Humvee__Vitre'),
+    return the raw part after the separator ('Vitre'). Otherwise return the
+    name unchanged. Used by Apply/Reapply Textures to match against the
+    raw material-name keys produced by _build_material_name_map."""
+    raw = str(name or "")
+    if not raw:
+        return ""
+    sep = _WARNO_MATERIAL_NS_SEP
+    idx = raw.find(sep)
+    if idx > 0:
+        return raw[idx + len(sep):]
+    return raw
+
+
+def _warno_purge_orphan_datablocks() -> Dict[str, int]:
+    """Purge orphan materials/images/meshes/node_groups (users == 0 and no
+    fake user) from bpy.data BEFORE a new import so that a stale 'Vitre'
+    or 'Mi_24V' material left over from a previously deleted unit cannot
+    be re-bound by name to the new one. Idempotent."""
+    purged = {"materials": 0, "images": 0, "meshes": 0, "node_groups": 0}
+    try:
+        for m in list(bpy.data.materials):
+            try:
+                if m.users == 0 and not m.use_fake_user:
+                    bpy.data.materials.remove(m, do_unlink=True)
+                    purged["materials"] += 1
+            except Exception:
+                continue
+        for img in list(bpy.data.images):
+            try:
+                if img.users == 0 and not img.use_fake_user:
+                    bpy.data.images.remove(img, do_unlink=True)
+                    purged["images"] += 1
+            except Exception:
+                continue
+        for me in list(bpy.data.meshes):
+            try:
+                if me.users == 0 and not me.use_fake_user:
+                    bpy.data.meshes.remove(me, do_unlink=True)
+                    purged["meshes"] += 1
+            except Exception:
+                continue
+        for ng in list(bpy.data.node_groups):
+            try:
+                if ng.users == 0 and not ng.use_fake_user:
+                    bpy.data.node_groups.remove(ng, do_unlink=True)
+                    purged["node_groups"] += 1
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return purged
+
+
+def _ensure_window_material_name(obj: bpy.types.Object, asset_hint: str = "") -> bool:
     if obj is None or obj.type != "MESH":
         return False
     if _norm_low(getattr(obj, "name", "")) != "window":
         return False
+    namespace = _warno_asset_namespace(asset_hint)
+    target_name = _warno_namespaced_material_name(namespace, "Vitre")
     slots = list(getattr(obj, "material_slots", []) or [])
     src = getattr(slots[0], "material", None) if slots else None
-    target = bpy.data.materials.get("Vitre")
+    # Look up by the namespaced name so that distinct units never collide on
+    # a shared "Vitre" datablock. If a legacy un-namespaced "Vitre" exists in
+    # the .blend, leave it untouched — orphan_purge at the next import start
+    # will remove it once nothing references it.
+    target = bpy.data.materials.get(target_name)
     if target is None:
         if src is not None:
             target = src.copy()
-            target.name = "Vitre"
+            target.name = target_name
         else:
-            target = bpy.data.materials.new(name="Vitre")
+            target = bpy.data.materials.new(name=target_name)
     if src is None:
         try:
             target.use_nodes = True
@@ -11863,6 +12396,17 @@ def _build_helper_armature(
                 and _is_aircraft_control_surface_name(raw_name)
             ):
                 local_rotation_basis = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+            # Wheel meshes (Roue_D*, Roue_G*, but NOT Roue_Elev_* helpers) are
+            # already oriented horizontally in Eugen's source FBX — DEV blend
+            # for Leopard_1A1 confirms rotation_euler is (0,0,0). On some tanks
+            # (e.g. Leopard_2A1) SPK off_mat carries a non-identity basis that
+            # we then double-apply, rotating the cylinder onto its side.
+            # Force identity for wheel mesh nodes so the DEV behaviour matches
+            # universally without affecting tanks that already worked.
+            if node.type == "MESH":
+                _raw_low = _norm_low(raw_name)
+                if _raw_low.startswith("roue_") and not _raw_low.startswith("roue_elev_"):
+                    local_rotation_basis = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
             local_matrix = _compose_affine_components(
                 transform_row.get("local_translation", [0.0, 0.0, 0.0]),
                 local_rotation_basis,
@@ -12640,6 +13184,349 @@ class WARNO_OT_PickAssetPopup(Operator):
         return {"FINISHED"}
 
 
+# =====================================================================
+# Tree-view Asset Browser — UIList + operators
+# =====================================================================
+
+
+class WARNO_UL_AssetBrowser(UIList):
+    """UIList renderer for the flat-list materialised tree.
+
+    Each row draws:
+      - a depth-based indent
+      - either a folder triangle (▶/▼) that toggles expansion, or a
+        leaf icon (model / LOD)
+      - the display name with a counter for folders
+    """
+
+    bl_idname = "WARNO_UL_asset_browser"
+
+    def draw_item(
+        self,
+        context,
+        layout,
+        data,
+        item,
+        icon,
+        active_data,
+        active_propname,
+        index,
+    ):
+        row = layout.row(align=True)
+        # Depth-based indent. Two BLANK1 icons per level give a reasonably
+        # tight tree while still being visually clear.
+        for _ in range(int(item.depth)):
+            row.label(text="", icon="BLANK1")
+
+        if item.is_folder:
+            tri_icon = "DOWNARROW_HLT" if item.is_expanded else "RIGHTARROW"
+            op = row.operator(
+                "warno.browser_toggle_folder",
+                text="",
+                icon=tri_icon,
+                emboss=False,
+            )
+            op.path_key = item.path_key
+            row.label(text=item.display_name, icon="FILE_FOLDER")
+            if item.asset_count > 0:
+                row.label(text=f"({item.asset_count})")
+        elif item.is_lod:
+            row.label(text="", icon="BLANK1")
+            pick_op = row.operator(
+                "warno.browser_pick_model",
+                text=item.display_name,
+                icon="MOD_DECIM",
+                emboss=False,
+            )
+            pick_op.model_primary = item.model_primary
+            pick_op.lod_variant = item.lod_variant
+            pick_op.row_index = index
+        else:  # model
+            row.label(text="", icon="BLANK1")
+            pick_op = row.operator(
+                "warno.browser_pick_model",
+                text=item.display_name,
+                icon="OBJECT_DATA",
+                emboss=False,
+            )
+            pick_op.model_primary = item.model_primary
+            pick_op.lod_variant = ""
+            pick_op.row_index = index
+
+    def filter_items(self, context, data, propname):
+        # We do our own filtering during _browser_populate_nodes via search
+        # text + expand state, so let the UIList show every row that's in
+        # the collection. Returning empty arrays preserves default order.
+        return [], []
+
+
+class WARNO_OT_BrowserToggleFolder(Operator):
+    """Toggle expansion of a folder node and refresh the tree."""
+
+    bl_idname = "warno.browser_toggle_folder"
+    bl_label = "Toggle Folder"
+    bl_options = {"INTERNAL"}
+
+    path_key: StringProperty()
+
+    def execute(self, context):
+        settings = context.scene.warno_import
+        key = str(self.path_key or "").strip()
+        if not key:
+            return {"CANCELLED"}
+        expanded = _browser_serialize_expanded(settings)
+        if key in expanded:
+            expanded.discard(key)
+        else:
+            expanded.add(key)
+        _browser_save_expanded(settings, expanded)
+        _browser_refresh_from_settings(settings)
+        return {"FINISHED"}
+
+
+class WARNO_OT_BrowserClearSearch(Operator):
+    """Clear the tree-browser search box."""
+
+    bl_idname = "warno.browser_clear_search"
+    bl_label = "Clear Search"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        settings = context.scene.warno_import
+        settings.browser_search = ""
+        _browser_refresh_from_settings(settings)
+        return {"FINISHED"}
+
+
+class WARNO_OT_BrowserPickModel(Operator):
+    """Single-click handler on a model / LOD row in the tree browser.
+    Immediately sets the selected asset (group + lod + final path), tags
+    every visible UI area for redraw so the panel's 'Current:' label and
+    the picker dropdown reflect the new selection right away. The popup
+    stays open so the user can keep browsing; clicking OK closes it."""
+
+    bl_idname = "warno.browser_pick_model"
+    bl_label = "Pick Model"
+    bl_options = {"INTERNAL"}
+
+    model_primary: StringProperty()
+    lod_variant: StringProperty()
+    row_index: IntProperty(default=-1)
+
+    def execute(self, context):
+        settings = context.scene.warno_import
+        primary = str(self.model_primary or "").strip()
+        lod = str(self.lod_variant or "").strip()
+        if not primary and not lod:
+            return {"CANCELLED"}
+        final_asset = lod if lod else primary
+        # Sync the active row index too so OK / footer match the click.
+        if self.row_index >= 0:
+            try:
+                settings.browser_active_index = int(self.row_index)
+            except Exception:
+                pass
+        settings.asset_sync_lock = True
+        try:
+            _safe_set_selected_asset_group(settings, primary or final_asset)
+            _safe_set_selected_asset_lod(settings, lod if lod else "__base__")
+            _safe_set_selected_asset(settings, final_asset)
+        finally:
+            settings.asset_sync_lock = False
+        try:
+            _sync_group_lod_from_selected(settings)
+        except Exception:
+            pass
+        # Re-assert the user's pick in case _sync_group_lod_from_selected's
+        # fallback overwrote it (older path could trip when groups cache is
+        # not in sync with the freshly clicked asset).
+        if str(settings.selected_asset or "").strip() != final_asset:
+            settings.asset_sync_lock = True
+            try:
+                _safe_set_selected_asset(settings, final_asset)
+            finally:
+                settings.asset_sync_lock = False
+        settings.status = f"Picked: {final_asset}"
+        # Force UI redraw across all areas so the panel and popup update now.
+        try:
+            for window in bpy.context.window_manager.windows:
+                for area in window.screen.areas:
+                    area.tag_redraw()
+        except Exception:
+            pass
+        return {"FINISHED"}
+
+
+class WARNO_OT_BrowserExpandAll(Operator):
+    """Expand every folder in the tree (or collapse to top-level only when
+    already fully expanded — works as a 'Reset View' too)."""
+
+    bl_idname = "warno.browser_expand_all"
+    bl_label = "Expand / Collapse All"
+    bl_options = {"INTERNAL"}
+
+    collapse: BoolProperty(default=False)
+
+    def execute(self, context):
+        settings = context.scene.warno_import
+        try:
+            index_path = _asset_index_path(settings)
+            cached = _load_asset_index_file(index_path) or {}
+        except Exception:
+            cached = {}
+        if self.collapse:
+            _browser_save_expanded(settings, set())
+        else:
+            tree = cached.get("folder_tree", []) if isinstance(cached, dict) else []
+            keys: set[str] = set()
+
+            def collect(n):
+                if not isinstance(n, dict):
+                    return
+                k = str(n.get("key", "")).strip()
+                if k:
+                    keys.add(k)
+                for ch in n.get("children", []) or []:
+                    collect(ch)
+
+            for root in tree:
+                collect(root)
+            _browser_save_expanded(settings, keys)
+        _browser_refresh_from_settings(settings)
+        return {"FINISHED"}
+
+
+class WARNO_OT_PickAssetBrowserTree(Operator):
+    """Tree-view popup picker (replaces the legacy 5-dropdown dialog)."""
+
+    bl_idname = "warno.pick_asset_browser_tree"
+    bl_label = "Asset Browser"
+    bl_description = "Browse WARNO assets in a tree view (folders, models, LODs)"
+
+    def invoke(self, context, _event):
+        settings = context.scene.warno_import
+        try:
+            index_data, _source, _runtime, _spk = _ensure_asset_index_sync(
+                settings, force_rebuild=False
+            )
+        except Exception as exc:
+            self.report(
+                {"WARNING"},
+                f"No scanned asset index ({exc}). Run 'Scan ALL Assets' first.",
+            )
+            return {"CANCELLED"}
+
+        # On first open, auto-expand every top-level root so the tree is
+        # not empty-looking. Keep deeper expand state from previous session.
+        expanded = _browser_serialize_expanded(settings)
+        roots_added = 0
+        for root in (index_data or {}).get("folder_tree", []) or []:
+            key = str(root.get("key", "")).strip()
+            if key and key not in expanded:
+                expanded.add(key)
+                roots_added += 1
+        if roots_added > 0:
+            _browser_save_expanded(settings, expanded)
+
+        _browser_populate_nodes(settings, index_data)
+
+        # Try to position the active row on the currently selected asset.
+        sel_primary = str(settings.selected_asset_group or "").strip()
+        sel_lod = str(settings.selected_asset_lod or "").strip()
+        if sel_primary and sel_primary != "__none__":
+            best_idx = -1
+            for i, n in enumerate(settings.browser_nodes):
+                if n.is_lod and sel_lod and sel_lod != "__base__":
+                    if n.lod_variant == sel_lod:
+                        best_idx = i
+                        break
+                if n.is_model and n.model_primary == sel_primary:
+                    best_idx = i  # keep looking in case of LOD
+            if best_idx >= 0:
+                settings.browser_active_index = best_idx
+
+        return context.window_manager.invoke_props_dialog(self, width=720)
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.warno_import
+
+        # Toolbar row: search + show-LODs + expand/collapse-all
+        bar = layout.row(align=True)
+        bar.prop(settings, "browser_search", text="", icon="VIEWZOOM")
+        if str(settings.browser_search or "").strip():
+            bar.operator("warno.browser_clear_search", text="", icon="X")
+        bar.separator()
+        bar.prop(settings, "browser_show_lods", text="LODs", toggle=True)
+        bar.separator()
+        op_expand = bar.operator(
+            "warno.browser_expand_all", text="", icon="DISCLOSURE_TRI_DOWN"
+        )
+        op_expand.collapse = False
+        op_collapse = bar.operator(
+            "warno.browser_expand_all", text="", icon="DISCLOSURE_TRI_RIGHT"
+        )
+        op_collapse.collapse = True
+
+        # Counter line
+        n = len(settings.browser_nodes)
+        info = layout.row(align=True)
+        info.label(text=f"{n} rows visible", icon="OUTLINER")
+
+        # The tree itself
+        layout.template_list(
+            "WARNO_UL_asset_browser",
+            "",
+            settings,
+            "browser_nodes",
+            settings,
+            "browser_active_index",
+            rows=20,
+        )
+
+        # Selection footer
+        if 0 <= settings.browser_active_index < n:
+            sel = settings.browser_nodes[settings.browser_active_index]
+            if sel.is_lod:
+                layout.label(text=f"Selected LOD: {sel.lod_variant}", icon="MOD_DECIM")
+            elif sel.is_model:
+                layout.label(text=f"Selected model: {sel.model_primary}", icon="OBJECT_DATA")
+            else:
+                layout.label(
+                    text=f"Folder: {sel.path_key}  ({sel.asset_count} models)",
+                    icon="FILE_FOLDER",
+                )
+        else:
+            layout.label(text="Click a model row to select it.", icon="INFO")
+
+    def execute(self, context):
+        settings = context.scene.warno_import
+        n = len(settings.browser_nodes)
+        if not (0 <= settings.browser_active_index < n):
+            self.report({"WARNING"}, "No row selected.")
+            return {"CANCELLED"}
+        sel = settings.browser_nodes[settings.browser_active_index]
+        if sel.is_folder:
+            self.report({"WARNING"}, "Select a model (not a folder) before clicking OK.")
+            return {"CANCELLED"}
+        primary = str(sel.model_primary or "").strip()
+        lod = str(sel.lod_variant or "").strip() if sel.is_lod else ""
+        if not primary and not lod:
+            return {"CANCELLED"}
+        # Delegate to the same single-click handler so OK and direct row
+        # clicks share one set-asset code path and one redraw guarantee.
+        try:
+            bpy.ops.warno.browser_pick_model(
+                model_primary=primary,
+                lod_variant=lod,
+                row_index=int(settings.browser_active_index),
+            )
+        except Exception as exc:
+            self.report({"ERROR"}, f"Pick failed: {exc}")
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
 class WARNO_OT_PrepareZZRuntime(Operator):
     bl_idname = "warno.prepare_zz_runtime"
     bl_label = "Prepare ZZ Runtime"
@@ -13234,13 +14121,26 @@ class WARNO_OT_ApplyTextures(Operator):
             for mat in obj.data.materials:
                 if mat is None:
                     continue
-                key = _material_key(mat.name)
-                maps = maps_by_mat_key.get(key)
+                # The datablock name may carry our per-asset namespace prefix
+                # (e.g. 'M1038_Humvee__Vitre'). Try the namespaced key first
+                # for correctness, then fall back to the stripped raw key so
+                # legacy un-namespaced materials in older .blend files still
+                # match the SPK-derived map dictionaries.
+                key_full = _material_key(mat.name)
+                key_raw = _material_key(_warno_strip_namespace(mat.name))
+                maps = maps_by_mat_key.get(key_full) or maps_by_mat_key.get(key_raw)
                 if not maps:
-                    maps = material_maps_by_name.get(mat.name)
+                    maps = (
+                        material_maps_by_name.get(mat.name)
+                        or material_maps_by_name.get(_warno_strip_namespace(mat.name))
+                    )
                 if not maps:
                     continue
-                role = role_by_mat_key.get(key, "other")
+                role = (
+                    role_by_mat_key.get(key_full)
+                    or role_by_mat_key.get(key_raw)
+                    or "other"
+                )
                 _apply_material_nodes(
                     mat,
                     maps,
@@ -13362,6 +14262,21 @@ class WARNO_OT_ImportAsset(Operator):
 
         project_root = _project_root(settings)
         runtime_info: Dict[str, Any] = {}
+        # Purge orphan Blender datablocks (materials/images/meshes left behind
+        # by previous imports the user has since deleted from the scene). This
+        # prevents a stale 'Vitre' or 'Mi_24V' material from being silently
+        # reused by name in the new asset's import. Safe no-op on a clean .blend.
+        try:
+            purged = _warno_purge_orphan_datablocks()
+            if any(purged.values()):
+                _warno_log(
+                    settings,
+                    "pre-import orphan purge: "
+                    + ", ".join(f"{k}={v}" for k, v in purged.items() if v),
+                    stage="import",
+                )
+        except Exception:
+            pass
         try:
             _set_status(settings, "stage: preparing runtime", stage="import")
             runtime_info = _prepare_zz_runtime_sources(extractor_mod, settings)
@@ -13721,13 +14636,17 @@ class WARNO_OT_ImportAsset(Operator):
                     mids_order.append(int(mid))
 
             mat_slot_by_mid: Dict[int, int] = {}
+            asset_namespace = _warno_asset_namespace(asset)
             for mid in mids_order:
-                mat_name = material_name_by_id.get(mid, f"Material_{mid:03d}")
+                raw_mat_name = material_name_by_id.get(mid, f"Material_{mid:03d}")
                 role = str(material_role_by_id.get(mid, "other"))
-                maps = material_maps_by_name.get(mat_name, {})
-                cache_key = f"{mat_name.lower()}::{role}"
+                maps = material_maps_by_name.get(raw_mat_name, {})
+                # Per-asset cache key keeps the in-import dedup intact while
+                # the Blender datablock name itself is namespaced.
+                cache_key = f"{raw_mat_name.lower()}::{role}"
                 mat = material_cache.get(cache_key)
                 if mat is None:
+                    mat_name = _warno_namespaced_material_name(asset_namespace, raw_mat_name)
                     mat = bpy.data.materials.get(mat_name)
                     if mat is None:
                         mat = bpy.data.materials.new(name=mat_name)
@@ -13758,7 +14677,7 @@ class WARNO_OT_ImportAsset(Operator):
                 bucket_diag["object_name"] = str(obj_name)
                 bucket_diag["preferred_group_name"] = str(preferred_group_name)
                 scene_bucket_diagnostics.append(bucket_diag)
-            _ensure_window_material_name(obj)
+            _ensure_window_material_name(obj, asset_hint=asset)
             vg_report = _apply_vertex_groups_from_bucket(
                 obj=obj,
                 bucket=bucket,
@@ -13891,6 +14810,29 @@ class WARNO_OT_ImportAsset(Operator):
             except Exception as exc:
                 self.report({"WARNING"}, f"Hierarchy build failed: {exc}")
                 hierarchy_root_obj = None
+
+        # Finalize WARNO-reserved material names (e.g. 'Vitre'): rename the
+        # namespaced material we just built ('<asset>__Vitre') back to the
+        # canonical 'Vitre' that the in-game cooker accepts. Any existing
+        # canonical material left over from a previous import is parked
+        # under '<old_asset>__Vitre' so its references on previously-imported
+        # objects continue to work without picking up our textures.
+        try:
+            renamed_reserved = _warno_finalize_reserved_material_names(asset)
+            if renamed_reserved > 0:
+                _warno_log(
+                    settings,
+                    f"reserved material rename: {renamed_reserved} canonical names finalized",
+                    stage="import",
+                )
+        except Exception as exc:
+            _warno_log(
+                settings,
+                f"reserved material rename failed: {exc}",
+                level="WARNING",
+                stage="import",
+            )
+
         new_scene_objects = [
             obj for obj in bpy.data.objects
             if int(obj.as_pointer()) not in preexisting_object_ptrs
@@ -14045,7 +14987,11 @@ class WARNO_PT_ImporterPanel(Panel):
             row = qry.row(align=True)
             row.operator("warno.scan_assets", text="Scan Assets")
             row.operator("warno.scan_assets_all", text="Scan ALL Assets (uses cache)", icon="TIME")
-            qry.operator("warno.pick_asset_browser", text="Pick Asset Browser", icon="FILEBROWSER")
+            qry.operator(
+                "warno.pick_asset_browser_tree",
+                text="Browse Assets",
+                icon="OUTLINER",
+            )
             qry.label(text=f"Current: {str(s.selected_asset or '').strip()}", icon="OBJECT_DATA")
             lod_row = qry.row(align=True)
             lod_icon = "TRIA_DOWN" if bool(s.show_asset_lods) else "TRIA_RIGHT"
@@ -14057,7 +15003,7 @@ class WARNO_PT_ImporterPanel(Panel):
                     qry.label(text="LOD: <base model>", icon="MOD_DECIM")
                 else:
                     qry.label(text=f"LOD: {picked_lod}", icon="MOD_DECIM")
-                qry.label(text="Use Pick Asset Browser to choose exact LOD variant.", icon="INFO")
+                qry.label(text="Use Browse Assets to choose exact LOD variant.", icon="INFO")
 
         opts = layout.box()
         hdr = opts.row(align=True)
@@ -14084,6 +15030,9 @@ class WARNO_PT_ImporterPanel(Panel):
 
 
 CLASSES = [
+    # WARNOBrowserNode must be registered BEFORE WARNOImporterSettings
+    # because the latter declares a CollectionProperty(type=WARNOBrowserNode).
+    WARNOBrowserNode,
     WARNOImporterSettings,
     WARNO_OT_LoadConfig,
     WARNO_OT_LoadExampleConfig,
@@ -14094,6 +15043,13 @@ CLASSES = [
     WARNO_OT_ScanAssetsAll,
     WARNO_OT_PickAssetBrowser,
     WARNO_OT_PickAssetPopup,
+    # New tree-view browser
+    WARNO_UL_AssetBrowser,
+    WARNO_OT_BrowserToggleFolder,
+    WARNO_OT_BrowserClearSearch,
+    WARNO_OT_BrowserExpandAll,
+    WARNO_OT_BrowserPickModel,
+    WARNO_OT_PickAssetBrowserTree,
     WARNO_OT_PrepareZZRuntime,
     WARNO_OT_InstallTGVDeps,
     WARNO_OT_OpenSystemConsole,

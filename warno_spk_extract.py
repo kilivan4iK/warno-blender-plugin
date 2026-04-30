@@ -3232,6 +3232,268 @@ def split_faces_by_bone_deterministic(
     return out
 
 
+def _resnap_degenerate_uv_faces(
+    vertex_rows: List[Tuple[float, float, float]],
+    uv_rows: List[Tuple[float, float]],
+    src_rows: List[int],
+    faces: List[Tuple[int, ...]],
+    min_span_threshold: float = 1.0e-3,
+    area_threshold: float = 1.0e-5,
+    max_iterations: int = 10,
+) -> Tuple[
+    List[Tuple[float, float, float]],
+    List[Tuple[float, float]],
+    List[int],
+    List[Tuple[int, ...]],
+    int,
+]:
+    """For every face (triangle or quad) whose UV is degenerate, find a
+    neighbor face (sharing one edge) with non-degenerate UV and rebuild
+    the degenerate face's UV by mirroring the neighbor's far-vertex UV
+    across the shared edge midpoint.
+
+    Degenerate is defined as either:
+      * min(u_span, v_span) < min_span_threshold — stripe pattern
+        (1px on a 1024 atlas at default 1e-3), or
+      * u_span * v_span < area_threshold — fully collapsed point.
+    The first condition catches the WARNO DECORS striping artifact where
+    span looks like (0.041, 0.001); the second catches sub-pixel collapses.
+
+    Why: WARNO composite DECORS assets (e.g. HLM_10_L.fbx aggregating 11
+    sibling FBX) and a few unit edge cases ship with faces whose UV span
+    is ~0 in one axis. Blender then samples a 1-2 pixel slice and repeats
+    it across the entire face, producing visible stripes.
+
+    Algorithm:
+      * iterate to a fixed point (max `max_iterations` passes) so that
+        degenerate clusters dissolve outward — once an outer face gets
+        resnapped, its previously-also-degenerate inner neighbors finally
+        have a non-degenerate neighbor to mirror against on the next pass.
+      * supports both triangles (3 verts) and quads (4 verts).
+      * non-edge vertices of the degenerate face are duplicated (new
+        vertex + new UV) so other faces sharing those vertices are not
+        disturbed by the UV change.
+    Returns (vertices, uvs, src_refs, faces, resnapped_count).
+    """
+    if not uv_rows or not faces:
+        return list(vertex_rows), list(uv_rows), list(src_rows), list(faces), 0
+
+    new_vertices = list(vertex_rows)
+    new_uvs = list(uv_rows)
+    new_srcs = list(src_rows)
+    new_faces = [tuple(face) for face in faces]
+    resnapped = 0
+
+    def _is_uv_degenerate(face: Sequence[int]) -> bool:
+        if len(face) < 3:
+            return False
+        try:
+            us = [float(new_uvs[v][0]) for v in face]
+            vs_ = [float(new_uvs[v][1]) for v in face]
+        except Exception:
+            return False
+        u_span = max(us) - min(us)
+        v_span = max(vs_) - min(vs_)
+        # 1) Stripe pattern (one axis collapsed to ~1px on a 1024 atlas).
+        if min(u_span, v_span) < min_span_threshold:
+            return True
+        # 2) Sub-pixel area collapse.
+        if u_span * v_span < area_threshold:
+            return True
+        # NOTE: We deliberately do NOT flag butterfly UV on quads as
+        # degenerate. Eugen's source FBX in WARNO DECORS (e.g. HLM_10_L
+        # rooftops) maps two diagonal corners of a quad to the same texel
+        # by design — that is the in-game look the developers chose. Any
+        # automatic re-projection here yields a worse, mismatched texture
+        # for the modder. Users that want a different roof texture can
+        # Smart-UV-Project the face manually in Edit Mode.
+        return False
+
+    for _iteration in range(int(max_iterations)):
+        # Rebuild edge -> face map each pass so newly-resnapped faces
+        # become available as donors for their still-degenerate neighbors.
+        edge_to_faces: Dict[Tuple[int, int], List[int]] = {}
+        for fi, face in enumerate(new_faces):
+            if len(face) < 3:
+                continue
+            n = len(face)
+            for i in range(n):
+                a = int(face[i])
+                b = int(face[(i + 1) % n])
+                edge = (min(a, b), max(a, b))
+                edge_to_faces.setdefault(edge, []).append(fi)
+
+        # Detect currently degenerate faces.
+        degenerate_indices: List[int] = []
+        for fi, face in enumerate(new_faces):
+            if 3 <= len(face) <= 4 and _is_uv_degenerate(face):
+                degenerate_indices.append(fi)
+        if not degenerate_indices:
+            break
+
+        progressed = False
+        for fi in degenerate_indices:
+            face = new_faces[fi]
+            face_verts = [int(v) for v in face]
+            n = len(face_verts)
+            # Find a non-degenerate neighbor via any shared edge.
+            chosen: Tuple[int, int, int] | None = None
+            for i in range(n):
+                a = face_verts[i]
+                b = face_verts[(i + 1) % n]
+                edge = (min(a, b), max(a, b))
+                for nfi in edge_to_faces.get(edge, []):
+                    if nfi == fi:
+                        continue
+                    nface = new_faces[nfi]
+                    if len(nface) < 3:
+                        continue
+                    if _is_uv_degenerate(nface):
+                        continue
+                    chosen = (nfi, a, b)
+                    break
+                if chosen is not None:
+                    break
+            if chosen is None:
+                continue
+            nfi, ea, eb = chosen
+            nface = new_faces[nfi]
+            # Pick any neighbor vertex that is not on the shared edge.
+            c_neighbor = -1
+            for v in nface:
+                iv = int(v)
+                if iv != ea and iv != eb:
+                    c_neighbor = iv
+                    break
+            if c_neighbor < 0:
+                continue
+            if ea >= len(new_uvs) or eb >= len(new_uvs) or c_neighbor >= len(new_uvs):
+                continue
+            ua = new_uvs[ea]
+            ub = new_uvs[eb]
+            uc_n = new_uvs[c_neighbor]
+            # Skip donors whose own shared edge is degenerate in UV space —
+            # their mirror would just collapse our face to another stripe.
+            if abs(float(ua[0]) - float(ub[0])) < 1.0e-6 and abs(float(ua[1]) - float(ub[1])) < 1.0e-6:
+                continue
+            mid_u = (float(ua[0]) + float(ub[0])) * 0.5
+            mid_v = (float(ua[1]) + float(ub[1])) * 0.5
+            mirrored_uv = (
+                2.0 * mid_u - float(uc_n[0]),
+                2.0 * mid_v - float(uc_n[1]),
+            )
+            # Detect butterfly only by strict diagonal-collapse — same rule
+            # as _is_uv_degenerate above. Keep these in sync.
+            is_butterfly = False
+            if n == 4:
+                eps = 1.0e-5
+                try:
+                    fu = [float(new_uvs[v][0]) for v in face_verts]
+                    fv = [float(new_uvs[v][1]) for v in face_verts]
+                    d02 = ((fu[0] - fu[2]) ** 2 + (fv[0] - fv[2]) ** 2) ** 0.5
+                    d13 = ((fu[1] - fu[3]) ** 2 + (fv[1] - fv[3]) ** 2) ** 0.5
+                    if d02 < eps or d13 < eps:
+                        is_butterfly = True
+                except Exception:
+                    is_butterfly = False
+
+            if is_butterfly:
+                # For butterfly quads, single-point mirror leaves the whole
+                # face as a flat-color patch — visually worse than the source
+                # stripe in many cases. Instead reproject our face's 3D
+                # positions onto the neighbor's UV bounding box, preserving
+                # the size ratio so the texture tiles at the same resolution
+                # as on the donor face. This yields a roof that looks like
+                # an extension of the neighboring wall pattern instead of a
+                # uniform color blob.
+                try:
+                    nb_us = [float(new_uvs[int(v)][0]) for v in nface]
+                    nb_vs_ = [float(new_uvs[int(v)][1]) for v in nface]
+                    nb_u_min, nb_u_max = min(nb_us), max(nb_us)
+                    nb_v_min, nb_v_max = min(nb_vs_), max(nb_vs_)
+                    nb_u_span = max(nb_u_max - nb_u_min, 1.0e-6)
+                    nb_v_span = max(nb_v_max - nb_v_min, 1.0e-6)
+
+                    our_pts3d = [tuple(new_vertices[v]) for v in face_verts]
+                    nb_pts3d = [tuple(new_vertices[int(v)]) for v in nface]
+
+                    # Pick the two 3D axes with the largest spread on our face
+                    # (drops the dominant-normal axis).
+                    spans = [
+                        max(p[i] for p in our_pts3d) - min(p[i] for p in our_pts3d)
+                        for i in range(3)
+                    ]
+                    axis_priority = sorted(range(3), key=lambda i: -spans[i])
+                    u_axis, v_axis = axis_priority[0], axis_priority[1]
+
+                    our_u_min = min(p[u_axis] for p in our_pts3d)
+                    our_v_min = min(p[v_axis] for p in our_pts3d)
+                    our_u_span = max(spans[u_axis], 1.0e-6)
+                    our_v_span = max(spans[v_axis], 1.0e-6)
+
+                    nb_u_min_axis = min(p[u_axis] for p in nb_pts3d)
+                    nb_v_min_axis = min(p[v_axis] for p in nb_pts3d)
+                    nb_u_span_axis = max(
+                        (max(p[u_axis] for p in nb_pts3d) - nb_u_min_axis),
+                        1.0e-6,
+                    )
+                    nb_v_span_axis = max(
+                        (max(p[v_axis] for p in nb_pts3d) - nb_v_min_axis),
+                        1.0e-6,
+                    )
+
+                    # UV-per-3D-unit on the donor; we use the same density
+                    # so 1m on our face occupies the same UV distance.
+                    u_density = nb_u_span / nb_u_span_axis
+                    v_density = nb_v_span / nb_v_span_axis
+
+                    new_uv_list: List[Tuple[float, float]] = []
+                    for p in our_pts3d:
+                        u = nb_u_min + (p[u_axis] - our_u_min) * u_density
+                        v = nb_v_min + (p[v_axis] - our_v_min) * v_density
+                        new_uv_list.append((u, v))
+                except Exception:
+                    new_uv_list = [mirrored_uv] * n
+
+                rebuilt: List[int] = []
+                for vi, v in enumerate(face_verts):
+                    if v >= len(new_vertices):
+                        rebuilt.append(v)
+                        continue
+                    new_idx = len(new_vertices)
+                    new_vertices.append(tuple(new_vertices[v]))
+                    new_uvs.append(new_uv_list[vi])
+                    new_srcs.append(new_srcs[v] if v < len(new_srcs) else 0)
+                    rebuilt.append(new_idx)
+                new_faces[fi] = tuple(rebuilt)
+                resnapped += 1
+                progressed = True
+            else:
+                # Normal stripe / area-collapse path: keep the shared-edge
+                # vertices, duplicate the rest with the mirrored UV.
+                rebuilt = []
+                for v in face_verts:
+                    if v == ea or v == eb:
+                        rebuilt.append(v)
+                        continue
+                    if v >= len(new_vertices):
+                        rebuilt.append(v)
+                        continue
+                    new_idx = len(new_vertices)
+                    new_vertices.append(tuple(new_vertices[v]))
+                    new_uvs.append(mirrored_uv)
+                    new_srcs.append(new_srcs[v] if v < len(new_srcs) else 0)
+                    rebuilt.append(new_idx)
+                new_faces[fi] = tuple(rebuilt)
+                resnapped += 1
+                progressed = True
+
+        if not progressed:
+            break
+
+    return new_vertices, new_uvs, new_srcs, new_faces, resnapped
+
+
 def cleanup_bucket_geometry(
     vertices: Sequence[Sequence[float]],
     uvs: Sequence[Sequence[float]],
@@ -3619,6 +3881,18 @@ def cleanup_bucket_geometry(
         used_faces.add(int(face_i))
 
     vertex_rows, uv_rows, src_rows, merged_faces, merged_mids = _compact(merged_faces, merged_mids)
+    # Re-snap any remaining triangles whose UV-rectangle collapsed below the
+    # area threshold. This is a Blender-rendering fix for source FBX shipped
+    # by Eugen with degenerate UV in WARNO composite DECORS and rare unit
+    # corner cases. See _resnap_degenerate_uv_faces docstring for the full
+    # rationale; the mirror-from-neighbor strategy preserves geometry and
+    # replaces 1-pixel stripes with a copy of the adjacent texture region.
+    vertex_rows, uv_rows, src_rows, merged_faces, uv_resnapped_count = _resnap_degenerate_uv_faces(
+        list(vertex_rows),
+        list(uv_rows),
+        list(src_rows),
+        list(merged_faces),
+    )
     post_component_count = len(_component_groups(merged_faces))
     diagnostics = {
         "group_name": str(group_name or ""),
@@ -3631,6 +3905,7 @@ def cleanup_bucket_geometry(
         "degenerate_polygons_removed": int(degenerate_removed),
         "tiny_components_removed": int(dropped_components),
         "quad_merges": int(quad_merges),
+        "uv_degenerate_resnapped": int(uv_resnapped_count),
     }
     return {
         "vertices": list(vertex_rows),
@@ -7989,6 +8264,12 @@ def _build_atlas_json_index(data: Dict[str, Any]) -> Tuple[Dict[str, List[Dict[s
         if not source_tgv_rel:
             continue
         source_role = _canonical_channel(str(tex.get("source_role", "generic")))
+        # Originating FBX path of the texture. WARNO's DECORS atlases pack
+        # textures from many sibling FBX into a single composite atlas
+        # (e.g. HLM_10_L.fbx aggregates 11 building-block FBX). Keeping
+        # source_asset_path on every entry lets the importer filter atlas
+        # targets down to those actually referenced by SPK materials.
+        source_asset_path = str(tex.get("source_asset_path", "")).strip()
         rect = tex.get("crop_rect_px") if isinstance(tex.get("crop_rect_px"), dict) else {}
         crop_rect_px = {
             "x": int(rect.get("x", 0) or 0),
@@ -8008,6 +8289,7 @@ def _build_atlas_json_index(data: Dict[str, Any]) -> Tuple[Dict[str, List[Dict[s
             entry = {
                 "source_tgv_rel": source_tgv_rel,
                 "source_role": source_role,
+                "source_asset_path": source_asset_path,
                 "crop_rect_px": dict(crop_rect_px),
                 "target_logical_rel": logical_rel,
                 "target_basename": basename or Path(_normalize_logical_ref(logical_rel)).stem,
