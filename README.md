@@ -12,7 +12,8 @@
   [Known Issues](#-known-issues).
 - **Tested with:** Blender 4.2 LTS and 5.0+. WARNO build v189668 (April 2026 patch).
 
-![preview](https://github.com/user-attachments/assets/8f0005b0-0681-4870-8728-a7c3e6320d28)
+![preview](<img width="1838" height="823" alt="image" src="https://github.com/user-attachments/assets/994802e1-c3fa-41f6-871d-b688a2681120" />
+)
 
 ---
 
