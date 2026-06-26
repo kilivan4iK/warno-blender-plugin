@@ -1,7 +1,7 @@
 bl_info = {
     "name": "WARNO Importer",
     "author": "Kilivanchik",
-    "version": (0, 1, 0),
+    "version": (1, 6, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > WARNO",
     "description": "Direct WARNO SPK importer with textures and optional helper bones",
@@ -42,13 +42,14 @@ from mathutils import Vector
 
 
 MODULE_CACHE: dict[tuple[str, str], tuple[int, Any]] = {}
-ZZ_RUNTIME_SESSION_CACHE: dict[tuple[str, str, tuple[tuple[str, int, int], ...]], Dict[str, Any]] = {}
+ZZ_RUNTIME_SESSION_CACHE: dict[tuple[str, str, str, tuple[tuple[str, int, int], ...]], Dict[str, Any]] = {}
 ASSET_INDEX_SESSION_CACHE: dict[str, Dict[str, Any]] = {}
 ASSET_PICKER_VIEW_CACHE: dict[str, Dict[str, Any]] = {}
 SAFE_NAME_RX = re.compile(r"[^A-Za-z0-9_.-]+")
 LOD_SUFFIX_LOCAL_RX = re.compile(r"_(LOW|MID|HIGH|LOD[0-9]+)$", re.IGNORECASE)
 CONTROL_CHAR_RX = re.compile(r"[\x00-\x1f\x7f]+")
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tga", ".tif", ".tiff"}
+WARNO_BUILD_STAMP = "v1.6.0"
 WARNO_DEV_SCALE = 20.0 / 43.0
 WARNO_OFF_MAT_SCALE = WARNO_DEV_SCALE / 100.0
 WARNO_HELPER_BONE_LENGTH = 0.4
@@ -121,14 +122,30 @@ def _norm_low(value: str) -> str:
     return str(value or "").strip().lower()
 
 
-def _warno_dev_scaled_xyz(x: float, y: float, z: float) -> Tuple[float, float, float]:
-    scale = float(WARNO_DEV_SCALE)
-    return x * scale, y * scale, z * scale
+def _warno_dev_scaled_xyz(
+    x: float, y: float, z: float, scale: "float | None" = None
+) -> Tuple[float, float, float]:
+    s = float(WARNO_DEV_SCALE if scale is None else scale)
+    return x * s, y * s, z * s
 
 
-def _warno_off_mat_point_xyz(x: float, y: float, z: float) -> Tuple[float, float, float]:
-    scale = float(WARNO_OFF_MAT_SCALE)
-    return -x * scale, y * scale, -z * scale
+def _warno_off_mat_point_xyz(
+    x: float, y: float, z: float, scale: "float | None" = None
+) -> Tuple[float, float, float]:
+    s = float(WARNO_OFF_MAT_SCALE if scale is None else scale)
+    return -x * s, y * s, -z * s
+
+
+def _active_game_scales(settings) -> Tuple[float, float]:
+    """Return (dev_scale, off_mat_scale) for the active game, falling back to the
+    WARNO constants if the extractor/profile is unavailable. Resolve ONCE per
+    import (never per-vertex) and pass the value into the scale helpers."""
+    try:
+        mod = _extractor_module(settings)
+        prof = mod.get_game_profile(getattr(settings, "game_preset", "WARNO"))
+        return float(prof["dev_scale"]), float(prof["off_mat_scale"])
+    except Exception:
+        return float(WARNO_DEV_SCALE), float(WARNO_OFF_MAT_SCALE)
 
 
 def _off_mat_axis_permutations(x: float, y: float, z: float) -> Dict[str, Tuple[float, float, float]]:
@@ -761,7 +778,9 @@ def _looks_like_modding_suite_root(path: Path) -> bool:
     if not p.exists() or not p.is_dir():
         return False
     markers = [
-        p / "moddingSuite.GfxCli",
+        p / "moddingSuite.exe",            # unified single-exe (current)
+        p / "moddingSuite" / "moddingSuite.exe",
+        p / "moddingSuite.GfxCli",         # legacy multi-project layout
         p / "moddingSuite.AtlasCli",
         p / "atlas_cli",
         p / "tgv_to_png.py",
@@ -792,12 +811,22 @@ def _iter_modding_suite_cli_candidates(
 ) -> List[Path]:
     candidates: List[Path] = []
     candidates.extend(_candidate_paths_from_raw(project_root, configured_path))
+    # Preferred: unified moddingSuite.exe (one binary, subcommand chosen by
+    # the wrapper scripts via name detection).
+    for base in [project_root, *list(project_root.parents)[:3]]:
+        candidates.append(base / "moddingSuite" / "moddingSuite.exe")
+        candidates.append(base / "moddingSuite-master" / "moddingSuite.exe")
+    if modding_suite_root is not None:
+        candidates.append(Path(modding_suite_root) / "moddingSuite.exe")
+    # Legacy: split CLI exes (kept as fallback for older installs).
     for base in [project_root, *list(project_root.parents)[:3]]:
         candidates.append(base / "moddingSuite" / legacy_subdir / exe_name)
+        candidates.append(base / "moddingSuite" / exe_name)
         candidates.append(base / "moddingSuite-master" / legacy_subdir / exe_name)
     if modding_suite_root is not None:
         root = Path(modding_suite_root)
         candidates.append(root / legacy_subdir / exe_name)
+        candidates.append(root / exe_name)
         for config_name in ("Release", "Debug"):
             bin_root = root / project_name / "bin" / config_name
             if not bin_root.exists() or not bin_root.is_dir():
@@ -990,6 +1019,16 @@ def _restore_project_root_and_auto_config(settings: "WARNOImporterSettings") -> 
         cfg = _config_path(settings)
         if cfg.exists() and cfg.is_file():
             _load_config_into_settings(settings, cfg)
+        else:
+            # First run (no config.json yet): auto-load the bundled example so the
+            # moddingSuite root, wrappers and deps are correct without manual setup.
+            for ex in (
+                _project_root(settings) / "config.example.json",
+                Path(__file__).resolve().parent / "config.example.json",
+            ):
+                if ex.exists() and ex.is_file():
+                    _load_config_into_settings(settings, ex)
+                    break
     except Exception:
         pass
     _enforce_fixed_runtime_defaults(settings)
@@ -1032,14 +1071,43 @@ def _log_import_progress(
     safe_total = max(1, int(total_steps))
     safe_step = max(0, min(int(step_idx), safe_total))
     pct = int(round((float(safe_step) / float(safe_total)) * 100.0))
-    msg = f"progress {safe_step}/{safe_total} ({pct}%) {str(label or '').strip()}"
+    label_s = str(label or "").strip()
+    msg = f"progress {safe_step}/{safe_total} ({pct}%) {label_s}"
     if extra:
         msg += f" | {extra}"
-    msg += f" | elapsed:{time.monotonic()-float(t0):.1f}s"
+    elapsed = time.monotonic() - float(t0)
+    msg += f" | elapsed:{elapsed:.1f}s"
     _set_status(settings, msg, stage="import_progress")
+    # Visible progress so the user can tell the import is working (not frozen):
+    # (1) an ASCII bar in the system console, (2) the cursor % counter via wm.progress
+    # (updates even during this blocking operator), (3) the bottom status-bar text.
+    try:
+        cells = 24
+        filled = max(0, min(cells, int(round(cells * safe_step / safe_total))))
+        bar = "█" * filled + "░" * (cells - filled)
+        print(f"[WARNO] {bar} {pct:3d}% | {safe_step}/{safe_total} {label_s} | {elapsed:.1f}s", flush=True)
+    except Exception:
+        pass
+    try:
+        wm = bpy.context.window_manager
+        if wm is not None:
+            wm.progress_update(int(pct))
+            wm.status_text_set(f"WARNO import {pct}% — {label_s} ({safe_step}/{safe_total})")
+    except Exception:
+        pass
 
 
 def _toggle_import_console(settings: Any, *, open_console: bool, active: bool = True) -> bool:
+    if not open_console:
+        # Every import exit routes through the close call -> tear down the cursor progress
+        # counter + clear the status-bar text here, regardless of console state.
+        try:
+            wm = bpy.context.window_manager
+            if wm is not None:
+                wm.progress_end()
+                wm.status_text_set(None)
+        except Exception:
+            pass
     if not active:
         return False
     try:
@@ -1069,10 +1137,14 @@ def _toggle_import_console(settings: Any, *, open_console: bool, active: bool = 
         return False
 
 
-def _dat_signature_for_cache(extractor_mod, warno_root: Path) -> tuple[tuple[str, int, int], ...]:
+def _dat_signature_for_cache(
+    extractor_mod,
+    warno_root: Path,
+    game: "str | None" = None,
+) -> tuple[tuple[str, int, int], ...]:
     rows: List[tuple[str, int, int]] = []
     try:
-        dat_files = extractor_mod.find_warno_texture_dat_files(warno_root)
+        dat_files = extractor_mod.find_warno_texture_dat_files(warno_root, game=game)
     except Exception:
         dat_files = []
     for p in dat_files:
@@ -1132,27 +1204,32 @@ def _prepare_zz_runtime_sources(
     if not warno_root.exists() or not warno_root.is_dir():
         raise RuntimeError(f"WARNO Folder not found: {warno_root}")
 
+    game = _normalize_game_id(getattr(settings, "game_preset", "WARNO"))
     runtime_root = _zz_runtime_root(settings)
     runtime_root.mkdir(parents=True, exist_ok=True)
     warno_key = str(warno_root.resolve()).lower()
     runtime_key = str(runtime_root.resolve()).lower()
-    dat_signature = _dat_signature_for_cache(extractor_mod, warno_root)
-    cache_key = (warno_key, runtime_key, dat_signature)
+    dat_signature = _dat_signature_for_cache(extractor_mod, warno_root, game=game)
+    cache_key = (game, warno_key, runtime_key, dat_signature)
     if force_rebuild:
         for old_key in list(ZZ_RUNTIME_SESSION_CACHE.keys()):
-            if old_key[0] == warno_key and old_key[1] == runtime_key:
+            if old_key[1] == warno_key and old_key[2] == runtime_key:
                 ZZ_RUNTIME_SESSION_CACHE.pop(old_key, None)
     else:
         cached = ZZ_RUNTIME_SESSION_CACHE.get(cache_key)
         if cached is not None:
             return dict(cached)
 
-    info = extractor_mod.prepare_runtime_sources_from_zz(warno_root=warno_root, runtime_root=runtime_root)
+    info = extractor_mod.prepare_runtime_sources_from_zz(
+        warno_root=warno_root,
+        runtime_root=runtime_root,
+        game=game,
+    )
     info["runtime_root"] = str(runtime_root)
     info["source_policy"] = "zz_runtime_only"
 
     try:
-        resolver = extractor_mod.get_zz_runtime_resolver(warno_root)
+        resolver = extractor_mod.get_zz_runtime_resolver(warno_root, game=game)
     except Exception:
         resolver = None
     if resolver is not None:
@@ -1243,12 +1320,13 @@ def _pick_best_asset_spk_path(
     extractor_mod,
     spk_paths: Sequence[Path],
     asset: str,
+    game: "str | None" = None,
 ) -> tuple[Path, str] | None:
     target = extractor_mod.normalize_asset_path(str(asset or "")).lower()
     best: tuple[int, int, str, str, Path, str] | None = None
     for spk_path in spk_paths:
         try:
-            with extractor_mod.SpkMeshExtractor(spk_path) as spk:
+            with extractor_mod.SpkMeshExtractor(spk_path, game=game) as spk:
                 hit = spk.find_best_fat_entry_for_asset(asset)
         except Exception:
             continue
@@ -1407,7 +1485,7 @@ def _load_asset_index_file(index_path: Path) -> Dict[str, Any] | None:
         data = json.loads(index_path.read_text(encoding="utf-8-sig"))
         if not isinstance(data, dict):
             return None
-        if int(data.get("schema_version", 0) or 0) != 2:
+        if int(data.get("schema_version", 0) or 0) != 3:
             return None
         ASSET_INDEX_SESSION_CACHE[key] = {"mtime_ns": int(st.st_mtime_ns), "data": data}
         return data
@@ -1744,6 +1822,22 @@ def _asset_group_key(extractor_mod, asset: str) -> str:
     return "/".join([str(p).lower() for p in parts] + [str(base).lower()])
 
 
+def _unit_lod_match_key(extractor_mod, asset: str) -> tuple:
+    """(faction, lod-stripped stem) — used to re-attach a shared-folder LOD to its unit.
+    Both `units/<faction>/<unit>/<unit>.ase2ndfbin` and the shared
+    `units/<faction>/lods/<unit>_low.ase2ndfbin` resolve to the SAME (faction, unit)."""
+    norm = str(asset or "").replace("\\", "/")
+    pp = PurePosixPath(norm)
+    parts = [str(p).lower() for p in pp.parts]
+    faction = ""
+    if "units" in parts:
+        i = parts.index("units")
+        if i + 1 < len(parts) and parts[i + 1] != "lods":
+            faction = parts[i + 1]
+    stem = _strip_lod_suffix_local(extractor_mod, pp.stem).lower()
+    return (faction, stem)
+
+
 def _build_asset_groups(extractor_mod, assets: Sequence[str]) -> List[Dict[str, Any]]:
     buckets: Dict[str, List[str]] = defaultdict(list)
     for asset in assets:
@@ -1763,6 +1857,27 @@ def _build_asset_groups(extractor_mod, assets: Sequence[str]) -> List[Dict[str, 
         pp = PurePosixPath(primary.replace("\\", "/"))
         label = _asset_display_name(primary)
         groups.append({"primary": primary, "label": label, "lods": lods})
+
+    # Re-attach LOD-only "orphan" groups (assets under a SHARED `<faction>/lods/` folder, whose
+    # group key resolves to the faction not the unit -> they don't merge with their base unit)
+    # to their real unit group, matched by (faction, lod-stripped stem). Without this the Asset
+    # Browser shows scattered *_low models not bound to any unit. No-op when there are no such
+    # orphans (e.g. per-unit LODs already merge), so it's safe for every game/preset.
+    unit_groups = [g for g in groups if not _is_lod_asset_path(str(g.get("primary", "")))]
+    orphan_groups = [g for g in groups if _is_lod_asset_path(str(g.get("primary", "")))]
+    if orphan_groups and unit_groups:
+        by_key: Dict[tuple, Dict[str, Any]] = {}
+        for g in unit_groups:
+            by_key.setdefault(_unit_lod_match_key(extractor_mod, str(g.get("primary", ""))), g)
+        leftover: List[Dict[str, Any]] = []
+        for og in orphan_groups:
+            host = by_key.get(_unit_lod_match_key(extractor_mod, str(og.get("primary", ""))))
+            if host is None:
+                leftover.append(og)
+                continue
+            merged = list(host.get("lods", [])) + [str(og.get("primary", ""))] + list(og.get("lods", []))
+            host["lods"] = sorted(dict.fromkeys([m for m in merged if m]), key=_lod_rank_for_asset)
+        groups = unit_groups + leftover
 
     groups.sort(key=lambda g: _asset_picker_sort_key(extractor_mod, str(g.get("primary", ""))))
     return groups
@@ -1938,14 +2053,19 @@ def _build_folder_tree_from_folders(folders: Sequence[Dict[str, Any]]) -> List[D
     return out
 
 
-def _scan_assets_from_spk_paths(extractor_mod, spk_paths: Sequence[Path], query: str | None) -> List[str]:
+def _scan_assets_from_spk_paths(
+    extractor_mod,
+    spk_paths: Sequence[Path],
+    query: str | None,
+    game: "str | None" = None,
+) -> List[str]:
     query_val = str(query or "").strip()
     query_for_scan = query_val if query_val else None
     seen_assets: set[str] = set()
     out: List[str] = []
     for spk_path in spk_paths:
         try:
-            with extractor_mod.SpkMeshExtractor(spk_path) as spk:
+            with extractor_mod.SpkMeshExtractor(spk_path, game=game) as spk:
                 for asset, _meta in spk.find_matches(query_for_scan, None):
                     txt = str(asset).strip()
                     key = txt.lower()
@@ -1964,7 +2084,7 @@ def _build_asset_index_payload(extractor_mod, assets: Sequence[str], signature: 
     folders = _build_asset_folders_cache(extractor_mod, groups)
     folder_tree = _build_folder_tree_from_folders(folders)
     return {
-        "schema_version": 2,
+        "schema_version": 3,  # bumped: LOD orphan re-attach (group shared /lods/ with units)
         "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "signature": signature,
         "assets": [str(a).strip() for a in assets if str(a).strip()],
@@ -2115,7 +2235,12 @@ def _ensure_asset_index_sync(
         if cached is not None and _asset_index_signature_matches(cached, signature):
             return cached, "cache", runtime_info, mesh_spk_paths
 
-    assets = _scan_assets_from_spk_paths(extractor_mod, mesh_spk_paths, query=None)
+    assets = _scan_assets_from_spk_paths(
+        extractor_mod,
+        mesh_spk_paths,
+        query=None,
+        game=_normalize_game_id(getattr(settings, "game_preset", "WARNO")),
+    )
     payload = _build_asset_index_payload(extractor_mod, assets, signature, len(mesh_spk_paths))
     _save_asset_index_file(index_path, payload)
     return payload, "rebuilt", runtime_info, mesh_spk_paths
@@ -2397,6 +2522,32 @@ def _browser_node_matches_search(node: Dict[str, Any], search_low: str) -> bool:
     return False
 
 
+def _browser_auto_expand_keys(folder_tree: Sequence[Dict[str, Any]]) -> set[str]:
+    """Folder keys to auto-expand on first open: every root, plus any linear
+    single-child folder chain, descending until the first folder that branches
+    or holds models. This makes deeply-nested single-root layouts (Wargame Red
+    Dragon / Steel Division 2: assets/3d/units/...) reveal their first useful
+    level instead of opening as one collapsed folder. WARNO trees that branch at
+    the root are unaffected (only their roots get expanded, as before)."""
+    out: set[str] = set()
+
+    def walk(node: Dict[str, Any]) -> None:
+        if not isinstance(node, dict):
+            return
+        key = str(node.get("key", "")).strip()
+        if not key:
+            return
+        out.add(key)
+        children = [c for c in (node.get("children", []) or []) if isinstance(c, dict)]
+        models = node.get("models", []) or []
+        if len(children) == 1 and not models:
+            walk(children[0])
+
+    for root in folder_tree or []:
+        walk(root)
+    return out
+
+
 def _browser_serialize_expanded(settings) -> set[str]:
     raw = str(getattr(settings, "browser_expanded_keys", "") or "[]")
     try:
@@ -2561,7 +2712,156 @@ def _browser_update_show_lods(self, _context):
     _browser_refresh_from_settings(self)
 
 
+# ---------------------------------------------------------------------------
+# Multi-game preset support (WARNO / Wargame Red Dragon / Steel Division 2).
+#
+# Each game keeps its own install folder + isolated extraction/cache dirs in a
+# ``game_presets`` section of config.json. Tooling (moddingSuite, CLIs, wrappers)
+# and import options stay shared at the top level. The live PropertyGroup always
+# reflects the currently selected game; switching the preset flushes the outgoing
+# game's fields to the section, loads the incoming section, and persists.
+# A legacy flat config with no ``game_presets`` is treated as the WARNO preset,
+# so WARNO behaviour is unchanged.
+# ---------------------------------------------------------------------------
+VALID_GAME_IDS = ("WARNO", "WARGAME_RD", "STEEL_DIVISION_2")
+
+# Per-game (isolated) fields. Everything else in config.json is shared.
+_PER_GAME_FIELDS = (
+    "warno_root",
+    "cache_dir",
+    "zz_runtime_dir",
+    "atlas_assets_dir",
+    "spk_path",
+    "skeleton_spk",
+)
+
+# Known default install paths, used to pre-seed a game section on first switch.
+_BUILTIN_DEFAULT_INSTALL = {
+    "WARNO": r"F:\SteamLibrary\steamapps\common\WARNO",
+    "WARGAME_RD": r"C:\Program Files (x86)\Steam\steamapps\common\Wargame Red Dragon",
+    "STEEL_DIVISION_2": r"C:\Program Files (x86)\Steam\steamapps\common\Steel Division 2",
+}
+
+
+def _normalize_game_id(game_id) -> str:
+    gid = str(game_id or "WARNO").strip().upper()
+    return gid if gid in VALID_GAME_IDS else "WARNO"
+
+
+def _default_game_section(game_id: str) -> Dict[str, Any]:
+    """Seed defaults for a game section. WARNO keeps the historical flat defaults
+    (so a fresh WARNO setup is byte-for-byte unchanged); other games get isolated
+    cache/runtime subfolders so their extracted data never collides with WARNO."""
+    gid = _normalize_game_id(game_id)
+    install = _BUILTIN_DEFAULT_INSTALL.get(gid, "")
+    if gid == "WARNO":
+        cache_dir = "output_blender"
+        zz_runtime_dir = "out_blender_runtime/zz_runtime"
+    else:
+        slug = gid.lower()
+        cache_dir = f"output_blender/{slug}"
+        zz_runtime_dir = f"out_blender_runtime/zz_runtime/{slug}"
+    return {
+        "warno_root": install,
+        "cache_dir": cache_dir,
+        "zz_runtime_dir": zz_runtime_dir,
+        "atlas_assets_dir": "",
+        "spk_path": "spk/Mesh_All.spk",
+        "skeleton_spk": "skeletonsspk/Skeleton_All.spk",
+    }
+
+
+def _collect_live_game_section(settings) -> Dict[str, Any]:
+    return {k: str(getattr(settings, k, "") or "") for k in _PER_GAME_FIELDS}
+
+
+def _apply_game_section(settings, section: Dict[str, Any]) -> None:
+    if not isinstance(section, dict):
+        return
+    for k in _PER_GAME_FIELDS:
+        if k in section:
+            try:
+                setattr(settings, k, str(section.get(k, "") or ""))
+            except Exception:
+                pass
+
+
+def _read_config_dict(path: Path) -> Dict[str, Any]:
+    try:
+        if path.exists() and path.is_file():
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _write_config_dict(path: Path, data: Dict[str, Any]) -> bool:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def _switch_game_preset(settings) -> None:
+    """EnumProperty flow: flush the outgoing game's live fields into its section,
+    load the incoming section into the live fields, and persist to config.json."""
+    cfg = _config_path(settings)
+    raw = _read_config_dict(cfg)
+    presets = raw.get("game_presets")
+    if not isinstance(presets, dict):
+        presets = {}
+    outgoing = _normalize_game_id(getattr(settings, "active_game_loaded", "WARNO"))
+    incoming = _normalize_game_id(getattr(settings, "game_preset", "WARNO"))
+
+    # 1) flush current live per-game fields into the outgoing section
+    presets[outgoing] = _collect_live_game_section(settings)
+    # 2) ensure incoming section exists (seed defaults the first time)
+    if not isinstance(presets.get(incoming), dict):
+        presets[incoming] = _default_game_section(incoming)
+    # 3) load incoming section into live fields
+    _apply_game_section(settings, presets[incoming])
+    settings.active_game_loaded = incoming
+    # 4) persist: active game + all sections + mirror active section to flat keys
+    raw["active_game"] = incoming
+    raw["game_presets"] = presets
+    for k, v in presets[incoming].items():
+        raw[k] = v
+    _write_config_dict(cfg, raw)
+    _enforce_fixed_runtime_defaults(settings)
+
+
+def _on_game_preset_changed(self, _context):
+    """Update callback for game_preset; guarded so config-driven assignment
+    (during load) does not trigger a spurious flush/load."""
+    if bool(getattr(self, "game_switch_lock", False)):
+        return
+    self.game_switch_lock = True
+    try:
+        _switch_game_preset(self)
+    except Exception:
+        pass
+    finally:
+        self.game_switch_lock = False
+
+
 class WARNOImporterSettings(PropertyGroup):
+    game_preset: EnumProperty(
+        name="Game",
+        description="Which Eugen Systems game to import from (each remembers its own folder + cache)",
+        items=[
+            ("WARNO", "WARNO", "Import from WARNO"),
+            ("WARGAME_RD", "Wargame Red Dragon", "Import from Wargame Red Dragon"),
+            ("STEEL_DIVISION_2", "Steel Division 2 (soon)", "Import from Steel Division 2"),
+        ],
+        default="WARNO",
+        update=_on_game_preset_changed,
+    )
+    game_switch_lock: BoolProperty(default=False, options={"HIDDEN"})
+    active_game_loaded: StringProperty(default="WARNO", options={"HIDDEN"})
     project_root: StringProperty(
         name="Project Root",
         description="Folder that contains warno_spk_extract.py and config.json",
@@ -2582,43 +2882,54 @@ class WARNOImporterSettings(PropertyGroup):
     )
     # Deprecated: NDF hints are intentionally disabled (heuristic naming was unreliable).
     unit_ndfbin: StringProperty(name="Unit NDF", subtype="FILE_PATH", default="", options={"HIDDEN"})
-    atlas_assets_dir: StringProperty(name="Atlas Assets", subtype="DIR_PATH", default="")
+    atlas_assets_dir: StringProperty(
+        name="Texture Assets",
+        description="Folder that contains extracted WARNO texture assets",
+        subtype="DIR_PATH",
+        default="",
+    )
     tgv_converter: StringProperty(name="TGV Converter", subtype="FILE_PATH", default="tgv_to_png.py")
     modding_suite_atlas_wrapper: StringProperty(
         name="ModdingSuite Atlas Wrapper",
         subtype="FILE_PATH",
         default="modding_suite_atlas_export.py",
         description="Wrapper script that exports Atlas metadata JSON via ModdingSuite",
+        options={"HIDDEN"},
     )
     modding_suite_atlas_cli: StringProperty(
         name="ModdingSuite Atlas CLI",
         subtype="FILE_PATH",
-        default="moddingSuite/atlas_cli/moddingSuite.AtlasCli.exe",
+        default="moddingSuite/moddingSuite.exe",
         description="Path to headless Atlas CLI executable (moddingSuite.AtlasCli.exe)",
+        options={"HIDDEN"},
     )
     modding_suite_gfx_wrapper: StringProperty(
         name="ModdingSuite GFX Wrapper",
         subtype="FILE_PATH",
         default="modding_suite_gfx_export.py",
         description="Wrapper script that exports GFX semantic JSON via ModdingSuite",
+        options={"HIDDEN"},
     )
     modding_suite_gfx_cli: StringProperty(
         name="ModdingSuite GFX CLI",
         subtype="FILE_PATH",
-        default="moddingSuite/gfx_cli/moddingSuite.GfxCli.exe",
+        default="moddingSuite/moddingSuite.exe",
         description="Path to headless GFX CLI executable (moddingSuite.GfxCli.exe)",
+        options={"HIDDEN"},
     )
     depiction_vehicles_ndf: StringProperty(
         name="DepictionVehicles NDF",
         subtype="FILE_PATH",
         default="",
         description="Optional explicit text DepictionVehicles.ndf override used for semantic bones/FX filtering",
+        options={"HIDDEN"},
     )
     depiction_operators_ndf: StringProperty(
         name="DepictionOperators NDF",
         subtype="FILE_PATH",
         default="",
         description="Optional explicit text DepictionOperators.ndf override used to resolve exact operator node names",
+        options={"HIDDEN"},
     )
     import_semantic_mode: EnumProperty(
         name="Semantic Mode",
@@ -2633,26 +2944,31 @@ class WARNOImporterSettings(PropertyGroup):
         name="Use Atlas JSON (ModdingSuite)",
         default=True,
         description="Resolve crop + naming from Atlas JSON exported by ModdingSuite wrapper",
+        options={"HIDDEN"},
     )
     use_gfx_json_manifest: BoolProperty(
         name="Use GFX JSON (ModdingSuite)",
         default=True,
         description="Resolve turret/fx/operator semantics from compiled GFX JSON exported by ModdingSuite wrapper",
+        options={"HIDDEN"},
     )
     atlas_json_strict: BoolProperty(
         name="Atlas JSON strict mode",
         default=True,
         description="If enabled, unresolved Atlas JSON mappings fail without fallback guessing",
+        options={"HIDDEN"},
     )
     atlas_json_cache_subdir: StringProperty(
         name="Atlas JSON cache",
         default="atlas_json_cache",
         description="Subfolder inside cache dir to store atlas JSON maps",
+        options={"HIDDEN"},
     )
     gfx_json_cache_subdir: StringProperty(
         name="GFX JSON cache",
         default="gfx_json_cache",
         description="Subfolder inside cache dir to store GFX semantic JSON manifests",
+        options={"HIDDEN"},
     )
     texture_subdir: StringProperty(name="Texture Subdir", default="textures")
     cache_dir: StringProperty(name="Cache Dir", subtype="DIR_PATH", default="output_blender")
@@ -2670,8 +2986,8 @@ class WARNOImporterSettings(PropertyGroup):
     modding_suite_root: StringProperty(
         name="moddingSuite Root",
         subtype="DIR_PATH",
-        default="moddingSuite-master",
-        description="Folder with moddingSuite (used to auto-detect tgv_to_png.py)",
+        default="moddingSuite",
+        description="Folder with the bundled moddingSuite.exe (auto-detected; always the 'moddingSuite' folder next to the plugin)",
     )
     zz_runtime_dir: StringProperty(
         name="ZZ Runtime Cache",
@@ -2775,6 +3091,7 @@ class WARNOImporterSettings(PropertyGroup):
         min=5,
         max=600,
         description="Timeout for headless atlas metadata export",
+        options={"HIDDEN"},
     )
     gfx_cli_timeout_sec: IntProperty(
         name="GFX CLI timeout (sec)",
@@ -2782,6 +3099,7 @@ class WARNOImporterSettings(PropertyGroup):
         min=5,
         max=600,
         description="Timeout for headless GFX semantic export",
+        options={"HIDDEN"},
     )
     texture_stage_timeout_sec: IntProperty(
         name="Texture stage timeout (sec)",
@@ -2890,13 +3208,16 @@ def _enforce_fixed_runtime_defaults(settings: WARNOImporterSettings) -> None:
     settings.import_semantic_mode = "REFERENCE" if str(settings.import_semantic_mode or "").upper() not in {"REFERENCE", "RAW_DEBUG"} else settings.import_semantic_mode
     if str(getattr(settings, "auto_smooth_mode", "OFF") or "").upper() not in {"MODIFIER", "OFF", "APPLY"}:
         settings.auto_smooth_mode = "OFF"
-    settings.use_atlas_json_mapping = True
-    settings.use_gfx_json_manifest = True
-    settings.atlas_json_strict = True
     settings.auto_textures = True
     settings.auto_rename_textures = True
     settings.fast_exact_texture_resolve = True
     settings.use_zz_dat_source = True
+    # WARNO atlas + GFX pipelines are always on (restores 1.5.0 behavior). The
+    # RD/SD2 texture/mesh paths early-return BEFORE the atlas gate and never read
+    # these flags, so forcing them True is WARNO-only in effect and RD-safe.
+    settings.use_atlas_json_mapping = True
+    settings.use_gfx_json_manifest = True
+    settings.atlas_json_strict = True
     settings.use_ao_multiply = False
     settings.normal_invert_mode = "none"
     try:
@@ -2949,35 +3270,19 @@ def _load_config_into_settings(settings: WARNOImporterSettings, path: Path) -> t
     settings.project_root = get_text("project_root", settings.project_root) or settings.project_root
     settings.atlas_assets_dir = get_text("atlas_assets_dir", settings.atlas_assets_dir)
     settings.tgv_converter = get_text("tgv_converter", settings.tgv_converter) or "tgv_to_png.py"
-    settings.modding_suite_atlas_wrapper = get_text(
-        "modding_suite_atlas_wrapper",
-        settings.modding_suite_atlas_wrapper,
-    ) or "modding_suite_atlas_export.py"
-    settings.modding_suite_atlas_cli = get_text(
-        "modding_suite_atlas_cli",
-        settings.modding_suite_atlas_cli,
-    ) or "moddingSuite/atlas_cli/moddingSuite.AtlasCli.exe"
-    settings.modding_suite_gfx_wrapper = get_text(
-        "modding_suite_gfx_wrapper",
-        settings.modding_suite_gfx_wrapper,
-    ) or "modding_suite_gfx_export.py"
-    settings.modding_suite_gfx_cli = get_text(
-        "modding_suite_gfx_cli",
-        settings.modding_suite_gfx_cli,
-    ) or "moddingSuite/gfx_cli/moddingSuite.GfxCli.exe"
-    settings.depiction_vehicles_ndf = get_text("depiction_vehicles_ndf", settings.depiction_vehicles_ndf)
-    settings.depiction_operators_ndf = get_text("depiction_operators_ndf", settings.depiction_operators_ndf)
+    settings.modding_suite_atlas_wrapper = "modding_suite_atlas_export.py"
+    settings.modding_suite_atlas_cli = "moddingSuite/moddingSuite.exe"
+    settings.modding_suite_gfx_wrapper = "modding_suite_gfx_export.py"
+    settings.modding_suite_gfx_cli = "moddingSuite/moddingSuite.exe"
+    settings.depiction_vehicles_ndf = ""
+    settings.depiction_operators_ndf = ""
     semantic_mode = get_text("import_semantic_mode", settings.import_semantic_mode).upper()
     settings.import_semantic_mode = semantic_mode if semantic_mode in {"REFERENCE", "RAW_DEBUG"} else "REFERENCE"
-    settings.use_atlas_json_mapping = get_bool("use_atlas_json_mapping", settings.use_atlas_json_mapping)
-    settings.use_gfx_json_manifest = get_bool("use_gfx_json_manifest", settings.use_gfx_json_manifest)
-    settings.atlas_json_strict = get_bool("atlas_json_strict", settings.atlas_json_strict)
-    settings.atlas_json_cache_subdir = (
-        get_text("atlas_json_cache_subdir", settings.atlas_json_cache_subdir) or "atlas_json_cache"
-    )
-    settings.gfx_json_cache_subdir = (
-        get_text("gfx_json_cache_subdir", settings.gfx_json_cache_subdir) or "gfx_json_cache"
-    )
+    settings.use_atlas_json_mapping = True
+    settings.use_gfx_json_manifest = True
+    settings.atlas_json_strict = True
+    settings.atlas_json_cache_subdir = "atlas_json_cache"
+    settings.gfx_json_cache_subdir = "gfx_json_cache"
     settings.texture_subdir = "textures"
     settings.cache_dir = get_text("cache_dir", settings.cache_dir) or settings.cache_dir
     settings.use_zz_dat_source = get_bool("use_zz_dat_source", settings.use_zz_dat_source)
@@ -3029,6 +3334,28 @@ def _load_config_into_settings(settings: WARNOImporterSettings, path: Path) -> t
     settings.rotate_y = 0.0
     settings.rotate_z = 0.0
     settings.mirror_y = True
+
+    # --- Multi-game preset layer (backward compatible) ---
+    presets = raw.get("game_presets")
+    active = _normalize_game_id(raw.get("active_game", ""))
+    if not isinstance(presets, dict) or not presets:
+        # Legacy flat config: the flat per-game values ARE the WARNO preset, so
+        # an old WARNO config loads exactly as before.
+        presets = {"WARNO": {k: str(getattr(settings, k, "") or "") for k in _PER_GAME_FIELDS}}
+        active = "WARNO"
+    # ensure every game is selectable (seed missing sections with defaults)
+    for gid in VALID_GAME_IDS:
+        if not isinstance(presets.get(gid), dict):
+            presets[gid] = _default_game_section(gid)
+    # assign the active game without firing the switch callback
+    settings.game_switch_lock = True
+    try:
+        settings.game_preset = active
+    finally:
+        settings.game_switch_lock = False
+    settings.active_game_loaded = active
+    _apply_game_section(settings, presets[active])
+
     _enforce_fixed_runtime_defaults(settings)
     return True, f"Loaded: {path}"
 
@@ -3049,18 +3376,7 @@ def _save_settings_to_config(settings: WARNOImporterSettings, path: Path) -> tup
     raw["skeleton_spk"] = settings.skeleton_spk
     raw["atlas_assets_dir"] = settings.atlas_assets_dir
     raw["tgv_converter"] = str(settings.tgv_converter or "tgv_to_png.py")
-    raw["modding_suite_atlas_wrapper"] = str(settings.modding_suite_atlas_wrapper or "modding_suite_atlas_export.py")
-    raw["modding_suite_atlas_cli"] = str(settings.modding_suite_atlas_cli or "moddingSuite/atlas_cli/moddingSuite.AtlasCli.exe")
-    raw["modding_suite_gfx_wrapper"] = str(settings.modding_suite_gfx_wrapper or "modding_suite_gfx_export.py")
-    raw["modding_suite_gfx_cli"] = str(settings.modding_suite_gfx_cli or "moddingSuite/gfx_cli/moddingSuite.GfxCli.exe")
-    raw["depiction_vehicles_ndf"] = str(settings.depiction_vehicles_ndf or "")
-    raw["depiction_operators_ndf"] = str(settings.depiction_operators_ndf or "")
     raw["import_semantic_mode"] = str(settings.import_semantic_mode or "REFERENCE")
-    raw["use_atlas_json_mapping"] = bool(settings.use_atlas_json_mapping)
-    raw["use_gfx_json_manifest"] = bool(settings.use_gfx_json_manifest)
-    raw["atlas_json_strict"] = bool(settings.atlas_json_strict)
-    raw["atlas_json_cache_subdir"] = str(settings.atlas_json_cache_subdir or "atlas_json_cache")
-    raw["gfx_json_cache_subdir"] = str(settings.gfx_json_cache_subdir or "gfx_json_cache")
     raw["texture_subdir"] = "textures"
     raw["cache_dir"] = settings.cache_dir
     raw["use_zz_dat_source"] = bool(settings.use_zz_dat_source)
@@ -3071,8 +3387,6 @@ def _save_settings_to_config(settings: WARNOImporterSettings, path: Path) -> tup
     raw["auto_textures"] = bool(settings.auto_textures)
     raw["fast_exact_texture_resolve"] = bool(settings.fast_exact_texture_resolve)
     raw["texture_process_timeout_sec"] = int(settings.texture_process_timeout_sec)
-    raw["atlas_cli_timeout_sec"] = int(settings.atlas_cli_timeout_sec)
-    raw["gfx_cli_timeout_sec"] = int(settings.gfx_cli_timeout_sec)
     raw["texture_stage_timeout_sec"] = int(settings.texture_stage_timeout_sec)
     raw["auto_install_tgv_deps"] = bool(settings.auto_install_tgv_deps)
     raw["tgv_deps_dir"] = str(settings.tgv_deps_dir or ".warno_pydeps")
@@ -3094,6 +3408,21 @@ def _save_settings_to_config(settings: WARNOImporterSettings, path: Path) -> tup
     raw["fbx_auto_smooth_mode"] = str(settings.auto_smooth_mode or "OFF").upper()
     raw["fbx_use_auto_smooth"] = str(settings.auto_smooth_mode or "OFF").upper() == "APPLY"
     raw["fbx_auto_smooth_angle"] = float(settings.auto_smooth_angle)
+
+    # --- Multi-game preset layer ---
+    # The active game's per-game values are written both to the flat keys above
+    # (old-reader-safe) and into game_presets[active]; other games keep their
+    # remembered sections untouched.
+    presets = raw.get("game_presets")
+    if not isinstance(presets, dict):
+        presets = {}
+    active = _normalize_game_id(getattr(settings, "game_preset", "WARNO"))
+    presets[active] = _collect_live_game_section(settings)
+    for gid in VALID_GAME_IDS:
+        if not isinstance(presets.get(gid), dict):
+            presets[gid] = _default_game_section(gid)
+    raw["active_game"] = active
+    raw["game_presets"] = presets
 
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -3122,6 +3451,8 @@ def _build_bone_payload(
     rot: dict[str, float],
     skeleton_spks,
     gfx_manifest_info,
+    dev_scale: float = WARNO_DEV_SCALE,
+    off_mat_scale: float = WARNO_OFF_MAT_SCALE,
 ) -> dict[str, Any]:
     gfx_manifest = dict(gfx_manifest_info or {}) if isinstance(gfx_manifest_info, dict) else {}
     gfx_semantic_bones = [
@@ -3352,6 +3683,7 @@ def _build_bone_payload(
                         float(raw_point[0]),
                         float(raw_point[1]),
                         float(raw_point[2]),
+                        scale=off_mat_scale,
                     )
                 except Exception:
                     continue
@@ -3445,7 +3777,7 @@ def _build_bone_payload(
     bone_centers_by_index: Dict[int, Tuple[float, float, float]] = {}
     for bidx, pos in raw_bone_centers_by_index.items():
         try:
-            px, py, pz = _warno_dev_scaled_xyz(float(pos[0]), float(pos[1]), float(pos[2]))
+            px, py, pz = _warno_dev_scaled_xyz(float(pos[0]), float(pos[1]), float(pos[2]), scale=dev_scale)
             bone_centers_by_index[int(bidx)] = (px, py, pz)
         except Exception:
             continue
@@ -3532,15 +3864,20 @@ def _channel_hint_from_stem(stem: str) -> str | None:
         return "diffuse"
     if "normal_x" in low or "normal_y" in low or "normal_z" in low:
         return None
-    if "normal_reconstructed" in low or low.endswith("_nm") or "normal" in low:
+    # NOTE: the loose "<channel> in name" substring tests must NOT fire when the channel word
+    # is the unit-name PREFIX (e.g. "Alpha_Jet" -> the DIFFUSE texture, not an alpha map; "Metal_*"
+    # etc.). Matching a prefix mis-routes the bare diffuse to that channel, so the material ends up
+    # with no Base Color. A channel keyword as a real channel sits at/after a separator, never at
+    # the very start. (This is the "all textures present except the diffuse" bug.)
+    if "normal_reconstructed" in low or low.endswith("_nm") or ("normal" in low and not low.startswith("normal")):
         return "normal"
-    if low.endswith("_o") or low.endswith("_ao") or "occlusion" in low:
+    if low.endswith("_o") or low.endswith("_ao") or ("occlusion" in low and not low.startswith("occlusion")):
         return "occlusion"
-    if low.endswith("_roughness") or low.endswith("_r") or "roughness" in low:
+    if low.endswith("_roughness") or low.endswith("_r") or ("roughness" in low and not low.startswith("roughness")):
         return "roughness"
-    if low.endswith("_metallic") or low.endswith("_m") or "metallic" in low:
+    if low.endswith("_metallic") or low.endswith("_m") or ("metallic" in low and not low.startswith("metallic")):
         return "metallic"
-    if low.endswith("_alpha") or low.endswith("_a") or "alpha" in low:
+    if low.endswith("_alpha") or low.endswith("_a") or ("alpha" in low and not low.startswith("alpha")):
         return "alpha"
     if low.endswith("_d") or "diffuse" in low or "albedo" in low or "color" in low:
         return "diffuse"
@@ -4327,10 +4664,17 @@ def _filter_atlas_targets_by_materials(
                 w == stem_low or w in stem_low or stem_low in w
                 for w in wanted_stems
             )
-            if not matched:
+            tgt = str(entry.get("target_logical_rel", "")).strip()
+            # Keep TRACK textures ('<Unit>_tracks') when the unit has a track material
+            # (Chenille_*), even if the texture's source-FBX stem doesn't match a material stem —
+            # otherwise the track stays untextured (T80BK: target 'T80B_tracks' vs material
+            # 'Chenille_Droite' never matches by stem, so the track refs get filtered away).
+            _tl = tgt.lower()
+            _is_track_tgt = ("track" in _tl) or ("chenille" in _tl) or ("_trk" in _tl)
+            _has_track_mat = any(("chenille" in w) or ("track" in w) or ("trk" in w) for w in wanted_stems)
+            if not matched and not (_is_track_tgt and _has_track_mat):
                 continue
             matched_any = True
-            tgt = str(entry.get("target_logical_rel", "")).strip()
             if tgt and tgt not in target_seen:
                 target_seen.add(tgt)
                 relevant_targets.append(tgt)
@@ -4340,6 +4684,512 @@ def _filter_atlas_targets_by_materials(
         # behavior so a corner case can't silently leave the asset bare.
         return None
     return relevant_targets
+
+
+def _rd_alpha_is_cutout(png_path) -> bool:
+    """True when a combined texture's alpha is a transparency CUTOUT mask (chains /
+    track-teeth gaps — large fully-transparent regions) rather than a smooth spec
+    mask. Cutout -> wire alpha to opacity; spec -> wire alpha (inverted) to roughness.
+    Decided by content (fraction of near-zero alpha) so it works regardless of the
+    texture's DS/DAS naming. PIL is on sys.path by the time this is called."""
+    # Eugen's CombinedD-A-S name has an 'A' slot, but that name is NOT sufficient: the
+    # body atlas and the track/chains atlas are BOTH "CombinedDAS", yet only the latter
+    # packs a real transparency CUTOUT in its alpha. The body's CombinedDAS alpha is a
+    # packed SPEC mask (mostly mid-grey, ZERO fully-transparent pixels) — wiring it to
+    # BSDF Alpha makes the hull see-through (the ikv_103/strv_103 'Chains' bug). So the
+    # decision MUST be made by alpha CONTENT, with the name only used to reject the
+    # CombinedDS family (which never carries a cutout) early.
+    name = Path(str(png_path)).name.lower()
+    if ("combds" in name) or ("combinedds" in name) or ("ddstexture" in name):
+        return False
+    # A genuine CUTOUT has real, mostly-binary transparency: a meaningful fraction of
+    # FULLY-transparent pixels (the gaps between chain links / track teeth). A packed
+    # SPEC mask has ~no transparent pixels (it is a grey gradient). Require real
+    # transparency regardless of the DAS/DS naming. PIL is on sys.path by now.
+    try:
+        from PIL import Image
+        im = Image.open(str(png_path))
+        if im.mode not in ("RGBA", "LA"):
+            return False
+        a = im.getchannel("A").resize((64, 128))
+        data = list(a.getdata())
+        n = len(data) or 1
+        fz = sum(1 for v in data if v < 32) / n           # fully-transparent fraction
+        # Opaque region: a CombinedDAS cutout's "solid" links peak at ~195 (0.76), NOT
+        # 255, so threshold at 150 (a flat spec mask sits at ~128 and never reaches it).
+        fop = sum(1 for v in data if v > 150) / n          # opaque-ish fraction
+        # Cutout == real transparency (>=5% transparent) AND a clear opaque region
+        # (>=5% opaque) -> a binary-ish mask. A packed SPEC mask (the body atlas) has
+        # ~0 transparent pixels (fz fails) and sits flat at mid-grey (fop fails too).
+        return fz >= 0.05 and fop >= 0.05
+    except Exception:
+        return False
+
+
+def _resolve_rd_textures(
+    extractor_mod,
+    spk,
+    settings: "WARNOImporterSettings",
+    asset: str,
+    model_dir: Path,
+    material_ids: Sequence[int],
+    material_name_by_id: Dict[int, str],
+    runtime_info: Dict[str, Any] | None,
+    report: dict,
+) -> tuple[Dict[str, Dict[str, Path]], dict]:
+    """Resolve Wargame RD / SD2 unit textures: material ref (ZZ:/PC/TextureGroup/.../X.png)
+    -> ZZ .tgv (TextureGroup->texture, .png->.tgv via ZZDatResolver.find) -> PNG
+    (tgv_to_png, ZIPO/zlib + DXTn) -> {role: Path} per material. No atlas/C# needed."""
+    import importlib.util
+    maps_by_name: Dict[str, Dict[str, Path]] = {}
+    runtime_info = runtime_info or {}
+    project_root = _project_root(settings)
+
+    # Make PIL + zstandard importable in-process (Blender's Python lacks them; the
+    # plugin bundles them under .warno_pydeps/py<ver>, same as the WARNO converter).
+    _pyver = "py%d%d" % (sys.version_info[0], sys.version_info[1])
+    _deps = _resolve_path(project_root, str(getattr(settings, "tgv_deps_dir", "") or ".warno_pydeps").strip()) / _pyver
+    if _deps.is_dir() and str(_deps) not in sys.path:
+        sys.path.insert(0, str(_deps))
+
+    tgv_path = project_root / "tgv_to_png.py"
+    spec = importlib.util.spec_from_file_location("warno_tgv_conv", str(tgv_path))
+    tgvm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tgvm)
+
+    zz = runtime_info.get("zz_resolver")
+    warno_root_text = str(runtime_info.get("warno_root", "") or getattr(settings, "warno_root", "") or "").strip()
+    if zz is None:
+        zz = extractor_mod.get_zz_runtime_resolver(Path(warno_root_text), game=settings.game_preset)
+    runtime_root = Path(str(runtime_info.get("runtime_root", "")).strip() or (project_root / "out_blender_runtime" / "zz_runtime"))
+    out_tex = model_dir / "textures"
+    try:
+        out_tex.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    try:
+        refs_by_material = spk.get_texture_refs_for_material_ids(material_ids)
+    except Exception:
+        refs_by_material = {}
+
+    png_cache: Dict[str, Path] = {}
+
+    def convert_ref(ref: str):
+        q = str(ref).split(":", 1)[-1]
+        try:
+            q = extractor_mod.normalize_asset_path(q)
+        except Exception:
+            pass
+        hit = zz.find(q)
+        if not hit:
+            return None
+        key = str(hit.get("path", ""))
+        if key in png_cache:
+            return png_cache[key]
+        out_png = out_tex / (Path(key).stem + ".png")
+        if not out_png.exists():
+            try:
+                tgv_file = zz.extract_hit_to_runtime(hit, runtime_root)
+                tgvm.convert_single_tgv(tgv_file, out_png)
+            except Exception:
+                return None
+        if out_png.exists():
+            png_cache[key] = out_png
+            return out_png
+        return None
+
+    # Prefer the combined diffuse+spec texture as the base (it carries the spec
+    # mask in its alpha); fall back to a plain diffuse, then anything else. The
+    # "combined" check is by name, not classify role, so CombinedDS (which the
+    # role classifier reports as generic) still wins and gets its alpha wired.
+    base_priority = {"combined_da": 1, "diffuse": 2, "generic": 3, "orm": 5}
+    for mid in material_ids:
+        name = material_name_by_id.get(int(mid)) or f"Material_{int(mid):03d}"
+        refs = refs_by_material.get(int(mid)) or []
+        maps: Dict[str, Path] = {}
+        best_base = None
+        best_base_combined = False
+        best_pri = 99
+        for ref in refs:
+            role = extractor_mod.classify_texture_role(ref)
+            png = convert_ref(ref)
+            if not png:
+                continue
+            if role == "normal":
+                maps.setdefault("normal", png)
+            elif role == "orm":
+                maps.setdefault("orm", png)
+            # CombinedDS/DAS keep the specular mask in their alpha channel
+            # (DiffuseTextureNoAlpha does not — its alpha is flat 255).
+            is_combined = "combined" in Path(ref).name.lower()
+            pri = 0 if is_combined else base_priority.get(role, 4)
+            if role != "normal" and pri < best_pri:
+                best_pri = pri
+                best_base = png
+                best_base_combined = is_combined
+        if best_base is not None:
+            maps["diffuse"] = best_base
+            if best_base_combined:
+                # CombinedDAS-style alpha is a transparency cutout (chains/teeth);
+                # CombinedDS-style alpha is a spec mask. Decide by content — EXCEPT for
+                # TRACK (chenille) materials: the chenille CombinedDAS alpha IS a real cutout
+                # (sprocket-hole / link gaps) but only ~4% of the atlas is transparent, just
+                # under the content-cutout threshold, so it gets misclassified as a spec mask
+                # -> the diffuse is baked to RGB (alpha dropped) -> the track loses its cutout
+                # (the "white alpha" + solid black gaps the user saw). The TGV name "combdas"
+                # already meant cutout; the content check over-corrected. Force cutout for tracks
+                # AND chains (the ball-chain curtain cards are alpha cutouts too — same ~4%
+                # transparent-atlas misclassification, e.g. merkava LODs where the split doesn't run).
+                _is_track_mat = "chenille" in str(name).lower() or "chain" in str(name).lower()
+                if _is_track_mat or _rd_alpha_is_cutout(best_base):
+                    maps["alpha_cutout"] = best_base
+                else:
+                    maps["spec_alpha"] = best_base
+        if maps:
+            # Clean texture names: copy each resolved map to "<material>_<channel>.png"
+            # so the Blender node shows a sensible name instead of the raw eugen
+            # TextureGroup stem ("tsccombds_combineddstexture01.png"). Copy (not move)
+            # so the shared png_cache originals stay valid; repoint maps at the copies.
+            try:
+                _safe = extractor_mod.sanitize_material_name(name)
+            except Exception:
+                _safe = ""
+            if not _safe:
+                _safe = re.sub(r"[^A-Za-z0-9_]+", "_", str(name)).strip("_") or f"Material_{int(mid):03d}"
+            import shutil as _sh
+            _renamed_src: Dict[str, Path] = {}
+            for _role, _suf in (("diffuse", "D"), ("normal", "NM"), ("orm", "ORM")):
+                _src = maps.get(_role)
+                if not isinstance(_src, Path) or not _src.exists():
+                    continue
+                _dst = out_tex / f"{_safe}_{_suf}.png"
+                try:
+                    if _role == "diffuse" and ("spec_alpha" in maps) and ("alpha_cutout" not in maps):
+                        # Body CombinedDS alpha is a SPEC mask (mostly ~0 -> the file
+                        # reads as ~98% transparent). Bake a NORMAL opaque diffuse at the
+                        # FILE level (the in-game round-trip reads the texture file, not
+                        # the Blender node graph, so an in-Blender invert never helps):
+                        # drop the spec alpha -> a clean opaque colour texture.
+                        from PIL import Image as _PILImage
+                        _PILImage.open(str(_src)).convert("RGB").save(str(_dst))
+                    elif _dst != _src and (not _dst.exists() or (_role == "diffuse" and "alpha_cutout" in maps)):
+                        # cutout diffuse MUST keep its alpha -> overwrite any stale RGB copy
+                        # (a previous build baked it to RGB and the not-exists guard would
+                        # otherwise keep the stale alpha-less file).
+                        _sh.copyfile(str(_src), str(_dst))
+                    if _dst.exists():
+                        _renamed_src[str(_src)] = _dst
+                        maps[_role] = _dst
+                except Exception:
+                    pass
+            # spec_alpha / alpha_cutout point at the same combined file as diffuse —
+            # repoint them at the renamed copy too.
+            for _ak in ("spec_alpha", "alpha_cutout"):
+                _av = maps.get(_ak)
+                if isinstance(_av, Path) and str(_av) in _renamed_src:
+                    maps[_ak] = _renamed_src[str(_av)]
+            # Mark this as a Wargame-RD/SD2 material so the importer uses the
+            # RD-specific node graph (spec-in-alpha -> roughness) instead of the
+            # WARNO atlas graph. WARNO materials never carry this key.
+            maps["rd_material"] = True
+            maps_by_name[name] = maps
+            report["resolved"].append(name)
+    report["atlas_mode"] = "rd_texturegroup"
+    report["atlas_source"] = "zz_texturegroup"
+    _warno_log(settings, f"RD textures resolved: {len(maps_by_name)} materials, {len(png_cache)} unique pngs", stage="texture")
+    return maps_by_name, report
+
+
+def _repair_track_uv_seams(mesh, uv_layer, bucket_uvs, thresh=0.4):
+    """Un-stretch the few RD-track triangles that straddle the texture wrap, KEEPING the
+    exact decoded game UV on every other triangle (1:1). The codec's `& mask` collapses
+    the texture wrap edge to 0, so a handful of triangles get one corner on the opposite
+    side of the tile from the others; mapped onto the CombinedDAS sub-rect they smear the
+    texture diagonally across the triangle ("трикутники летять"). They can't be made
+    contiguous inside a single sub-rect copy (shifting a corner by a tile would leave the
+    rect and sample the chains). So collapse each such triangle's UV to its centroid: it
+    then samples ONE texel (flat) instead of a smear. The track diffuse is near-uniform
+    dark scaly, so a flat triangle is invisible — only the stretched artefact is removed.
+    Every non-straddling triangle keeps its exact decoded UV. RD/SD2 track only."""
+    n = len(bucket_uvs)
+    for poly in mesh.polygons:
+        loops = list(poly.loop_indices)
+        vis = [mesh.loops[li].vertex_index for li in loops]
+        us = [bucket_uvs[vi][0] if vi < n else 0.0 for vi in vis]
+        vs = [bucket_uvs[vi][1] if vi < n else 0.0 for vi in vis]
+        if (max(us) - min(us) > thresh) or (max(vs) - min(vs) > thresh):
+            cu = sum(us) / len(us); cv = sum(vs) / len(vs)
+            for li in loops:
+                uv_layer.data[li].uv = (cu, cv)
+        else:
+            for li, vi in zip(loops, vis):
+                uv_layer.data[li].uv = bucket_uvs[vi] if vi < n else (0.0, 0.0)
+
+
+def _crop_scaly_for_track(combined_png):
+    """Crop the scaly-armour chunk out of a unit's CombinedDAS for use as a TILING track
+    tread texture. CombinedDAS = scaly armour (image top-left) + sawtooth teeth (right
+    edge) + ball-chains (bottom); the track has no dedicated tread texture, so the scaly
+    armour is the closest usable one. Crop a clean inner chunk (no teeth, no chains) that
+    tiles under REPEAT along the tube-unwrapped belt. Returns a Path or None."""
+    try:
+        from PIL import Image
+        p = Path(str(combined_png))
+        im = Image.open(str(p)).convert("RGB")
+        W, H = im.size
+        crop = im.crop((int(0.06 * W), int(0.04 * H), int(0.62 * W), int(0.42 * H)))
+        out = p.with_name(p.stem + "_trackscaly.png")
+        crop.save(str(out))
+        return out
+    except Exception:
+        return None
+
+
+def _cube_project_track_uv(mesh, uv_layer, tiles=40.0):
+    """Per-face triplanar (cube) UV for an RD track (chenille) belt. The belt has faces in
+    several orientations — the radial TREAD faces AND the flat ±side faces you see from the
+    side. A single tube/cylindrical unwrap gives the side faces a DEGENERATE UV (constant
+    across one axis -> the chevron/herringbone smear). Triplanar projects EACH face onto
+    its own dominant-axis plane at a uniform world scale, so every face — tread or side —
+    gets a clean, non-stretched, tiling map. Paired with the REPEAT scaly-crop material.
+    `tiles` sets texel density (bbox span / tiles per repeat). RD/SD2 track only."""
+    verts = mesh.vertices
+    if len(verts) == 0:
+        return
+    xs = [v.co.x for v in verts]; ys = [v.co.y for v in verts]; zs = [v.co.z for v in verts]
+    span = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)) or 1.0
+    S = (span / float(tiles)) or 1.0
+    for poly in mesh.polygons:
+        nm = poly.normal
+        ax, ay, az = abs(nm.x), abs(nm.y), abs(nm.z)
+        if ax >= ay and ax >= az:
+            comp = 0
+        elif ay >= az:
+            comp = 1
+        else:
+            comp = 2
+        for li, vi in zip(poly.loop_indices, poly.vertices):
+            co = verts[vi].co
+            if comp == 0:
+                uu, vv = co.y, co.z
+            elif comp == 1:
+                uu, vv = co.x, co.z
+            else:
+                uu, vv = co.x, co.y
+            uv_layer.data[li].uv = (uu / S, vv / S)
+
+
+def _tube_unwrap_track(verts):
+    """Tube/cylindrical UV unwrap for an RD track (chenille) belt — fixes the texture
+    stretch at the CURVED ends that the decoded file UV has (the game regenerates a
+    per-link UV at runtime via IndexedChenilles; that runtime UV is not in the file, so
+    the file UV maps the belt as if flat and smears around the idler/sprocket).
+
+    The belt is a closed loop band. We unwrap it as a tube: U = arc length around the
+    loop, V = position across the belt width — giving uniform, square texels everywhere
+    INCLUDING the curves. Robust to the model's orientation and to the part holding BOTH
+    tracks (left+right): PCA finds the principal axes; the most BIMODAL axis is the
+    width/separation axis (the gap between the two tracks); the loop lies in the other
+    two axes. Each track is unwrapped independently around its own centre.
+
+    `verts` is a flat list of (x,y,z) in the SAME space the mesh is built in (bucket
+    space). Returns a per-vertex list of (u,v); U tiles along the belt (≈ perimeter/width
+    so texels stay square), V in [0,1] across the width. Caller folds V into the texture
+    sub-rect. RD/SD2 track only — never called for WARNO geometry."""
+    import numpy as np
+    import math as _m
+    P = np.asarray(verts, dtype=float).reshape(-1, 3)
+    n = len(P)
+    out = [(0.0, 0.0)] * n
+    if n < 6:
+        return out
+    c = P.mean(0)
+    Q = P - c
+    # PCA (eigh -> ascending eigenvalues; columns are axes)
+    try:
+        w, v = np.linalg.eigh(Q.T @ Q)
+    except Exception:
+        return out
+    A = Q @ v   # projections onto principal axes
+    # Width/separation axis = the most bimodal projection (largest empty central gap).
+    def _gap(vals):
+        if vals.max() - vals.min() < 1e-6:
+            return 0
+        h, _ = np.histogram(vals, bins=12)
+        return int((h[3:9] == 0).sum())
+    waxis = int(np.argmax([_gap(A[:, i]) for i in range(3)]))
+    other = [i for i in range(3) if i != waxis]
+    wv = A[:, waxis]
+    split = (wv.max() + wv.min()) / 2.0   # between the two track clusters
+    res = np.zeros((n, 2))
+    N = 240
+    for side in (0, 1):
+        mask = (wv < split) if side == 0 else (wv >= split)
+        idx = np.where(mask)[0]
+        if len(idx) < 3:
+            continue
+        a = A[idx][:, other[0]]
+        b = A[idx][:, other[1]]
+        ws = A[idx][:, waxis]
+        ca = a.mean(); cb = b.mean()
+        th = np.arctan2(b - cb, a - ca)               # angle around the loop
+        binix = (((th + _m.pi) / (2 * _m.pi)) * N).astype(int) % N
+        cent = np.zeros((N, 2)); cnt = np.zeros(N)
+        for k in range(len(idx)):
+            bi = binix[k]; cent[bi, 0] += a[k]; cent[bi, 1] += b[k]; cnt[bi] += 1
+        filled = [bi for bi in range(N) if cnt[bi] > 0]
+        if len(filled) < 3:
+            continue
+        for bi in filled:
+            cent[bi] /= cnt[bi]
+        # cumulative TRUE arc length around the ordered loop (not raw angle -> no end
+        # compression on the elongated stadium loop)
+        arclen = np.zeros(N); cum = 0.0
+        for i in range(1, len(filled)):
+            p = cent[filled[i]]; qq = cent[filled[i - 1]]
+            cum += _m.hypot(p[0] - qq[0], p[1] - qq[1]); arclen[filled[i]] = cum
+        p = cent[filled[0]]; qq = cent[filled[-1]]
+        perim = cum + _m.hypot(p[0] - qq[0], p[1] - qq[1])
+        if perim < 1e-6:
+            perim = 1.0
+        width = float(ws.max() - ws.min()) or 1.0
+        tiles = perim / width                          # square texels
+        wmin = float(ws.min())
+        for k in range(len(idx)):
+            bi = binix[k]
+            al = arclen[bi]
+            if cnt[bi] == 0:
+                bi = min(filled, key=lambda x: abs(x - bi)); al = arclen[bi]
+            res[idx[k], 0] = al / perim * tiles
+            res[idx[k], 1] = (ws[k] - wmin) / width
+    return [(float(res[i, 0]), float(res[i, 1])) for i in range(n)]
+
+
+def _split_track_chains_textures(model, material_name_by_id, maps_by_name):
+    """RD/SD2: split the shared CombinedDAS atlas into a separate TRACKS texture (the tread
+    = top half) and a CHAINS texture (ball-chains = bottom half), each written as its own
+    PNG with a generated BINARY ALPHA map (WARNO-style — the alpha PNG is a clean 0/255
+    cutout that plugs straight into BSDF Alpha, so the shader needs no GreaterThan node).
+
+    The decoded UV is kept exactly as the game has it: the track samples the top of the
+    atlas, the chains the bottom. So each split file keeps its own half and BLANKS the
+    other half (RGB->black, alpha->0); that way each material owns a texture with only its
+    content while the existing UV still lands on the right pixels (no UV remap needed).
+
+    Files are named from the source atlas texture: <stem>_tracks.png / _tracks_alpha.png
+    and <stem>_chains.png / _chains_alpha.png. Track = the chenille part's material; chains
+    = a non-track material whose name contains 'chain'. Gated on the chenille flag, so
+    WARNO never enters this path."""
+    try:
+        from PIL import Image
+        parts = model.get("parts") or []
+
+        def mname(mid):
+            return str((material_name_by_id or {}).get(int(mid), "") or "")
+
+        track_mids = {
+            int(p["material"]) for p in parts
+            if isinstance(p.get("vertices"), dict) and p["vertices"].get("chenille")
+            and p.get("material") is not None
+        }
+        # Track parts baked from a POST-VS getter carry tread_full_uv: the game binds the
+        # FULL CombinedDAS tread strip (256x256) and the UV spans its full height. For those
+        # use the WHOLE texture (no top-half crop) and DON'T remap the UV into a crop sub-rect
+        # — that half-crop+remap was the stretch/seam bug. File-only/legacy tracks keep the crop.
+        track_full_uv = {
+            int(p["material"]) for p in parts
+            if isinstance(p.get("vertices"), dict) and p["vertices"].get("chenille")
+            and p["vertices"].get("tread_full_uv") and p.get("material") is not None
+        }
+        # WARNO-safety: this whole split (track AND chains) is an RD/SD2-only feature.
+        # Gate it on the chenille flag — if the model has no track part, do NOT touch any
+        # material (the chain-name match alone is NOT a reliable RD signal, and WARNO must
+        # stay byte-for-byte unchanged). Only RD/SD2 track units have a chenille part.
+        if not track_mids:
+            return
+        chain_mids = {
+            int(p["material"]) for p in parts
+            if p.get("material") is not None and int(p["material"]) not in track_mids
+            and "chain" in mname(p["material"]).lower()
+        }
+
+        def _make(combined_png, region, full=False):
+            # full=True: the WHOLE CombinedDAS (the complete tread strip, game-exact). Else a
+            # TRUE 1:1 crop of the part's half of the atlas (256x256), not a blanked copy.
+            p = Path(str(combined_png))
+            im = Image.open(str(p)).convert("RGBA")
+            W, H = im.size
+            if full:
+                crop = im
+            else:
+                half = H // 2
+                box = (0, 0, W, half) if region == "tracks" else (0, half, W, H)
+                crop = im.crop(box)
+            r, g, b, a = crop.split()
+            rgb = Image.merge("RGB", (r, g, b))
+            abin = a.point(lambda v: 255 if v >= 76 else 0).convert("L")  # binary cutout
+            # WARNO-style clean texture names: "<base>_D.png" (diffuse) + "<base>_A.png"
+            # (alpha) — the source diffuse is already "<base>_D.png" (e.g. Droite_D.png).
+            # (was the verbose "<stem>_tracks_full[_alpha].png".)
+            _base = p.stem[:-2] if p.stem.lower().endswith("_d") else p.stem
+            rgb_p = p.with_name(_base + "_D.png"); rgb.save(str(rgb_p))
+            # If the source atlas alpha for this region is FULLY OPAQUE, the binary mask is a
+            # useless blank-WHITE PNG (e.g. the leopard tread strip alpha = all 255). Wiring it
+            # into BSDF Alpha then renders the belt WHITE/washed in Material-Preview/Solid on
+            # some GPUs (user: "track alpha texture is completely white"). A solid belt needs no
+            # cutout -> emit no alpha file; the caller renders it opaque.
+            if abin.getextrema()[0] >= 255:
+                return rgb_p, None
+            al_p = p.with_name(_base + "_A.png"); abin.save(str(al_p))
+            return rgb_p, al_p
+
+        cache = {}
+
+        def _apply(mid, region):
+            nm = (material_name_by_id or {}).get(int(mid))
+            m = (maps_by_name or {}).get(nm) if nm else None
+            if not isinstance(m, dict):
+                return
+            comb = m.get("diffuse")
+            if not comb:
+                return
+            full = (region == "tracks" and int(mid) in track_full_uv)
+            key = (str(comb), region, full)
+            if key not in cache:
+                cache[key] = _make(comb, region, full)
+            rgb_p, al_p = cache[key]
+            for k in ("alpha_cutout", "spec_alpha", "track_repeat", "force_opaque", "uv_crop"):
+                m.pop(k, None)
+            m["diffuse"] = rgb_p
+            if al_p is not None:
+                m["alpha"] = al_p             # separate binary alpha (WARNO-style)
+            else:
+                # No cutout in the source alpha -> render the belt OPAQUE (do NOT wire a
+                # blank-white alpha). track_repeat = opaque + REPEAT so the tread UV tails
+                # outside [0,1] still tile seamlessly.
+                m.pop("alpha", None)
+                m["track_repeat"] = True
+            if full:
+                # FULL game tread strip + the post-VS UV used 1:1 (no crop remap). REPEAT (set
+                # via the alpha path) tiles the few V values just outside [0,1]. This is the
+                # game-exact path (texture pixel-identical to CombinedDAS, UV = post-VS).
+                pass
+            else:
+                # The crop covers this Blender-V region of the full atlas; the importer remaps
+                # the decoded UV into [0,1] of the crop so it fills the texture like the get.
+                m["uv_crop"] = (0.5, 1.0) if region == "tracks" else (0.0, 0.5)
+
+        for mid in track_mids:
+            _apply(mid, "tracks")
+        for mid in chain_mids:
+            _apply(mid, "chains")
+    except Exception:
+        pass
+
+
+# Back-compat alias for existing call sites.
+_force_opaque_baked_tracks = _split_track_chains_textures
 
 
 def _resolve_material_maps(
@@ -4373,6 +5223,24 @@ def _resolve_material_maps(
     }
     if not settings.auto_textures:
         return maps_by_name, report
+
+    # Wargame RD / SD2 store unit textures as standalone .tgv in the ZZ TextureGroup
+    # (no WARNO-style atlas). Resolve them directly and return BEFORE the atlas-path
+    # validation below (which requires a WARNO atlas folder RD does not have).
+    try:
+        _gid = _normalize_game_id(getattr(settings, "game_preset", "WARNO"))
+    except Exception:
+        _gid = "WARNO"
+    if _gid in ("WARGAME_RD", "STEEL_DIVISION_2"):
+        try:
+            return _resolve_rd_textures(
+                extractor_mod, spk, settings, asset, model_dir,
+                material_ids, material_name_by_id, runtime_info, report,
+            )
+        except Exception as exc:  # never block geometry import on texture failure
+            _warno_log(settings, f"RD texture resolve failed: {exc}", stage="texture")
+            report["errors"].append(f"rd_texture:{exc}")
+            return maps_by_name, report
 
     _warno_log(settings, f"texture resolve start asset={asset}", stage="texture")
 
@@ -4457,6 +5325,7 @@ def _resolve_material_maps(
                         atlas_cli_path=atlas_cli_path,
                         force_rebuild=False,
                         timeout_sec=max(5, int(settings.atlas_cli_timeout_sec)),
+                        game=_normalize_game_id(getattr(settings, "game_preset", "WARNO")),
                     )
                     atlas_map_path_text = str(atlas_map_info.get("atlas_map_path", "")).strip()
                     atlas_map_path = Path(atlas_map_path_text) if atlas_map_path_text else None
@@ -4663,6 +5532,20 @@ def _resolve_material_maps(
                 log_level="INFO",
                 stage="texture",
             )
+            # Move the visible progress bar/cursor during the (slow) per-texture TGV decode
+            # so this phase doesn't look frozen. Textures span ~the 50%->60% band.
+            try:
+                _tpct = int(round(50.0 + 10.0 * (float(idx) / float(max(1, total_refs)))))
+                _tc = 24
+                _tf = max(0, min(_tc, int(round(_tc * _tpct / 100.0))))
+                print(f"[WARNO] {'█' * _tf}{'░' * (_tc - _tf)} {_tpct:3d}% | "
+                      f"resolving textures {idx}/{total_refs}", flush=True)
+                _wm = bpy.context.window_manager
+                if _wm is not None:
+                    _wm.progress_update(int(_tpct))
+                    _wm.status_text_set(f"WARNO import {_tpct}% — resolving textures ({idx}/{total_refs})")
+            except Exception:
+                pass
 
         def _resolve_with_converter(conv_path: Path):
             return extractor_mod.resolve_texture_from_atlas_ref(
@@ -5058,6 +5941,226 @@ def _resolve_material_maps(
     return maps_by_name, report
 
 
+def _split_track_by_side(
+    tris: Sequence[Tuple[int, int, int]],
+    rotated_vertices: Sequence[Tuple[float, float, float]],
+) -> Dict[str, List[Tuple[int, int, int]]]:
+    """Split a single RD track mesh (which spans BOTH belts) into the left and right
+    belt by geometry. RD tracks have no usable bone names, so the only robust signal
+    is position: each belt is a separate connected component sitting on one side of
+    the Y=0 mid-plane (left = -Y / Gauche, right = +Y / Droite). Group whole connected
+    components by their centroid-Y sign; if connectivity yields a single welded blob
+    (or all on one side), fall back to a per-triangle centroid-Y partition. Returns
+    {"left": [...], "right": [...]}. Pure geometry, used only for the RD chenille
+    branch — WARNO tracks already split per-material and never reach this."""
+    out: Dict[str, List[Tuple[int, int, int]]] = {"left": [], "right": []}
+    tri_list = [tuple(int(v) for v in t) for t in tris if len(t) == 3]
+    vcount = len(rotated_vertices)
+    if not tri_list or vcount <= 0:
+        return out
+
+    def _comp_cy(tri_indices: Sequence[int]) -> float:
+        ys: List[float] = []
+        for ti in tri_indices:
+            for v in tri_list[ti]:
+                if 0 <= v < vcount:
+                    ys.append(float(rotated_vertices[v][1]))
+        return (sum(ys) / len(ys)) if ys else 0.0
+
+    vert_to_tris: Dict[int, List[int]] = defaultdict(list)
+    for ti, tri in enumerate(tri_list):
+        a, b, c = tri
+        if min(a, b, c) < 0 or max(a, b, c) >= vcount:
+            continue
+        vert_to_tris[a].append(ti)
+        vert_to_tris[b].append(ti)
+        vert_to_tris[c].append(ti)
+
+    visited: set[int] = set()
+    components: List[List[int]] = []
+    for start in range(len(tri_list)):
+        if start in visited:
+            continue
+        queue = [start]
+        visited.add(start)
+        comp: List[int] = []
+        while queue:
+            cur = queue.pop()
+            comp.append(cur)
+            for v in tri_list[cur]:
+                for nei in vert_to_tris.get(v, []):
+                    if nei not in visited:
+                        visited.add(nei)
+                        queue.append(nei)
+        if comp:
+            components.append(comp)
+
+    if len(components) >= 2:
+        for comp in components:
+            side = "right" if _comp_cy(comp) >= 0.0 else "left"
+            out[side].extend(tri_list[ti] for ti in comp)
+
+    # Fallback: a single welded component (or everything landed on one side) ->
+    # partition per-triangle by its own centroid Y.
+    if not out["left"] or not out["right"]:
+        out = {"left": [], "right": []}
+        for tri in tri_list:
+            ys = [float(rotated_vertices[v][1]) for v in tri if 0 <= v < vcount]
+            cy = (sum(ys) / len(ys)) if ys else 0.0
+            out["right" if cy >= 0.0 else "left"].append(tri)
+    return out
+
+
+def _chassis_face_components(nverts: int, faces) -> List[List[int]]:
+    """Connected components of a triangle soup by SHARED VERTEX INDEX. Returns a list of
+    face-index lists (one per disconnected mesh island). Union-find with path halving."""
+    if nverts <= 0 or not faces:
+        return []
+    parent = list(range(nverts))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for f in faces:
+        a, b, c = int(f[0]), int(f[1]), int(f[2])
+        ra, rb, rc = find(a), find(b), find(c)
+        if ra != rb:
+            parent[rb] = ra
+        if ra != rc:
+            parent[find(rc)] = ra
+    comp: Dict[int, List[int]] = {}
+    for fi, f in enumerate(faces):
+        comp.setdefault(find(int(f[0])), []).append(fi)
+    return list(comp.values())
+
+
+def _subbucket_from_faces(b: dict, face_indices, name: str, *, is_hull: bool) -> dict:
+    """Build a new bucket holding only `face_indices` of bucket `b`, re-indexing vertices.
+    Copies b's metadata (group_bone_index, diagnostics, ...). Peeled (non-hull) subparts get
+    a centroid origin via warno_rd_origin."""
+    verts = b.get("vertices") or []
+    uvs = b.get("uvs") or []
+    srcs = b.get("source_refs") or []
+    fmids = b.get("face_mids") or []
+    faces = b.get("faces") or []
+    remap: Dict[int, int] = {}
+    nv: List[Any] = []
+    nuv: List[Any] = []
+    nsrc: List[Any] = []
+    nf: List[Any] = []
+    nfm: List[Any] = []
+    for fi in face_indices:
+        f = faces[int(fi)]
+        tri: List[int] = []
+        for vi in (int(f[0]), int(f[1]), int(f[2])):
+            mapped = remap.get(vi)
+            if mapped is None:
+                mapped = len(nv)
+                remap[vi] = mapped
+                nv.append(verts[vi])
+                nuv.append(uvs[vi] if vi < len(uvs) else (0.0, 0.0))
+                nsrc.append(srcs[vi] if vi < len(srcs) else (0, 0))
+            tri.append(mapped)
+        nf.append((tri[0], tri[1], tri[2]))
+        nfm.append(fmids[int(fi)] if int(fi) < len(fmids) else 0)
+    nb = dict(b)
+    nb["group_name"] = str(name)
+    nb["vertices"] = nv
+    nb["uvs"] = nuv
+    nb["source_refs"] = nsrc
+    nb["faces"] = nf
+    nb["face_mids"] = nfm
+    if isinstance(b.get("diagnostics"), dict):
+        d = dict(b["diagnostics"])
+        d["group_name"] = str(name)
+        nb["diagnostics"] = d
+    if not is_hull:
+        nb["warno_rd_origin"] = True  # peeled detail: object builder gives it a centroid origin
+        nb["warno_peeled_name"] = str(name)  # name the object by this, not the inherited Chassis bone
+    return nb
+
+
+def _peel_chassis_welded_subparts(
+    buckets: List[dict],
+    *,
+    max_ratio: float = 0.06,
+    min_tris: int = 8,
+    max_subparts: int = 16,
+) -> List[dict]:
+    """RD/SD2 only: peel the obvious WELDED ANTENNAS/AERIALS/MASTS out of the Chassis/MainBody
+    bucket into their own movable objects. These thin vertical rods share the chassis bone, so
+    the name-based split can't separate them — only geometry can. We peel ONLY clearly
+    antenna-like islands (tall + thin: height >= 2.5x its widest horizontal extent) so the rest
+    of the hull (boxes, fenders, lights, the bolts) is NEVER shattered into junk objects (an
+    earlier all-islands peel produced 64 fragments). Caller gates on model_is_rd -> WARNO
+    untouched."""
+    result: List[dict] = []
+    for b in buckets:
+        gname = _norm_low(str(b.get("group_name", "")))
+        faces = b.get("faces") or []
+        if gname not in {"chassis", "mainbody"} or len(faces) < max(36, min_tris * 3):
+            result.append(b)
+            continue
+        comps = _chassis_face_components(len(b.get("vertices") or []), faces)
+        if len(comps) <= 1:
+            result.append(b)
+            continue
+        comps.sort(key=lambda c: -len(c))
+        total = len(faces)
+        verts = b.get("vertices") or []
+
+        def _comp_extent(face_list):
+            vs = set()
+            for fi in face_list:
+                f = faces[int(fi)]
+                vs.update((int(f[0]), int(f[1]), int(f[2])))
+            xs = [float(verts[v][0]) for v in vs]
+            ys = [float(verts[v][1]) for v in vs]
+            zs = [float(verts[v][2]) for v in vs]
+            return (max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs),
+                    (sum(xs) / len(xs), sum(ys) / len(ys), sum(zs) / len(zs)))
+
+        keep: set = set(comps[0])  # largest component is always the hull
+        # Unit scale = bbox diagonal of the WHOLE chassis bucket (not just the largest
+        # component — a multi-shell hull like the S-tank fragments, which would understate the
+        # scale and let slivers through). A REAL antenna/mast is tall relative to the unit;
+        # small thin slivers (a row of smoke launchers, tiny fittings) are not. Without this,
+        # stridsvagn peeled 15 sliver objects and ikv peeled tiny 0.1m bits.
+        allx = [float(v[0]) for v in verts]
+        ally = [float(v[1]) for v in verts]
+        allz = [float(v[2]) for v in verts]
+        hull_diag = max((
+            (max(allx) - min(allx)) ** 2
+            + (max(ally) - min(ally)) ** 2
+            + (max(allz) - min(allz)) ** 2
+        ) ** 0.5, 1.0e-3) if verts else 1.0
+        subs: List[List[int]] = []
+        for c in comps[1:]:
+            ntri = len(c)
+            if len(subs) >= max_subparts or ntri < int(min_tris) or ntri > int(total * max_ratio):
+                keep.update(c)
+                continue
+            dx, dy, dz, _cen = _comp_extent(c)
+            tall_thin = dz >= 2.5 * max(dx, dy, 1.0e-6)
+            tall_abs = dz >= 0.10 * hull_diag
+            if tall_thin and tall_abs:  # tall + thin + tall-relative-to-unit -> antenna/mast ONLY
+                subs.append(c)
+            else:
+                keep.update(c)  # boxes / hatches / fenders / slivers stay welded (no junk objects)
+        if not subs:
+            result.append(b)
+            continue
+        # deterministic numbering by centroid
+        subs.sort(key=lambda c: tuple(round(v, 3) for v in _comp_extent(c)[3]))
+        result.append(_subbucket_from_faces(b, sorted(keep), str(b.get("group_name", "Chassis")), is_hull=True))
+        for n_ant, c in enumerate(subs, start=1):
+            result.append(_subbucket_from_faces(b, c, f"Antenna_{n_ant:02d}", is_hull=False))
+    return result
+
+
 def _collect_mesh_buckets(
     extractor_mod,
     model: dict[str, Any],
@@ -5068,6 +6171,9 @@ def _collect_mesh_buckets(
     bone_parent_by_index: Dict[int, int],
     bone_positions: Dict[str, List[float]],
     split_main_parts: bool,
+    dev_scale: float = WARNO_DEV_SCALE,
+    material_maps_by_name: Dict[str, Any] = None,
+    is_rd_asset: bool = False,
 ) -> list[dict[str, Any]]:
     buckets: Dict[str, dict[str, Any]] = {}
     order: List[str] = []
@@ -5266,6 +6372,43 @@ def _collect_mesh_buckets(
             return None
         return keep_chassis, dict(assignments)
 
+    # Wargame RD / SD2 skinned units: the skeleton has no usable bone names, so a
+    # per-bone split shatters the body into messy named/"Part_NNN" fragments, each
+    # with a tiny sub-region UV (looks "squished"). Detect such a model by its
+    # chenille (track) part and keep all non-track geometry as ONE MainBody with a
+    # full UV; only the tracks are split out (below). WARNO never sets chenille.
+    model_is_rd = any(
+        bool(p.get("vertices", {}).get("chenille"))
+        for p in model.get("parts", [])
+    )
+    # Wargame RD / SD2 used to fall back to a geometric body split because its
+    # skeleton bone names decoded to control-byte garbage. The node-blob name
+    # table is now decoded correctly (see SpkMeshExtractor._parse_concat_names_fixed),
+    # so RD bodies carry real bone names (chassis / tourelle_01 / canon_01 /
+    # roue_d* / roue_g* ...). When those names are present, route the RD BODY through
+    # the exact same named-bone split WARNO uses, so RD imports gain real part names,
+    # vertex groups + weights, bone-pivot origins and the empty-bone hierarchy — i.e.
+    # parity with WARNO. The chenille (track) parts are still handled by the RD-only
+    # branch above (geometric belt split + track UV), and the geometric rd_split_body_part
+    # remains the fallback when no usable names were resolved.
+    _model_has_named_bones = any(str(v).strip() for v in (bone_name_by_index or {}).values())
+
+    # Map each track belt side -> its real skeleton bone index (chenille_droite_01 /
+    # chenille_gauche_01). The RD belt split is geometric, but tagging each belt with
+    # its own chenille bone lets the downstream builder name it Chenille_Droite_01 /
+    # Chenille_Gauche_01, give it the belt's bone-pivot origin and parent it under the
+    # chassis — i.e. WARNO parity. Without this the belts inherited the chassis bone
+    # (default_root_bone_index) and, once real RD names were decoded, both collided
+    # into "Chassis_2 / Chassis_3". Empty when names are unavailable -> belts keep the
+    # old chassis-rooted fallback.
+    _chenille_bone_idx_by_side: Dict[str, int] = {}
+    for _bidx, _bnm in (bone_name_by_index or {}).items():
+        _low = _norm_low(str(_bnm or ""))
+        if _low.startswith("chenille_droite") and "right" not in _chenille_bone_idx_by_side:
+            _chenille_bone_idx_by_side["right"] = int(_bidx)
+        elif _low.startswith("chenille_gauche") and "left" not in _chenille_bone_idx_by_side:
+            _chenille_bone_idx_by_side["left"] = int(_bidx)
+
     for part_i, part in enumerate(model.get("parts", [])):
         indices = part.get("indices", [])
         xyz = part.get("vertices", {}).get("xyz", [])
@@ -5281,7 +6424,7 @@ def _collect_mesh_buckets(
             y = float(xyz[vi * 3 + 1])
             z = float(xyz[vi * 3 + 2])
             rx, ry, rz = extractor_mod.apply_rotation(x, y, z, rot)
-            rx, ry, rz = _warno_dev_scaled_xyz(float(rx), float(ry), float(rz))
+            rx, ry, rz = _warno_dev_scaled_xyz(float(rx), float(ry), float(rz), scale=dev_scale)
             rotated.append((rx, ry, rz))
             if vi * 2 + 1 < len(uv):
                 uu = float(uv[vi * 2 + 0])
@@ -5295,9 +6438,64 @@ def _collect_mesh_buckets(
         mat_name = material_name_by_id.get(mid, f"Material_{mid:03d}")
         fallback = f"Part_{part_i:03d}"
 
+        # Wargame RD / SD2 track geometry is flagged by the IRISZoom decoder
+        # (the vertex type carries a "NormalAndChenilleIndex" field). Keep the whole
+        # chenille part as ONE separate "Chenille" object instead of folding it into
+        # MainBody (its big tiling-strip UVs were what made the body UV look cramped)
+        # — and do NOT bone-split it (its per-link bones would shatter it into pieces).
+        # WARNO geometry never sets this flag, so WARNO bucketing is unchanged.
+        is_chenille = bool(part.get("vertices", {}).get("chenille"))
+
+        # RD ball-chains ("цепури"): a NON-chenille part whose material is a cutout
+        # CombinedDAS (the ball-chain belt shares the track's atlas). Peel it into its OWN
+        # "Chains" object — like the track's "Chenille" object — so its UV + alpha cutout
+        # never conflict with the merged MainBody. Identify it by the material maps
+        # (alpha_cutout / uv_crop are RD-only keys, set only for CombinedDAS cutouts), not
+        # by the unreliable material name. WARNO never sets these keys, so it's unaffected.
+        _ch_maps = (material_maps_by_name or {}).get(mat_name) or {}
+        is_chains = (not is_chenille) and bool(
+            _ch_maps.get("alpha_cutout") or _ch_maps.get("uv_crop")
+        )
+
         group_payloads: List[Dict[str, Any]] = []
-        if split_main_parts:
-            if bone_name_by_index and hasattr(extractor_mod, "split_faces_by_bone_deterministic"):
+        if is_chenille:
+            # RD track is ONE mesh spanning BOTH belts. Split it into the left
+            # (Chenille_Gauche, -Y) and right (Chenille_Droite, +Y) belt so each is a
+            # separate object + per-side material, mirroring WARNO. Pure geometry (RD
+            # has no usable bone names). Falls back to one "Chenille" if degenerate.
+            _track_sides = _split_track_by_side(_all_tris(indices), rotated)
+            group_payloads = []
+            for _side_key, _side_label in (("left", "Chenille_Gauche"), ("right", "Chenille_Droite")):
+                _side_tris = _track_sides.get(_side_key) or []
+                if _side_tris:
+                    _side_bone = int(_chenille_bone_idx_by_side.get(_side_key, default_root_bone_index))
+                    group_payloads.append({
+                        "group_name_raw": _side_label,
+                        "group_name_sanitized": _side_label,
+                        "group_bone_index": _side_bone,
+                        "tris": list(_side_tris),
+                    })
+            if not group_payloads:
+                group_payloads = [{
+                    "group_name_raw": "Chenille",
+                    "group_name_sanitized": "Chenille",
+                    "group_bone_index": int(default_root_bone_index),
+                    "tris": _all_tris(indices),
+                }]
+        elif is_chains:
+            group_payloads = [{
+                "group_name_raw": "Chains",
+                "group_name_sanitized": "Chains",
+                "group_bone_index": int(default_root_bone_index),
+                "tris": _all_tris(indices),
+            }]
+        elif split_main_parts and (not model_is_rd or _model_has_named_bones):
+            # Bone-split when the skeleton yielded usable (non-empty) bone names.
+            # WARNO always does; Wargame-RD now does too (real names decoded from the
+            # skeleton node blob). Tracks were already separated via the chenille
+            # branch above. Falls back to a single MainBody if the split yields nothing.
+            _has_named_bones = any(str(v).strip() for v in (bone_name_by_index or {}).values())
+            if _has_named_bones and hasattr(extractor_mod, "split_faces_by_bone_deterministic"):
                 try:
                     group_payloads = extractor_mod.split_faces_by_bone_deterministic(
                         part=part,
@@ -5309,7 +6507,7 @@ def _collect_mesh_buckets(
                     )
                 except Exception:
                     group_payloads = []
-            elif bone_name_by_index and hasattr(extractor_mod, "split_faces_by_bone_top_level"):
+            elif _has_named_bones and hasattr(extractor_mod, "split_faces_by_bone_top_level"):
                 # Backward compatibility with older extractor builds.
                 try:
                     group_payloads = extractor_mod.split_faces_by_bone_top_level(
@@ -5366,6 +6564,25 @@ def _collect_mesh_buckets(
                         patched_groups.append(g)
                     if patched_groups:
                         group_payloads = patched_groups
+        elif model_is_rd and split_main_parts and hasattr(extractor_mod, "rd_split_body_part"):
+            # RD body has no usable bone names, but the IRISZoom per-vertex dominant
+            # bone index + geometry let us auto-split it into MainBody / Canon (gun) /
+            # Tourelle (gun mount or turret) / Roue_D*/Roue_G* (roadwheels), mirroring
+            # WARNO. rd_split_body_part never shatters (single MainBody on ambiguity);
+            # each group carries an "origin" (cluster centroid) applied per-object later.
+            try:
+                group_payloads = extractor_mod.rd_split_body_part(
+                    part.get("vertices", {}) or {}, rotated, _all_tris(indices),
+                ) or []
+            except Exception:
+                group_payloads = []
+            if not group_payloads:
+                group_payloads = [{
+                    "group_name_raw": "MainBody",
+                    "group_name_sanitized": "MainBody",
+                    "group_bone_index": int(default_root_bone_index),
+                    "tris": _all_tris(indices),
+                }]
         else:
             group_payloads = [{
                 "group_name_raw": "MainBody",
@@ -5400,6 +6617,21 @@ def _collect_mesh_buckets(
                 order.append(key)
             elif int(bucket.get("group_bone_index", -1)) < 0 and int(group_bone_index) >= 0:
                 bucket["group_bone_index"] = int(group_bone_index)
+            # RD body-split groups carry an "origin" -> flag the bucket so the object
+            # builder sets its origin to the part's centroid (RD has no bone pivots).
+            if "origin" in group:
+                bucket["warno_rd_origin"] = True
+            # RD wheels: their skeleton roue_* bone pivots routinely resolve to the world
+            # origin (the wheel mesh carries its own world position), which would leave the
+            # wheel pivot at (0,0,0). Flag them so the object builder gives each a
+            # geometric-centroid origin (the wheel centre). The armature pass runs AFTER but
+            # skips objects carrying this centroid (so it isn't clobbered back to 0,0,0).
+            # Body/turret/gun keep their resolved bone-pivot origin; tracks (chenille) keep
+            # the native track-deform setup untouched. RD-only; WARNO never reaches this.
+            if model_is_rd:
+                _gn_low_origin = _norm_low(str(group_name or ""))
+                if _gn_low_origin.startswith("roue"):
+                    bucket["warno_rd_origin"] = True
 
             group_diag = group.get("diagnostics", {})
             if not isinstance(group_diag, dict):
@@ -5466,6 +6698,11 @@ def _collect_mesh_buckets(
                     face_mids=b.get("face_mids", []) or [],
                     source_refs=b.get("source_refs", []) or [],
                     group_name=str(b.get("group_name", "") or ""),
+                    # RD/SD2: skip the tri->quad merge. For RD geometry the merge emits
+                    # quads that render as HOLES (the real cause of the leopard hull holes,
+                    # proven by ON/OFF frozen-camera renders). WARNO keeps the merge ->
+                    # byte-identical. RD keeps all triangles (watertight, verified).
+                    merge_quads=(not bool(model_is_rd)),
                 )
             except Exception:
                 cleanup_payload = {}
@@ -5527,6 +6764,16 @@ def _collect_mesh_buckets(
         ):
             b.pop(temp_key, None)
         out.append(b)
+    # RD/SD2 only: un-weld antennas/hatches/fittings that share the chassis bone (the
+    # name-based split can't separate them; geometry islands can). Gated on the RD/SD2
+    # game preset (NOT chenille) so it also runs on TRACKLESS RD units (boats / wheeled,
+    # e.g. fremantle's masts) whose model_is_rd would be False; WARNO is byte-for-byte
+    # unchanged. Falls back to `out` on any error.
+    if model_is_rd or is_rd_asset:
+        try:
+            out = _peel_chassis_welded_subparts(out)
+        except Exception:
+            pass
     return out
 
 
@@ -5601,6 +6848,160 @@ def _wire_normal_color_to_normal_map(nodes, links, color_socket, normal_map_node
     links.new(color_socket, normal_map_node.inputs["Color"])
 
 
+def _apply_rd_material_nodes(
+    mat: bpy.types.Material,
+    maps: dict[str, Path],
+    role: str,
+) -> None:
+    """Build the node graph for a Wargame Red Dragon / Steel Division 2 material.
+
+    RD-era units do not ship separate normal / roughness / metallic textures the
+    way WARNO does — the shading data is packed into one texture's alpha channel.
+    Two cases, decided by alpha content in `_resolve_rd_textures`:
+      * CombinedDAS-style = a transparency CUTOUT mask (chains, track-teeth gaps):
+        alpha -> BSDF Alpha, blend = CLIP so the black gaps become see-through.
+      * CombinedDS-style = a specular mask: alpha (inverted) -> Roughness.
+    RGB always -> Base Color. DiffuseTextureNoAlpha has a flat alpha -> matte
+    default roughness. Fully isolated from the WARNO graph (WARNO unchanged)."""
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nodes = nt.nodes
+    links = nt.links
+    nodes.clear()
+
+    out = nodes.new("ShaderNodeOutputMaterial")
+    out.location = (560, 40)
+    bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.location = (240, 40)
+    links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+
+    base = maps.get("diffuse")
+    spec_alpha = maps.get("spec_alpha")
+    alpha_cutout = maps.get("alpha_cutout")
+    alpha_tex = maps.get("alpha")            # separate WARNO-style binary alpha map
+    track_repeat = bool(maps.get("track_repeat"))
+    force_opaque = bool(maps.get("force_opaque")) or track_repeat
+    normal = maps.get("normal")
+
+    base_node = None
+    if base is not None:
+        base_node = _texture_node(nodes, base, -560, 200, non_color=False)
+        if base_node is not None:
+            if track_repeat:
+                # RD track: the cropped scaly-armour tread tiles along the tube-unwrapped
+                # belt (UV set at object build). REPEAT so it tiles seamlessly.
+                try:
+                    base_node.extension = "REPEAT"
+                except Exception:
+                    pass
+            links.new(base_node.outputs["Color"], bsdf.inputs["Base Color"])
+
+    if alpha_tex is not None:
+        # WARNO-style SEPARATE alpha map: a clean binary (0/255) cutout texture wired
+        # straight into BSDF Alpha — no GreaterThan/threshold node needed in the shader.
+        # Used by the split track/chains textures (_split_track_chains_textures).
+        a_node = _texture_node(nodes, alpha_tex, -560, 20, non_color=True)
+        if a_node is not None:
+            links.new(a_node.outputs["Color"], bsdf.inputs["Alpha"])
+        # The track UV seam fix (get_model_geometry -> _floodfill_track_uv_seam) leaves the
+        # tread V continuous, running slightly outside [0,1]; REPEAT makes those tails tile
+        # seamlessly (no edge clamp). Set it explicitly on BOTH the diffuse and alpha nodes.
+        for _n in (base_node, a_node):
+            if _n is not None:
+                try:
+                    _n.extension = "REPEAT"
+                except Exception:
+                    pass
+        for attr, val in (("blend_method", "CLIP"), ("shadow_method", "CLIP")):
+            if hasattr(mat, attr):
+                try:
+                    setattr(mat, attr, val)
+                except Exception:
+                    pass
+        if hasattr(mat, "alpha_threshold"):
+            try:
+                mat.alpha_threshold = 0.5
+            except Exception:
+                pass
+        if hasattr(mat, "surface_render_method"):
+            try:
+                mat.surface_render_method = "DITHERED"
+            except Exception:
+                pass
+        try:
+            bsdf.inputs["Roughness"].default_value = 0.6
+        except Exception:
+            pass
+    elif force_opaque:
+        # Solid (no alpha link), keeps RGB -> Base Color from above.
+        for attr, val in (("blend_method", "OPAQUE"), ("shadow_method", "OPAQUE")):
+            if hasattr(mat, attr):
+                try:
+                    setattr(mat, attr, val)
+                except Exception:
+                    pass
+        try:
+            bsdf.inputs["Roughness"].default_value = 0.6
+        except Exception:
+            pass
+    elif alpha_cutout is not None:
+        # Transparency cutout: the texture's alpha is a binary-ish mask (chain
+        # links / track teeth opaque, gaps == 0). Drive BSDF Alpha and CLIP so the
+        # gaps vanish instead of rendering as black. The opaque alpha peaks ~0.76
+        # (not 1.0), so a low clip threshold keeps the shapes solid.
+        cut_node = base_node if (base is not None and str(alpha_cutout) == str(base)) \
+            else _texture_node(nodes, alpha_cutout, -560, 200, non_color=False)
+        if cut_node is not None and "Alpha" in cut_node.outputs:
+            # Wire the texture alpha STRAIGHT into BSDF Alpha (no GreaterThan/threshold
+            # node) — same clean path as the WARNO-style separate alpha map. The crisp
+            # binary cutout comes from CLIP + alpha_threshold below, which works under
+            # both legacy blend_method (<4.2) and EEVEE-Next surface_render_method (5.1).
+            links.new(cut_node.outputs["Alpha"], bsdf.inputs["Alpha"])
+        for attr, val in (("blend_method", "CLIP"), ("shadow_method", "CLIP")):
+            if hasattr(mat, attr):
+                try:
+                    setattr(mat, attr, val)
+                except Exception:
+                    pass
+        if hasattr(mat, "alpha_threshold"):
+            try:
+                mat.alpha_threshold = 0.3
+            except Exception:
+                pass
+        if hasattr(mat, "surface_render_method"):
+            try:
+                mat.surface_render_method = "DITHERED"
+            except Exception:
+                pass
+        try:
+            bsdf.inputs["Roughness"].default_value = 0.6
+        except Exception:
+            pass
+    elif spec_alpha is not None:
+        # The CombinedDS alpha is a packed spec mask, NOT opacity. Per user preference
+        # we do NOT wire it at all (no Invert -> Roughness node): the body is just the
+        # opaque diffuse texture with a matte default roughness — clean node graph.
+        if hasattr(mat, "blend_method"):
+            mat.blend_method = "OPAQUE"
+        try:
+            bsdf.inputs["Roughness"].default_value = 0.7
+        except Exception:
+            pass
+    elif base_node is not None:
+        try:
+            bsdf.inputs["Roughness"].default_value = 0.7   # matte painted-metal default
+        except Exception:
+            pass
+
+    if normal is not None:
+        nrm_node = _texture_node(nodes, normal, -880, -360, non_color=True)
+        if nrm_node is not None:
+            nm = nodes.new("ShaderNodeNormalMap")
+            nm.location = (-560, -360)
+            links.new(nrm_node.outputs["Color"], nm.inputs["Color"])
+            links.new(nm.outputs["Normal"], bsdf.inputs["Normal"])
+
+
 def _apply_material_nodes(
     mat: bpy.types.Material,
     maps: dict[str, Path],
@@ -5608,6 +7009,11 @@ def _apply_material_nodes(
     ao_multiply_diffuse: bool = True,
     normal_invert_mode: str = "none",
 ) -> None:
+    # Wargame RD / SD2 materials carry an "rd_material" marker and use a separate
+    # node graph (spec-in-alpha). WARNO maps never set it, so WARNO is unaffected.
+    if maps.get("rd_material"):
+        _apply_rd_material_nodes(mat, maps, role)
+        return
     alpha = maps.get("alpha")
     alpha_track_like = False
     if alpha is not None:
@@ -5779,7 +7185,18 @@ def _merge_by_distance(objects: Sequence[bpy.types.Object], distance: float) -> 
         if obj.type != "MESH":
             continue
         try:
-            if bool(obj.get("warno_is_track_mesh", False)):
+            # NEVER merge-by-distance a track (chenille) / chains belt: its tread tiles via a
+            # per-link UV sawtooth whose tile boundaries are DUPLICATE verts at the same
+            # position with different UVs; merging collapses them -> the per-link tiling
+            # smears into a stretched, seamed tread (the user-reported bug). Check the flag
+            # AND the object name, because the REFERENCE-mode cleanup deletes warno_is_track_mesh
+            # before this merge runs (so the flag alone is unreliable here).
+            _nlow = _norm_low(getattr(obj, "name", ""))
+            if (bool(obj.get("warno_is_track_mesh", False))
+                    or bool(obj.get("warno_is_chains_mesh", False))
+                    or _nlow.startswith("chenille")
+                    or _nlow.startswith("chains")
+                    or "track" in _nlow):
                 continue
         except Exception:
             pass
@@ -5801,6 +7218,57 @@ def _merge_by_distance(objects: Sequence[bpy.types.Object], distance: float) -> 
         bm.to_mesh(mesh)
         bm.free()
         mesh.update()
+
+
+def _fill_rd_mesh_holes(obj: bpy.types.Object, *, weld_dist: float = 0.0006, max_sides: int = 24) -> int:
+    """RD/SD2 unit meshes ship as OPEN shells — the hull has many open boundary edges (areas
+    the game never shows: under hatches/grilles, the open bottom, inner walls). In Blender they
+    read as holes. Weld near-coincident boundary verts into closed loops, then fill holes up to
+    `max_sides` edges (so the large intended bottom opening is left open). RD-only; skips
+    track/chains belts (their open edges are intentional UV-seam duplicates). Returns faces added."""
+    if obj.type != "MESH" or obj.data is None:
+        return 0
+    nlow = _norm_low(getattr(obj, "name", ""))
+    if (bool(obj.get("warno_is_track_mesh", False)) or bool(obj.get("warno_is_chains_mesh", False))
+            or nlow.startswith("chenille") or nlow.startswith("chains") or "track" in nlow):
+        return 0
+    mesh = obj.data
+    try:
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        uvl = bm.loops.layers.uv.active
+        f0 = len(bm.faces)
+        if weld_dist > 0 and bm.verts:
+            bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=float(weld_dist))
+        boundary = [e for e in bm.edges if e.is_boundary]
+        if not boundary:
+            bm.free()
+            return 0
+        # representative UV per boundary vert (from its existing loops) so the new fill faces
+        # get sensible UVs instead of (0,0) -> the v1.7.4 smeared-texture bug.
+        vert_uv = {}
+        if uvl is not None:
+            for f in bm.faces:
+                for lp in f.loops:
+                    if lp.vert not in vert_uv:
+                        vert_uv[lp.vert] = lp[uvl].uv.copy()
+        res = bmesh.ops.holes_fill(bm, edges=boundary, sides=int(max_sides))
+        new_faces = [f for f in res.get("faces", []) or [] if f.is_valid]
+        if uvl is not None:
+            for f in new_faces:
+                for lp in f.loops:
+                    uv = vert_uv.get(lp.vert)
+                    if uv is not None:
+                        lp[uvl].uv = uv
+        if new_faces:
+            bmesh.ops.recalc_face_normals(bm, faces=new_faces)
+        added = len(bm.faces) - f0
+        bm.to_mesh(mesh)
+        bm.free()
+        mesh.update()
+        return max(0, int(added))
+    except Exception:
+        return 0
 
 
 def _assign_uniform_vertex_group(obj: bpy.types.Object, name: str, weight: float = 1.0) -> bool:
@@ -6088,139 +7556,41 @@ def _synthesize_zero_weight_track_lane(
         for vert_index in zero_indices
         if int(vert_index) not in set(upper_zero)
     ]
-    if upper_zero:
-        front_pos = helper_positions_by_group.get(str(front_end_name))
-        rear_pos = helper_positions_by_group.get(str(rear_end_name))
-        if isinstance(front_pos, Vector) and isinstance(rear_pos, Vector):
-            split_x = (float(front_pos.x) + float(rear_pos.x)) * 0.5
-            front_patch = [
-                int(vert_index)
-                for vert_index in upper_zero
-                if float(mesh.vertices[int(vert_index)].co.x) >= float(split_x)
-            ]
-            rear_patch = [
-                int(vert_index)
-                for vert_index in upper_zero
-                if int(vert_index) not in set(front_patch)
-            ]
-        else:
-            front_patch = list(upper_zero)
-            rear_patch = []
-        if front_patch:
+    # Voronoi-in-X: assign every belt vertex to its NEAREST synthetic wheel helper in X.
+    # The old code split the upper return lane by ONE midpoint and the lower (ground) lane
+    # between only the two endcaps, so each endcap group owned ~half the belt -> the
+    # weight-bleed bug (a single Roue_Elev_* group spanning ~half the belt; e.g. gepard
+    # Roue_Elev_D1 diag=4.7, raketenjagd D2/G2 diag=3.7). Nearest-helper bucketing localizes
+    # each group to roughly one inter-wheel pitch.
+    upper_pool = [(str(n), helper_positions_by_group.get(str(n))) for n in upper_names]
+    upper_pool = [(n, p) for n, p in upper_pool if isinstance(p, Vector)]
+    all_pool = [(str(n), p) for n, p in synthetic_items if isinstance(p, Vector)]
+
+    def _bucket_by_nearest_x(verts, pool):
+        buckets: Dict[str, List[int]] = defaultdict(list)
+        for vert_index in verts:
+            vx = float(mesh.vertices[int(vert_index)].co.x)
+            best = min(pool, key=lambda np: abs(vx - float(np[1].x)))[0]
+            buckets[str(best)].append(int(vert_index))
+        return buckets
+
+    # upper return lane -> nearest UPPER (return-roller) helper; lower ground-contact lane
+    # -> nearest of ALL wheel helpers. Each lane painted exclusively (weights stay normalized).
+    for lane_verts, lane_pool in (
+        (upper_zero, upper_pool if len(upper_pool) >= 2 else all_pool),
+        (remaining_zero, all_pool),
+    ):
+        if not lane_verts:
+            continue
+        if not lane_pool:
             filled += _assign_track_group_patch(
-                obj=obj,
-                group_name=str(front_end_name),
-                vert_indices=front_patch,
-                track_group_names=track_group_names,
-                exclusive=True,
-            )
-        if rear_patch:
+                obj=obj, group_name=str(front_end_name), vert_indices=list(lane_verts),
+                track_group_names=track_group_names, exclusive=True)
+            continue
+        for group_name, vert_indices in _bucket_by_nearest_x(lane_verts, lane_pool).items():
             filled += _assign_track_group_patch(
-                obj=obj,
-                group_name=str(rear_end_name),
-                vert_indices=rear_patch,
-                track_group_names=track_group_names,
-                exclusive=True,
-            )
-
-        # Add localized upper-return-roller patches after endcaps own the broad loop.
-        # This keeps front/rear ordinals dominant while still giving each small roller
-        # its own nearby weight paint instead of smearing a whole strip into one name.
-        upper_name_set = {str(name) for name in upper_names}
-        upper_interiors = [
-            str(name)
-            for name in upper_names
-            if str(name) not in {str(front_end_name), str(rear_end_name)}
-        ]
-        for idx, group_name in enumerate(upper_interiors):
-            helper_pos = helper_positions_by_group.get(str(group_name))
-            if helper_pos is None:
-                continue
-            ordered_index = upper_names.index(str(group_name))
-            prev_name = str(upper_names[max(ordered_index - 1, 0)])
-            next_name = str(upper_names[min(ordered_index + 1, len(upper_names) - 1)])
-            prev_pos = helper_positions_by_group.get(prev_name)
-            next_pos = helper_positions_by_group.get(next_name)
-            if prev_pos is None or next_pos is None:
-                continue
-            min_gap = min(
-                abs(float(helper_pos.x) - float(prev_pos.x)),
-                abs(float(next_pos.x) - float(helper_pos.x)),
-            )
-            if min_gap <= 1.0e-6:
-                continue
-            patch_radius = max(min_gap * 0.26, 1.0e-4)
-            if len(upper_interiors) <= 1:
-                core_scale = 0.5
-            elif idx == 0:
-                core_scale = 0.12
-            elif idx == len(upper_interiors) - 1:
-                core_scale = 0.0
-            elif idx >= (len(upper_interiors) // 2):
-                core_scale = 0.42
-            else:
-                core_scale = 0.5
-            core_radius = patch_radius * core_scale
-            core_patch: List[int] = []
-            shoulder_weights: Dict[int, float] = {}
-            for vert_index in upper_zero:
-                vert = mesh.vertices[int(vert_index)]
-                dx = abs(float(vert.co.x) - float(helper_pos.x))
-                if dx > patch_radius:
-                    continue
-                if core_radius > 1.0e-6 and dx <= core_radius:
-                    core_patch.append(int(vert_index))
-                    continue
-                t = (dx - core_radius) / max(patch_radius - core_radius, 1.0e-6)
-                shoulder_peak = 0.96
-                shoulder_weights[int(vert_index)] = max(0.2, shoulder_peak - (t * (shoulder_peak - 0.2)))
-            if core_patch:
-                filled += _assign_track_group_patch(
-                    obj=obj,
-                    group_name=str(group_name),
-                    vert_indices=core_patch,
-                    track_group_names=track_group_names,
-                    exclusive=True,
-                )
-            if shoulder_weights:
-                filled += _overlay_track_group_weights(
-                    obj=obj,
-                    group_name=str(group_name),
-                    vert_weights=shoulder_weights,
-                )
-
-    if not remaining_zero:
-        return filled
-
-    if rear_end_name == front_end_name:
-        filled += _assign_track_group_patch(
-            obj=obj,
-            group_name=str(front_end_name),
-            vert_indices=remaining_zero,
-            track_group_names=track_group_names,
-            exclusive=True,
-        )
-        return filled
-
-    end_assignments: Dict[str, List[int]] = defaultdict(list)
-    front_pos = helper_positions_by_group.get(str(front_end_name))
-    rear_pos = helper_positions_by_group.get(str(rear_end_name))
-    for vert_index in remaining_zero:
-        vert = mesh.vertices[int(vert_index)]
-        score_front = abs(float(vert.co.x) - float(front_pos.x)) if isinstance(front_pos, Vector) else 0.0
-        score_rear = abs(float(vert.co.x) - float(rear_pos.x)) if isinstance(rear_pos, Vector) else 0.0
-        if score_front <= score_rear:
-            end_assignments[str(front_end_name)].append(int(vert_index))
-        else:
-            end_assignments[str(rear_end_name)].append(int(vert_index))
-    for group_name, vert_indices in end_assignments.items():
-        filled += _assign_track_group_patch(
-            obj=obj,
-            group_name=str(group_name),
-            vert_indices=vert_indices,
-            track_group_names=track_group_names,
-            exclusive=True,
-        )
+                obj=obj, group_name=str(group_name), vert_indices=vert_indices,
+                track_group_names=track_group_names, exclusive=True)
     return filled
 
 
@@ -6632,6 +8002,47 @@ def _relabel_synthetic_track_groups(
     return changed
 
 
+def _rebalance_rd_track_weights(obj, track_group_names, helper_positions_by_group) -> int:
+    """RD chenille ONLY: re-assign EVERY belt vertex exclusively to its NEAREST wheel helper
+    in X. The game's RAW belt weights are coarse — one wheel (e.g. gepard Roue_Elev_D1) can
+    span half the belt, which paints ugly and deforms badly. This Voronoi-in-X partition gives
+    a clean per-wheel rig consistent with the synthetic backfill. WARNO tracks (no chenille
+    flag) never reach this. Returns the number of re-bucketed vertices."""
+    if obj.type != "MESH" or obj.data is None:
+        return 0
+    pool = [(str(n), p) for n, p in (helper_positions_by_group or {}).items() if isinstance(p, Vector)]
+    if len(pool) < 2:
+        return 0
+    gi = {g.name: g.index for g in obj.vertex_groups}
+    track_idx = {n: gi[n] for n in track_group_names if n in gi}
+    if len(track_idx) < 2:
+        return 0
+    mesh = obj.data
+    buckets: Dict[str, List[int]] = defaultdict(list)
+    for v in mesh.vertices:
+        vx = float(v.co.x)
+        best = min(pool, key=lambda np: abs(vx - float(np[1].x)))[0]
+        if str(best) in track_idx:
+            buckets[str(best)].append(int(v.index))
+    moved = 0
+    vg_by_name = {n: obj.vertex_groups[i] for n, i in track_idx.items()}
+    for gname, verts in buckets.items():
+        if not verts:
+            continue
+        for other_name, vg in vg_by_name.items():
+            if other_name != gname:
+                try:
+                    vg.remove(verts)
+                except Exception:
+                    pass
+        try:
+            vg_by_name[gname].add(verts, 1.0, "REPLACE")
+            moved += len(verts)
+        except Exception:
+            pass
+    return moved
+
+
 def _apply_vertex_groups_from_bucket(
     obj: bpy.types.Object,
     bucket: Dict[str, Any],
@@ -6664,6 +8075,17 @@ def _apply_vertex_groups_from_bucket(
         side_token = "g"
     elif "droite" in low_name or "right" in low_name:
         side_token = "d"
+
+    # RD chenille (IRISZoom flag) vs WARNO track (also named chenille, but NO flag). Only the
+    # RD belt gets the per-wheel weight rebalance; WARNO tracks keep their real raw weights.
+    is_rd_track = False
+    if is_track and source_refs:
+        try:
+            _p0 = int(source_refs[0][0])
+            _parts = model.get("parts", []) or []
+            is_rd_track = bool(0 <= _p0 < len(_parts) and (_parts[_p0].get("vertices", {}) or {}).get("chenille"))
+        except Exception:
+            is_rd_track = False
 
     def _raw_bone_payload(part_i: int) -> Tuple[List[float], List[float]]:
         parts = list(model.get("parts", []) or [])
@@ -6787,6 +8209,14 @@ def _apply_vertex_groups_from_bucket(
         result["track_zero_weight_filled"] += int(backfill_report.get("filled", 0))
         result["track_zero_weight_before"] += int(backfill_report.get("zero_before", 0))
         result["track_zero_weight_after"] += int(backfill_report.get("zero_after", 0))
+        # RD chenille: rebalance EVERY belt vertex to its nearest wheel (the raw belt weights
+        # are coarse -> one wheel spans half the belt). Clean per-wheel rig; RD-only.
+        if is_rd_track:
+            try:
+                result["track_rebalanced"] = _rebalance_rd_track_weights(
+                    obj, created_track_group_names, helper_positions_by_group)
+            except Exception:
+                pass
         result["track_group_sources"] = {
             str(name): str(group_source_by_name.get(str(name), "raw"))
             for name in sorted(created_track_group_names, key=_track_group_sort_key)
@@ -7131,6 +8561,76 @@ def _warno_namespaced_material_name(namespace: str, raw_name: str) -> str:
     return f"{ns}{_WARNO_MATERIAL_NS_SEP}{raw}"
 
 
+def _warno_finalize_track_material_names(asset_hint: str) -> int:
+    """Post-import: strip the asset namespace from each track mesh's material and
+    rename it to the bare OBJECT name, e.g. '<asset>__Chenille_Gauche' on object
+    'Chenille_Gauche_01' -> 'Chenille_Gauche_01'. The namespace is kept DURING the
+    build to avoid cross-unit material collisions; stripping it afterwards gives the
+    clean per-track names that match the objects. If a same-named material already
+    exists (a previously-imported unit), Blender auto-suffixes '.001' — the intended
+    collision avoidance. Each track object has its own material (one side per part),
+    so this is a 1:1 rename."""
+    namespace = _warno_asset_namespace(asset_hint)
+    if not namespace:
+        return 0
+    prefix = namespace + _WARNO_MATERIAL_NS_SEP
+    renamed = 0
+    for obj in list(bpy.data.objects):
+        if getattr(obj, "type", "") != "MESH":
+            continue
+        if not bool(obj.get("warno_is_track_mesh", False)):
+            continue
+        if str(obj.get("warno_asset", "") or "") != str(asset_hint):
+            continue
+        data = getattr(obj, "data", None)
+        mats = getattr(data, "materials", None) if data is not None else None
+        if not mats:
+            continue
+        for mat in mats:
+            if mat is None or not str(mat.name).startswith(prefix):
+                continue
+            target = str(obj.name)
+            if mat.name == target:
+                continue
+            try:
+                mat.name = target
+                renamed += 1
+            except Exception:
+                continue
+    return renamed
+
+
+def _warno_finalize_rd_material_names(asset_hint: str) -> int:
+    """Post-import: strip the asset namespace from EVERY material of this asset so it gets the
+    clean BARE name ('AIFV_B__Chenille_Droite' -> 'Chenille_Droite', 'merkava_1__Chassis' ->
+    'Chassis'). Applies to BOTH RD and WARNO (the cooker wants the bare game name; the
+    '<unit>__' prefix is only a Blender-side collision guard). Runs AFTER the reserved-name
+    finalize (so '<unit>__Vitre' is already 'Vitre' and won't be touched) and BEFORE the track
+    finalize (so tracks end up bare, not the object name). A collision with a leftover material
+    from a previous import auto-suffixes ('.001'); re-importing the same unit purges the orphan
+    first so the name stays clean."""
+    namespace = _warno_asset_namespace(asset_hint)
+    if not namespace:
+        return 0
+    prefix = namespace + _WARNO_MATERIAL_NS_SEP
+    renamed = 0
+    for mat in list(bpy.data.materials):
+        if mat is None:
+            continue
+        nm = str(mat.name or "")
+        if not nm.startswith(prefix):
+            continue
+        bare = _warno_strip_namespace(nm)
+        if not bare or bare == nm:
+            continue
+        try:
+            mat.name = bare
+            renamed += 1
+        except Exception:
+            continue
+    return renamed
+
+
 def _warno_finalize_reserved_material_names(asset_hint: str) -> int:
     """Post-import pass: rename namespaced reserved materials (e.g.
     'M1038_Humvee__Vitre') back to their canonical name ('Vitre') so the
@@ -7243,6 +8743,173 @@ def _warno_purge_orphan_datablocks() -> Dict[str, int]:
     return purged
 
 
+def _finalize_glass_materials() -> int:
+    """RD ships the canopy/glass material (e.g. 'Vitres') OPAQUE, but the game renders it as
+    see-through tinted glass. Detect glass by name (vitre/vitres/verre/glass), make it transparent
+    (low BSDF alpha + BLEND) and normalize the name to the cooker-reserved 'Vitre'. Only an OPAQUE
+    glass material has its alpha lowered, so an already-transparent one is left as-is."""
+    glass_rx = re.compile(r"^(vitres?|verre|glass)", re.IGNORECASE)
+    count = 0
+    for mat in list(bpy.data.materials):
+        if mat is None:
+            continue
+        bare = _norm_low(_warno_strip_namespace(str(getattr(mat, "name", ""))))
+        if not glass_rx.match(bare):
+            continue
+        try:
+            mat.use_nodes = True
+            bsdf = next((n for n in mat.node_tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+        except Exception:
+            bsdf = None
+        if bsdf is not None:
+            ai = bsdf.inputs.get("Alpha")
+            if ai is not None and not ai.is_linked and float(ai.default_value) >= 0.99:
+                ai.default_value = 0.2  # see-through tinted glass
+            ri = bsdf.inputs.get("Roughness")
+            if ri is not None and not ri.is_linked:
+                ri.default_value = 0.05
+        for attr, val in (("blend_method", "BLEND"), ("shadow_method", "HASHED"),
+                          ("show_transparent_back", True), ("use_backface_culling", False)):
+            if hasattr(mat, attr):
+                try:
+                    setattr(mat, attr, val)
+                except Exception:
+                    pass
+        if hasattr(mat, "surface_render_method"):
+            try:
+                mat.surface_render_method = "BLENDED"
+            except Exception:
+                pass
+        if bare != "vitre":
+            try:
+                mat.name = "Vitre"
+            except Exception:
+                pass
+        count += 1
+    return count
+
+
+def _fix_unwired_diffuse() -> int:
+    """A WARNO CombinedDA/diffuse texture for a unit whose NAME contains a channel keyword
+    (Alpha_Jet, Metal_*, ...) gets mis-routed by the atlas resolver: the diffuse image node ends
+    up wired to BSDF Alpha while Base Color stays empty -> the model renders flat/untextured ("all
+    textures present except the diffuse"). Repair at the node level: for any Principled material
+    whose Base Color is UNLINKED, wire the diffuse image node (the TEX_IMAGE whose stem carries NO
+    channel suffix, i.e. the bare '<Unit>.png' or CombinedDA) into Base Color. No-op for materials
+    whose Base Color is already wired (RD + healthy WARNO), so it only repairs the broken case."""
+    suffix_rx = re.compile(r"_(a|d|nm|n|m|o|ao|r|s|orm|os|rs|alpha|normal|metallic|roughness|occlusion|diffuse)$", re.I)
+    cnt = 0
+    for m in list(bpy.data.materials):
+        if m is None or not getattr(m, "use_nodes", False) or m.node_tree is None:
+            continue
+        low = _norm_low(getattr(m, "name", ""))
+        if low.startswith("vitre") or "verre" in low:
+            continue  # glass intentionally has no diffuse (transparency only)
+        bsdf = next((n for n in m.node_tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+        if bsdf is None:
+            continue
+        bc = bsdf.inputs.get("Base Color")
+        if bc is None or bc.is_linked:
+            continue
+        diff = None
+        for n in m.node_tree.nodes:
+            if n.type == "TEX_IMAGE" and getattr(n, "image", None):
+                stem = _norm_low(Path(str(n.image.name)).stem)
+                if stem and not suffix_rx.search(stem):
+                    diff = n
+                    break
+        if diff is not None:
+            try:
+                m.node_tree.links.new(diff.outputs["Color"], bc)
+                cnt += 1
+            except Exception:
+                pass
+    return cnt
+
+
+def _normalize_diffuse_colorspace_and_alpha() -> int:
+    """Universal (WARNO + RD) node hygiene for every Principled material:
+      * the DIFFUSE (image wired into Base Color) must be sRGB;
+      * every OTHER image map (normal/metallic/roughness/occlusion/alpha mask) must be Non-Color;
+      * BSDF Alpha must NEVER be driven by the diffuse's own COLOR output (a 3-channel colour
+        mis-wired onto 1-channel alpha — happens on keyword-named units like Alpha_Jet). Disconnect
+        it so Alpha falls back to opaque. A SEPARATE alpha-mask texture, or the diffuse's true ALPHA
+        channel, driving Alpha is left intact (cutout chains/tracks keep working)."""
+    # A texture is a DATA map (Non-Color) iff its stem ends in a non-diffuse channel suffix; anything
+    # else (bare '<Unit>.png', '<Unit>_E.png' variant, CombinedDA, '*_D'/'*_diffuse') is the diffuse.
+    nondiff_rx = re.compile(r"_(a|nm|n|m|o|ao|r|s|orm|os|rs|alpha|normal|metallic|roughness|occlusion|specular|spec|mask)$", re.I)
+
+    def _is_data_map(node):
+        img = getattr(node, "image", None)
+        if img is None:
+            return False
+        return bool(nondiff_rx.search(_norm_low(Path(str(img.name)).stem)))
+
+    cnt = 0
+    for m in list(bpy.data.materials):
+        if m is None or not getattr(m, "use_nodes", False) or m.node_tree is None:
+            continue
+        nt = m.node_tree
+        # 1. colour space by texture ROLE (from its name) — global + deterministic, no flip-flop when
+        #    the same image is shared across materials: data maps -> Non-Color, diffuse -> sRGB.
+        for n in nt.nodes:
+            if getattr(n, "type", "") != "TEX_IMAGE" or not getattr(n, "image", None):
+                continue
+            want = "Non-Color" if _is_data_map(n) else "sRGB"
+            try:
+                cs = n.image.colorspace_settings
+                if cs.name != want:
+                    cs.name = want
+                    cnt += 1
+            except Exception:
+                pass
+        # 2. BSDF Alpha must NEVER be driven by a DIFFUSE texture's COLOR output (3-channel colour
+        #    mis-wired onto 1-channel alpha). A real alpha-mask (*_A) texture driving Alpha stays.
+        bsdf = next((n for n in nt.nodes if n.type == "BSDF_PRINCIPLED"), None)
+        if bsdf is None:
+            continue
+        # Cutout materials (chains / tank tracks) legitimately key their see-through gaps off a
+        # texture and are individually tuned — never strip their Alpha; only the colour space above
+        # is normalised for them. Glass (Vitre) is NOT cutout (it uses a flat 0.2 value) so it is
+        # still cleaned below.
+        m_low = _norm_low(getattr(m, "name", ""))
+        if any(k in m_low for k in ("chenille", "track", "chain", "chaine", "_trk")):
+            continue
+        ai = bsdf.inputs.get("Alpha")
+        if ai is not None and ai.is_linked:
+            lk = ai.links[0]
+            fn = lk.from_node
+            if (getattr(fn, "type", "") == "TEX_IMAGE"
+                    and getattr(lk.from_socket, "name", "") == "Color"
+                    and not _is_data_map(fn)):
+                try:
+                    nt.links.remove(lk)
+                    cnt += 1
+                except Exception:
+                    pass
+    return cnt
+
+
+def _name_chain_objects() -> int:
+    """Name a chain-card object after its material instead of the generic peel name: a mesh whose
+    only material is a chain material but named 'Chassis_N' / 'Part_N' becomes 'Chains', so the
+    anti-RPG ball-chain curtain reads as its own object (not a chassis fragment)."""
+    cnt = 0
+    for o in list(bpy.data.objects):
+        if getattr(o, "type", "") != "MESH":
+            continue
+        if not re.match(r"^(chassis|mainbody|part)_\d+$", _norm_low(getattr(o, "name", ""))):
+            continue
+        mats = [sl.material for sl in getattr(o, "material_slots", []) if sl.material]
+        if mats and all("chain" in str(getattr(m, "name", "")).lower() for m in mats):
+            try:
+                o.name = "Chains"
+                cnt += 1
+            except Exception:
+                pass
+    return cnt
+
+
 def _ensure_window_material_name(obj: bpy.types.Object, asset_hint: str = "") -> bool:
     if obj is None or obj.type != "MESH":
         return False
@@ -7318,6 +8985,412 @@ def _set_object_origin_world(obj: bpy.types.Object, world_point: Vector) -> None
     local = mw.inverted() @ world_point
     mesh.transform(Matrix.Translation(-local))
     obj.matrix_world.translation = world_point
+
+
+def _fix_outlier_wheels(imported_objects: Sequence[bpy.types.Object], _fix_collection=None) -> int:
+    """Snap any wheel that sits far from its own Roue_Elev_<side><n> elevator empty back onto it.
+    A wheel can be flung to the wrong side by a duplicate/bogus bone (Leopard_1V Roue_D1) or a
+    whole-side source mirror defect (m48a5_mid: 7 of 9 "D" wheels on the +Y/left side). The
+    elevator empty is the reliable reference — it's placed from the resolver + the
+    resolved-positions mirror-fix. PRIMARY: for each wheel, if its centre is >1.0m from its own
+    elevator (and that elevator is consistent with its side's elevators, i.e. not itself an
+    outlier), translate the wheel so its centre lands on the elevator. FALLBACK (no elevator):
+    mirror a far same-side Y-outlier from its opposite-side counterpart. Correctly-placed wheels
+    (centre already on their elevator) are never moved -> safe for every normal unit."""
+    import statistics
+    # Force parent transforms to propagate first — right after the armature build a parented
+    # wheel's matrix_world is still stale, so the displacement wouldn't be seen.
+    try:
+        bpy.context.view_layer.update()
+    except Exception:
+        pass
+    def _ctr(o: bpy.types.Object) -> Vector:
+        wb = [o.matrix_world @ Vector(c) for c in o.bound_box]
+        return Vector((sum(p.x for p in wb) / 8.0, sum(p.y for p in wb) / 8.0, sum(p.z for p in wb) / 8.0))
+    wheels: Dict[Tuple[str, int], bpy.types.Object] = {}
+    elevs: Dict[Tuple[str, int], Vector] = {}
+    # Roue_Elev_* are EMPTIES created inside _build_helper_armature and linked to the import
+    # collection, NOT present in imported_objects (the mesh buckets) — gather them from the
+    # collection so the elevator reference is available.
+    elev_pool = list(getattr(_fix_collection, "all_objects", []) or []) if _fix_collection is not None else list(imported_objects)
+    for o in imported_objects:
+        nl = _norm_low(getattr(o, "name", ""))
+        m = re.fullmatch(r"roue_([dg])(\d+)", nl)
+        if m and o.type == "MESH":
+            wheels[(m.group(1), int(m.group(2)))] = o
+    for o in elev_pool:
+        me = re.fullmatch(r"roue_elev_([dg])(\d+)", _norm_low(getattr(o, "name", "")))
+        if me:
+            elevs[(me.group(1), int(me.group(2)))] = o.matrix_world.translation.copy()
+    elev_med: Dict[str, float] = {}
+    for side in ("d", "g"):
+        ys = [p.y for (sd, _n), p in elevs.items() if sd == side]
+        if len(ys) >= 2:
+            elev_med[side] = statistics.median(ys)
+    fixed = 0
+    snapped: set = set()
+    # PRIMARY: snap each displaced wheel onto its own (trustworthy) elevator.
+    for (side, num), o in list(wheels.items()):
+        elev = elevs.get((side, num))
+        if elev is None:
+            continue
+        emed = elev_med.get(side)
+        if emed is not None and abs(elev.y - emed) > 1.0:
+            continue  # elevator itself is an outlier -> don't trust it as a target
+        c = _ctr(o)
+        if (c - elev).length <= 1.0:
+            continue  # wheel already sits on its elevator
+        try:
+            mw = o.matrix_world.copy()
+            mw.translation = mw.translation + (elev - c)
+            o.matrix_world = mw
+            fixed += 1
+            snapped.add((side, num))
+        except Exception:
+            continue
+    # FALLBACK: opposite-side mirror for wheels that have no usable elevator.
+    medians: Dict[str, float] = {}
+    for side in ("d", "g"):
+        ys = [_ctr(o).y for (sd, _n), o in wheels.items() if sd == side]
+        if len(ys) >= 3:
+            medians[side] = statistics.median(ys)
+    for (side, num), o in list(wheels.items()):
+        if (side, num) in snapped or (side, num) in elevs:
+            continue
+        med = medians.get(side)
+        if med is None:
+            continue
+        c = _ctr(o)
+        if abs(c.y - med) <= 1.0:
+            continue
+        opp = wheels.get(("g" if side == "d" else "d", num))
+        omed = medians.get("g" if side == "d" else "d")
+        if opp is None or omed is None:
+            continue
+        oc = _ctr(opp)
+        if abs(oc.y - omed) > 1.0:
+            continue
+        target = Vector((oc.x, -oc.y, oc.z))
+        try:
+            mw = o.matrix_world.copy()
+            mw.translation = mw.translation + (target - c)
+            o.matrix_world = mw
+            fixed += 1
+        except Exception:
+            continue
+    return fixed
+
+
+def _fix_flyaway_rotors(collection) -> int:
+    """A rotor/propeller (Helice/Rotor/Pale) whose geometry decodes FAR from its object origin
+    (the bone pivot failed, so the object sits at the unit but the mesh is ~90 m away, e.g.
+    mil_mi-2d_przetacznik) flies off and blows up the scene bounds (the heli renders as a dot).
+    Re-center such a far-outlier rotor's geometry onto its own origin so it sits back at the unit."""
+    objs = list(getattr(collection, "all_objects", []) or [])
+    meshes = [o for o in objs if getattr(o, "type", "") == "MESH" and o.data is not None and len(o.data.vertices) > 0]
+    rotor_rx = re.compile(r"(helice|rotor|\bpale|propeller|rotopale)", re.IGNORECASE)
+    rotors = [o for o in meshes if rotor_rx.search(getattr(o, "name", ""))]
+    body = [o for o in meshes if o not in rotors]
+    if not rotors or not body:
+        return 0
+
+    def _wcenter(o):
+        c = Vector((0.0, 0.0, 0.0))
+        mw = o.matrix_world
+        for v in o.data.vertices:
+            c += mw @ v.co
+        return c / len(o.data.vertices)
+
+    # Body centroid + spread from ACTUAL world vertices (object bound_box is unreliable here).
+    bcen = Vector((0.0, 0.0, 0.0)); npts = 0
+    for o in body:
+        mw = o.matrix_world
+        for v in o.data.vertices:
+            bcen += mw @ v.co; npts += 1
+    bcen /= max(1, npts)
+    spread = 0.0
+    for o in body:
+        mw = o.matrix_world
+        step = max(1, len(o.data.vertices) // 200)
+        for i in range(0, len(o.data.vertices), step):
+            spread = max(spread, (mw @ o.data.vertices[i].co - bcen).length)
+    thresh = 2.0 * spread + 10.0  # a real rotor sits within the unit; >this = flown off
+
+    cnt = 0
+    for o in rotors:
+        if (_wcenter(o) - bcen).length <= thresh:
+            continue
+        lc = Vector((0.0, 0.0, 0.0))
+        for v in o.data.vertices:
+            lc += v.co
+        lc /= len(o.data.vertices)
+        for v in o.data.vertices:
+            v.co = v.co - lc
+        o.data.update()
+        cnt += 1
+    return cnt
+
+
+def _align_coaxial_rotors(collection) -> int:
+    """Coaxial helicopters (Ka-50/52/27 ...) carry TWO large flat HORIZONTAL rotor discs that must
+    be stacked on ONE mast (same X,Y, different Z). When the bone pivots decode to different X,Y the
+    two blade-sets fan from offset centres -> a messy crisscross (Ka_50_AA). Snap the coaxial discs
+    to their common X,Y centroid, keeping each disc's own Z. Single-rotor helis (one big disc + a
+    small tail rotor) have <2 large horizontal discs, so they are never touched."""
+    objs = list(getattr(collection, "all_objects", []) or [])
+    meshes = [o for o in objs if getattr(o, "type", "") == "MESH" and o.data is not None and len(o.data.vertices) > 0]
+    rotor_rx = re.compile(r"(helice|rotor|\bpale|propeller|rotopale)", re.IGNORECASE)
+    discs = []
+    for o in meshes:
+        if not rotor_rx.search(getattr(o, "name", "")):
+            continue
+        pts = [o.matrix_world @ v.co for v in o.data.vertices]
+        mnv = Vector((min(p[i] for p in pts) for i in range(3)))
+        mxv = Vector((max(p[i] for p in pts) for i in range(3)))
+        d = mxv - mnv
+        # large flat HORIZONTAL disc: Z is the thin axis, both X and Y span a real rotor
+        if d.z < 0.30 * min(d.x, d.y) and d.x > 5.0 and d.y > 5.0:
+            cen = Vector((0.0, 0.0, 0.0))
+            for p in pts:
+                cen += p
+            cen /= len(pts)
+            discs.append((o, cen))
+    if len(discs) < 2:
+        return 0
+    avg_x = sum(c.x for _, c in discs) / len(discs)
+    avg_y = sum(c.y for _, c in discs) / len(discs)
+    cnt = 0
+    for o, cen in discs:
+        delta = Vector((avg_x - cen.x, avg_y - cen.y, 0.0))
+        if delta.length < 0.05:
+            continue
+        local_delta = o.matrix_world.to_3x3().inverted() @ delta
+        for v in o.data.vertices:
+            v.co = v.co + local_delta
+        o.data.update()
+        cnt += 1
+    return cnt
+
+
+def _split_and_weight_merged_track(imported_objects, collection) -> int:
+    """Normalize track belts so Gauche=LEFT, Droite=RIGHT always match the Roue_G/Roue_D wheels,
+    each belt is weighted to its own side's wheels, bound to its side armature, and carries a
+    side-named material. Two cases:
+      * WARNO merged belt (one mesh 'Chenille_Droite' with verts on BOTH +Y and -Y, the other
+        side just an empty): split by world-Y into Chenille_Droite/Chenille_Gauche.
+      * RD / already-split single-side belt: relabel it when its Droite/Gauche name disagrees with
+        the wheel side (RD's geometric belt split is backwards vs the wheels on most units, e.g.
+        hafiz/loggim/olifant/telak, but correct on a few like sexton), and weight it if it has none.
+    The RIGHT side is read from the wheels, never a hardcoded Y sign."""
+    import bmesh
+    pool = list(getattr(collection, "all_objects", []) or []) if collection is not None else list(imported_objects)
+    elevs: Dict[str, List[Tuple[str, Vector]]] = {"d": [], "g": []}
+    arms: Dict[str, Any] = {"d": None, "g": None}
+    empties: Dict[str, Any] = {}
+    for o in pool:
+        nl = _norm_low(getattr(o, "name", ""))
+        me = re.fullmatch(r"roue_elev_([dg])(\d+)", nl)
+        if me:
+            elevs[me.group(1)].append((o.name, o.matrix_world.translation.copy()))
+        ma = re.fullmatch(r"armature_([dg])\d", nl)
+        if ma and getattr(o, "type", "") == "ARMATURE" and arms[ma.group(1)] is None:
+            arms[ma.group(1)] = o
+        mt = re.fullmatch(r"chenille_(droite|gauche)(_\d+)?", nl)
+        if mt and getattr(o, "type", "") == "EMPTY":
+            empties[mt.group(1)] = o
+
+    # Which world-Y sign is the RIGHT (Droite) side? Read it from the wheels (Roue_D side), not a
+    # fixed convention. Fall back to the right-hand rule (Droite = -Y) only with no elevators.
+    dY = (sum(float(p.y) for _, p in elevs["d"]) / len(elevs["d"])) if elevs["d"] else None
+    gY = (sum(float(p.y) for _, p in elevs["g"]) / len(elevs["g"])) if elevs["g"] else None
+    if dY is not None and gY is not None:
+        d_is_neg = dY < gY
+    elif dY is not None:
+        d_is_neg = dY < 0.0
+    elif gY is not None:
+        d_is_neg = gY > 0.0
+    else:
+        d_is_neg = True
+
+    def _side_for_meanY(my):
+        return "d" if ((my < 0.0) == d_is_neg) else "g"
+
+    track_meshes = [o for o in pool
+                    if getattr(o, "type", "") == "MESH" and o.data is not None
+                    and re.match(r"chenille_(droite|gauche)", _norm_low(getattr(o, "name", "")))]
+
+    def _delete_side(mesh, mwx, keep_neg):
+        bm = bmesh.new(); bm.from_mesh(mesh)
+        kill = [f for f in bm.faces
+                if ((sum((mwx @ v.co).y for v in f.verts) / max(1, len(f.verts))) < 0) != keep_neg]
+        if kill:
+            bmesh.ops.delete(bm, geom=kill, context="FACES")
+        loose = [v for v in bm.verts if not v.link_faces]
+        if loose:
+            bmesh.ops.delete(bm, geom=loose, context="VERTS")
+        bm.to_mesh(mesh); bm.free(); mesh.update()
+
+    def _track_maxw(t):
+        vl = t.data.vertices
+        mw = 0.0
+        for vi in range(0, len(vl), max(1, len(vl) // 100)):
+            for g in vl[vi].groups:
+                if g.weight > mw:
+                    mw = g.weight
+        return mw
+
+    def _weight_bind(obj, side):
+        ev = elevs.get(side, [])
+        if not ev or not obj.data.vertices:
+            return
+        for g in list(obj.vertex_groups):
+            obj.vertex_groups.remove(g)
+        vg: Dict[str, Any] = {}
+        mw2 = obj.matrix_world
+        for v in obj.data.vertices:
+            wx = (mw2 @ v.co).x
+            best = min(ev, key=lambda e: abs(float(e[1].x) - wx))
+            grp = vg.get(best[0])
+            if grp is None:
+                grp = obj.vertex_groups.new(name=best[0]); vg[best[0]] = grp
+            grp.add([v.index], 1.0, "REPLACE")
+        arm = arms.get(side)
+        if arm is not None:
+            # The side carrier may have been built with use_deform=False (a merged belt carrying
+            # only one side's vgroups -> the other side's wheels were non-deform), which makes the
+            # modifier silently do nothing. Force the bones this belt rides deforming.
+            arm_bones = getattr(getattr(arm, "data", None), "bones", None)
+            if arm_bones is not None:
+                for bname in vg.keys():
+                    b = arm_bones.get(bname)
+                    if b is not None:
+                        b.use_deform = True
+            # Bind EXACTLY this side's armature (replace a wrong/old one left from a swapped belt).
+            existing = [m for m in obj.modifiers if m.type == "ARMATURE"]
+            if not (len(existing) == 1 and existing[0].object is arm):
+                for m in existing:
+                    obj.modifiers.remove(m)
+                m = obj.modifiers.new(name="Armature", type="ARMATURE"); m.object = arm
+
+    def _ensure_side_material(half, want, other, base_asset):
+        hd = getattr(half, "data", None)
+        hmats = getattr(hd, "materials", None)
+        if not hmats or not any(m is not None for m in hmats):
+            return
+        src = next(m for m in hmats if m is not None)
+        if want.lower() in str(src.name).lower():
+            return  # already the right side
+        target = (str(src.name).replace(other, want)
+                  .replace(other.lower(), want.lower())
+                  .replace(other.upper(), want.upper()))
+        if target == str(src.name):
+            _ns = _warno_asset_namespace(base_asset) if base_asset else ""
+            target = (_ns + _WARNO_MATERIAL_NS_SEP + "Chenille_" + want) if _ns else ("Chenille_" + want)
+        m = bpy.data.materials.get(target)
+        if m is None:
+            m = src.copy()
+            try:
+                m.name = target
+            except Exception:
+                pass
+            if base_asset:
+                m["warno_asset"] = base_asset
+        for i in range(len(hmats)):
+            if hmats[i] is not None:
+                hmats[i] = m
+
+    done = 0
+    single_side = []
+    for o in track_meshes:
+        mw = o.matrix_world.copy()
+        ys = [(mw @ v.co).y for v in o.data.vertices]
+        if not ys:
+            continue
+        nL = sum(1 for y in ys if y > 0.4)
+        nR = sum(1 for y in ys if y < -0.4)
+        if min(nL, nR) < 0.2 * max(1, nL + nR):
+            single_side.append(o)
+            continue
+        # Split geometry by world-Y: o keeps Y<0 (neg_half), a fresh copy keeps Y>0 (pos_half).
+        if o.data.users > 1:
+            o.data = o.data.copy()
+        md = o.data.copy()
+        gauche = bpy.data.objects.new("__trackG", md)
+        gauche.matrix_world = mw.copy()
+        collection.objects.link(gauche)
+        _delete_side(gauche.data, mw, keep_neg=False)   # keep Y>0
+        _delete_side(o.data, mw, keep_neg=True)          # keep Y<0
+        neg_half, pos_half = o, gauche
+        droite_half = neg_half if d_is_neg else pos_half
+        gauche_half = pos_half if d_is_neg else neg_half
+        _weight_bind(droite_half, "d")
+        _weight_bind(gauche_half, "g")
+        base_asset = o.get("warno_asset", "") if hasattr(o, "get") else ""
+        _ensure_side_material(droite_half, "Droite", "Gauche", base_asset)
+        _ensure_side_material(gauche_half, "Gauche", "Droite", base_asset)
+        # The left belt replaces the unused Chenille_Gauche empty (remove it if childless).
+        ge = empties.get("gauche")
+        if ge is not None:
+            try:
+                if not list(getattr(ge, "children", []) or []):
+                    bpy.data.objects.remove(ge, do_unlink=True)
+                else:
+                    ge.name = ge.name + "_bone"
+            except Exception:
+                pass
+        droite_half.name = "Chenille_Droite_01"
+        gauche_half.name = "Chenille_Gauche_01"
+        droite_half["warno_is_track_mesh"] = True
+        gauche_half["warno_is_track_mesh"] = True
+        if base_asset:
+            droite_half["warno_asset"] = base_asset
+            gauche_half["warno_asset"] = base_asset
+        try:
+            imported_objects.append(gauche)
+        except Exception:
+            pass
+        done += 1
+
+    # Single-side belts. First weight any that have NO weights yet (m48a5/sexton), by their
+    # existing name side. Then fix the systematic RD mislabel ONLY in the clean case: exactly one
+    # Droite + one Gauche belt, on OPPOSITE Y sides, with the Droite-named belt sitting on the
+    # Roue_G side. Degenerate layouts (both belts on the same side, e.g. sexton) are left ALONE so
+    # we never collapse two belts into one name.
+    named: Dict[str, Tuple[Any, float]] = {}
+    for t in single_side:
+        ys = [(t.matrix_world @ v.co).y for v in t.data.vertices]
+        if not ys:
+            continue
+        my = sum(ys) / len(ys)
+        nlow = _norm_low(getattr(t, "name", ""))
+        key = "droite" if "droite" in nlow else ("gauche" if "gauche" in nlow else "")
+        if key and key not in named:
+            named[key] = (t, my)
+        if key and _track_maxw(t) < 0.01:
+            _weight_bind(t, "d" if key == "droite" else "g")
+            done += 1
+    if "droite" in named and "gauche" in named:
+        td, myd = named["droite"]
+        tg, myg = named["gauche"]
+        if (myd < 0.0) != (myg < 0.0) and _side_for_meanY(myd) == "g":
+            # Clean opposite-side swap: exchange Chenille_Droite/Chenille_Gauche (name + material
+            # + weights + armature) so each belt matches its wheels. Temp-rename first.
+            for i, t in enumerate((td, tg)):
+                try:
+                    t.name = "__rdtrk_%d" % i
+                except Exception:
+                    pass
+            for t, side in ((td, "g"), (tg, "d")):
+                ba = t.get("warno_asset", "") if hasattr(t, "get") else ""
+                _weight_bind(t, side)
+                if side == "d":
+                    _ensure_side_material(t, "Droite", "Gauche", ba)
+                else:
+                    _ensure_side_material(t, "Gauche", "Droite", ba)
+                t.name = "Chenille_Droite_01" if side == "d" else "Chenille_Gauche_01"
+                t["warno_is_track_mesh"] = True
+                done += 1
+    return done
 
 
 def _build_helper_armature(
@@ -7407,6 +9480,17 @@ def _build_helper_armature(
             except Exception:
                 continue
     use_deterministic_raw_scene = raw_scene_graph is not None
+    # The parent-anchor / fallen-empty fallbacks below are an RD/SD2-only net (the IRISZoom
+    # raw scene leaves a few helpers at origin). use_deterministic_raw_scene is NOT RD-specific
+    # — WARNO scenes also carry a raw_scene_graph — so without this extra game gate those
+    # fallbacks fired on WARNO too and REGRESSED it: smoke empties (Fx_Fumee_Chenille_D1/G1)
+    # collapsed onto their shared parent, and wheels/empties jumped to the parent anchor
+    # (Leopard_1A1/Leopard_1V). Gate RD-only so WARNO's empty + wheel placement is byte-for-byte
+    # as before (these blocks are purely additive; off for WARNO == the original code path).
+    _armature_is_rd = bool(
+        settings is not None
+        and str(getattr(settings, "game_preset", "") or "").upper() in ("WARGAME_RD", "STEEL_DIVISION_2")
+    )
     ordered_indices = sorted(int(i) for i in bone_name_by_index.keys())
     gfx_track_kind = str(bone_payload.get("gfx_track_kind", "") or "").strip().lower()
     gfx_manifest_source = str(bone_payload.get("gfx_manifest_source", "none") or "none").strip() or "none"
@@ -10917,6 +13001,24 @@ def _build_helper_armature(
                 semantic_helper_reason_by_index[int(bidx)] = str(fallback_candidate.get("role", role_name or "semantic_helper"))
                 semantic_helpers_approx += 1
                 continue
+            # Parent-anchor fallback: a helper that fails ALL transform sources still lands at
+            # its parent (the antenna base sits on the hull) instead of collapsing to world
+            # origin (the ikv_103 Antenne_01/02 "fallen empty" bug). Only fills nodes that
+            # currently resolve to NOTHING, so it never moves an already-placed node.
+            _pa = parent_anchor
+            if not isinstance(_pa, Vector):
+                _walk = int(bone_parent_by_index.get(int(bidx), -1)); _g = 0
+                while _walk >= 0 and _g < 256:
+                    _anc = resolved_positions.get(int(_walk))
+                    if isinstance(_anc, Vector):
+                        _pa = _anc; break
+                    _walk = int(bone_parent_by_index.get(int(_walk), -1)); _g += 1
+            if use_deterministic_raw_scene and _armature_is_rd and isinstance(_pa, Vector):
+                resolved_positions[int(bidx)] = _pa.copy()
+                semantic_helper_source_by_index[int(bidx)] = "parent_anchor_fallback"
+                semantic_helper_reason_by_index[int(bidx)] = "semantic_no_own_candidate_parent_anchor"
+                semantic_helpers_approx += 1
+                continue
             semantic_helper_source_by_index[int(bidx)] = "skipped"
             semantic_helper_reason_by_index[int(bidx)] = "semantic_no_own_candidate"
             semantic_helpers_skipped += 1
@@ -10968,6 +13070,22 @@ def _build_helper_armature(
                 resolved_positions[int(bidx)] = fallback_candidate["world"].copy()
                 semantic_helper_source_by_index[int(bidx)] = str(fallback_candidate.get("source", "") or "semantic_fallback")
                 semantic_helper_reason_by_index[int(bidx)] = str(fallback_candidate.get("role", role_name or "semantic_helper"))
+                semantic_helpers_approx += 1
+                continue
+            # Parent-anchor fallback (same as the no-own-candidate branch): land at the
+            # nearest resolved ancestor instead of world origin.
+            _pa = parent_anchor
+            if not isinstance(_pa, Vector):
+                _walk = int(bone_parent_by_index.get(int(bidx), -1)); _g = 0
+                while _walk >= 0 and _g < 256:
+                    _anc = resolved_positions.get(int(_walk))
+                    if isinstance(_anc, Vector):
+                        _pa = _anc; break
+                    _walk = int(bone_parent_by_index.get(int(_walk), -1)); _g += 1
+            if use_deterministic_raw_scene and _armature_is_rd and isinstance(_pa, Vector):
+                resolved_positions[int(bidx)] = _pa.copy()
+                semantic_helper_source_by_index[int(bidx)] = "parent_anchor_fallback"
+                semantic_helper_reason_by_index[int(bidx)] = "semantic_non_exact_parent_anchor"
                 semantic_helpers_approx += 1
                 continue
             semantic_helper_source_by_index[int(bidx)] = "skipped"
@@ -12043,14 +14161,83 @@ def _build_helper_armature(
         node_by_bone_index[int(bidx)] = empty
         created_empties += 1
 
+    # Mirror-fix outlier wheel/elevator bones in resolved_positions BEFORE anything is placed.
+    # A duplicate/bogus bone or a bad weights-derived position can fling a single wheel + its
+    # elevator empty + its track deform bone to the wrong side (Leopard_1V roue_elev_d1 ->
+    # (0.79,2.72,-1.38), dragging Roue_D1). Detect a roue_[dg]#/roue_elev_[dg]# whose resolved Y
+    # is a far outlier from its same-side siblings and snap it to the MIRROR of its opposite-side
+    # counterpart. Fixing resolved_positions here fixes the empty (placed just below), the wheel
+    # origin, AND the track deform bone (head=resolved_positions, built later) all at once.
+    # Universal; only clear outliers WITH a good counterpart are touched (no-op otherwise).
+    try:
+        import statistics as _wst
+        _wgrp: Dict[Tuple[str, str], List[Tuple[int, int]]] = {}
+        for _bi in ordered_indices:
+            if not isinstance(resolved_positions.get(int(_bi)), Vector):
+                continue
+            _wm = re.fullmatch(r"(roue_elev_|roue_)([dg])(\d+)", _norm_low(str(display_name_by_index.get(int(_bi), ""))))
+            if _wm:
+                _wgrp.setdefault((_wm.group(1), _wm.group(2)), []).append((int(_wm.group(3)), int(_bi)))
+        for (_pfx, _sd) in list(_wgrp.keys()):
+            _entries = _wgrp.get((_pfx, _sd), [])
+            _ys = [resolved_positions[_bi].y for _, _bi in _entries]
+            if len(_ys) < 3:
+                continue
+            _med = _wst.median(_ys)
+            _oentries = _wgrp.get((_pfx, "g" if _sd == "d" else "d"), [])
+            _oys = [resolved_positions[_bi].y for _, _bi in _oentries]
+            if len(_oys) < 3:
+                continue
+            _omed = _wst.median(_oys)
+            _good_opp: Dict[int, Vector] = {}
+            for _n, _bi in _oentries:
+                _p = resolved_positions[_bi]
+                if abs(_p.y - _omed) <= 1.0:
+                    _good_opp[_n] = _p
+            for _n, _bi in _entries:
+                _p = resolved_positions[_bi]
+                if abs(_p.y - _med) <= 1.0:
+                    continue
+                _op = _good_opp.get(_n)
+                if _op is not None:
+                    resolved_positions[int(_bi)] = Vector((_op.x, -_op.y, _op.z))
+    except Exception:
+        pass
+
     # Place object origins/empties at resolved deterministic positions.
     for bidx, node in node_by_bone_index.items():
         pos = resolved_positions.get(int(bidx))
-        if pos is None:
-            continue
         if node.type == "MESH":
+            if pos is None:
+                continue
+            # RD wheels/tracks intentionally use a geometric-centroid origin (their
+            # roue_*/chenille_* bone pivot resolves to the world origin); don't clobber
+            # it with the bone pivot. WARNO/other meshes never set this marker.
+            try:
+                if node.get("warno_rd_centroid_origin"):
+                    continue
+            except Exception:
+                pass
             _set_object_origin_world(node, pos)
         else:
+            # "Fallen empty" net: a helper with NO resolved position, or one collapsed to
+            # ~world-origin while its parent sits elsewhere (a degenerate stream_local, e.g.
+            # the ikv_103 Antenne_* / gepard 'Particle view' bug), snaps to its nearest
+            # non-origin ancestor (antenna base on the hull) instead of dropping to (0,0,0).
+            # WARNO empties resolve to real positions; also gate on the RD deterministic
+            # scene path so the WARNO (weighted-positions) path is byte-for-byte untouched.
+            if use_deterministic_raw_scene and _armature_is_rd and (pos is None or float(pos.length) < 0.01):
+                _walk = int(bone_parent_by_index.get(int(bidx), -1))
+                _g = 0
+                while _walk >= 0 and _g < 256:
+                    _anc = resolved_positions.get(int(_walk))
+                    if isinstance(_anc, Vector) and float(_anc.length) >= 0.01:
+                        pos = _anc.copy()
+                        break
+                    _walk = int(bone_parent_by_index.get(int(_walk), -1))
+                    _g += 1
+            if pos is None:
+                continue
             node.location = pos
 
     def _ensure_track_edge_groups_from_resolved(
@@ -12266,8 +14453,12 @@ def _build_helper_armature(
             continue
         grp = _wheel_armature_group_name(side, int(bidx))
         if not grp:
+            # A1-B: the skeleton has Roue_Elev_<side> wheels but NO Armature_<side><n> carrier
+            # bone (loggim_sa / hafiz / olifant), so no track armature was ever built. Synthesize
+            # a side carrier so the rig IS created — exactly what units that have carrier bones
+            # get for free. Only fires when the real carrier is genuinely absent.
             wheel_missing_carrier += 1
-            continue
+            grp = "armature_%s1" % side
         wheel_groups.setdefault(grp, []).append((int(bidx), bool(is_deform)))
 
     created_armatures: List[bpy.types.Object] = []
@@ -12517,6 +14708,12 @@ def _build_helper_armature(
             continue
 
     smoke_world_overrides = 0
+    # Track-smoke (Fx_Fumee_Chenille_D/G) empties belong BEHIND the belt at ground level, not at
+    # their raw bone pivot (mid-hull, "under the tracks"). Move them just behind the track rear
+    # edge (X) at ground (Z). The side (Y) comes from each empty's OWN resolved position — the
+    # WARNO track BASE mesh is centred at Y~=0 so the track-mesh bbox center_y is useless there
+    # (it collapsed both empties to the centre line); the resolved Y keeps D/G on their correct
+    # sides for WARNO + RD. Runs for both games (this is the intended smoke placement).
     if use_deterministic_raw_scene:
         def _track_dust_anchor_metrics(track_obj: bpy.types.Object | None) -> Dict[str, float] | None:
             if track_obj is None:
@@ -12561,24 +14758,42 @@ def _build_helper_armature(
             for metrics in (right_metrics, left_metrics)
             if isinstance(metrics, dict)
         ]
-        shared_rear_x = -max(dust_x_values) if dust_x_values else 0.0
+        # Anchor the smoke just behind the TRACK belt's rear (the idler — where track dust kicks
+        # up), at ground; close to the hull, not floating behind the rear plate. Universal:
+        # derived from the track object bounds + a small fixed margin (works for any unit).
+        _track_rear_x = None
+        for _t in (track_right_obj, track_left_obj):
+            if _t is None:
+                continue
+            try:
+                _mn, _mx, _c = _bounds_world(_t)
+                _v = float(_mn.x)
+                if _track_rear_x is None or _v < _track_rear_x:
+                    _track_rear_x = _v
+            except Exception:
+                continue
+        if _track_rear_x is not None:
+            shared_rear_x = _track_rear_x - 0.15
+        else:
+            shared_rear_x = -max(dust_x_values) * 1.12 if dust_x_values else 0.0
         shared_abs_y = min(dust_y_values) if dust_y_values else 0.0
         shared_ground_z = min(dust_z_values) if dust_z_values else 0.0
 
-        smoke_d_point = (
-            Vector((shared_rear_x, -shared_abs_y, shared_ground_z))
-            if right_metrics is not None
-            else None
-        )
-        smoke_g_point = (
-            Vector((shared_rear_x, shared_abs_y, shared_ground_z))
-            if left_metrics is not None
-            else None
-        )
-        if smoke_d_point is None and isinstance(smoke_g_point, Vector):
-            smoke_d_point = Vector((smoke_g_point.x, -smoke_g_point.y, smoke_g_point.z))
-        if smoke_g_point is None and isinstance(smoke_d_point, Vector):
-            smoke_g_point = Vector((smoke_d_point.x, -smoke_d_point.y, smoke_d_point.z))
+        def _smoke_side_y(idx: int, fallback_y: float) -> float:
+            # Prefer the empty's OWN resolved (spk_exact) side position; fall back to the
+            # track-mesh center_y only when the resolved Y is missing/collapsed (|y|<=0.1,
+            # e.g. the centred WARNO belt base mesh) so D/G never collapse to the centre line.
+            rp = resolved_positions.get(int(idx))
+            if isinstance(rp, Vector) and abs(float(rp.y)) > 0.1:
+                return float(rp.y)
+            return float(fallback_y)
+
+        if right_metrics is not None or left_metrics is not None:
+            smoke_d_point = Vector((shared_rear_x, _smoke_side_y(smoke_d_idx, -shared_abs_y), shared_ground_z))
+            smoke_g_point = Vector((shared_rear_x, _smoke_side_y(smoke_g_idx, shared_abs_y), shared_ground_z))
+        else:
+            smoke_d_point = None
+            smoke_g_point = None
 
         for smoke_idx, smoke_point in ((smoke_d_idx, smoke_d_point), (smoke_g_idx, smoke_g_point)):
             if smoke_idx < 0 or not isinstance(smoke_point, Vector):
@@ -12845,9 +15060,10 @@ def _build_asset_index_payload_worker(
     spk_paths: Sequence[Path],
     signature: Dict[str, Any],
     index_path: Path,
+    game: "str | None" = None,
 ) -> Dict[str, Any]:
     extractor_mod = _load_extractor_module_for_worker(extractor_path)
-    assets = _scan_assets_from_spk_paths(extractor_mod, spk_paths, query=None)
+    assets = _scan_assets_from_spk_paths(extractor_mod, spk_paths, query=None, game=game)
     payload = _build_asset_index_payload(extractor_mod, assets, signature, len(spk_paths))
     _save_asset_index_file(index_path, payload)
     return payload
@@ -12920,6 +15136,7 @@ class WARNO_OT_BuildAssetIndex(Operator):
                 "index_path": index_path,
                 "signature": signature,
                 "extractor_path": extractor_path,
+                "game": _normalize_game_id(getattr(settings, "game_preset", "WARNO")),
             }
 
             def worker():
@@ -12929,6 +15146,7 @@ class WARNO_OT_BuildAssetIndex(Operator):
                         spk_paths=[Path(p) for p in self._job["spk_paths"]],
                         signature=dict(self._job["signature"]),
                         index_path=Path(self._job["index_path"]),
+                        game=self._job["game"],
                     )
                     self._job["payload"] = payload
                 except Exception as exc:
@@ -13416,16 +15634,15 @@ class WARNO_OT_PickAssetBrowserTree(Operator):
             )
             return {"CANCELLED"}
 
-        # On first open, auto-expand every top-level root so the tree is
-        # not empty-looking. Keep deeper expand state from previous session.
+        # On first open, auto-expand the root(s) and any linear single-child
+        # folder chain so the tree is not empty-looking — important for deep
+        # single-root layouts (Wargame RD / Steel Division 2). Keep any deeper
+        # expand state from a previous session.
         expanded = _browser_serialize_expanded(settings)
-        roots_added = 0
-        for root in (index_data or {}).get("folder_tree", []) or []:
-            key = str(root.get("key", "")).strip()
-            if key and key not in expanded:
-                expanded.add(key)
-                roots_added += 1
-        if roots_added > 0:
+        auto = _browser_auto_expand_keys((index_data or {}).get("folder_tree", []) or [])
+        new_keys = auto - expanded
+        if new_keys:
+            expanded |= new_keys
             _browser_save_expanded(settings, expanded)
 
         _browser_populate_nodes(settings, index_data)
@@ -13776,79 +15993,12 @@ class WARNO_OT_OpenLogFile(Operator):
             return {"CANCELLED"}
 
 
-class WARNO_OT_RebuildAtlasJsonCache(Operator):
-    bl_idname = "warno.rebuild_atlas_json_cache"
-    bl_label = "Rebuild Atlas JSON Cache"
-    bl_description = "Force rebuild Atlas JSON map for current selected asset"
-
-    def execute(self, context):
-        settings = context.scene.warno_import
-        _enforce_fixed_runtime_defaults(settings)
-
-        asset = str(settings.selected_asset or "").strip()
-        if not asset:
-            msg = "No asset selected. Scan and pick an asset first."
-            settings.status = msg
-            self.report({"WARNING"}, msg)
-            return {"CANCELLED"}
-
-        project_root = _project_root(settings)
-        warno_root = _resolve_path(project_root, str(settings.warno_root or "").strip())
-        modsuite_root = _resolve_path(project_root, str(settings.modding_suite_root or "").strip())
-        wrapper_path = _resolve_path(
-            project_root,
-            str(settings.modding_suite_atlas_wrapper or "").strip() or "modding_suite_atlas_export.py",
-        )
-        atlas_cli_text = str(settings.modding_suite_atlas_cli or "").strip()
-        atlas_cli_path = _resolve_path(project_root, atlas_cli_text) if atlas_cli_text else None
-        cache_root = _atlas_json_cache_root(settings)
-
-        if not warno_root.exists() or not warno_root.is_dir():
-            msg = f"WARNO folder not found: {warno_root}"
-            settings.status = msg
-            self.report({"ERROR"}, msg)
-            return {"CANCELLED"}
-        if not modsuite_root.exists() or not modsuite_root.is_dir():
-            msg = f"moddingSuite root not found: {modsuite_root}"
-            settings.status = msg
-            self.report({"ERROR"}, msg)
-            return {"CANCELLED"}
-
-        try:
-            extractor_mod = _extractor_module(settings)
-            if hasattr(extractor_mod, "clear_atlas_json_cache"):
-                extractor_mod.clear_atlas_json_cache()
-            info = extractor_mod.build_or_load_atlas_texture_map(
-                warno_root=warno_root,
-                modding_suite_root=modsuite_root,
-                asset_path=asset,
-                cache_dir=cache_root,
-                wrapper_path=wrapper_path,
-                atlas_cli_path=atlas_cli_path,
-                force_rebuild=True,
-                timeout_sec=max(5, int(settings.atlas_cli_timeout_sec)),
-            )
-            entries = int(info.get("atlas_map_entries", 0) or 0)
-            map_path = str(info.get("atlas_map_path", "")).strip()
-            msg = f"Atlas JSON rebuilt: entries={entries} | {map_path or asset}"
-            settings.status = msg
-            _warno_log(settings, msg, stage="atlas")
-            self.report({"INFO"}, msg)
-            return {"FINISHED"}
-        except Exception as exc:
-            msg = f"Atlas JSON rebuild failed: {exc}"
-            settings.status = msg
-            _warno_log(settings, msg, level="ERROR", stage="atlas")
-            self.report({"ERROR"}, msg)
-            return {"CANCELLED"}
-
-
 def _strip_texture_channel_suffix(stem: str) -> str:
     raw = str(stem or "").strip()
     if not raw:
         return ""
     out = re.sub(r"(?i)_(diffuse|albedo|color|normal|roughness|metallic|occlusion|alpha)$", "", raw)
-    out = re.sub(r"(?i)_(d|nm|r|m|ao|a|orm)$", "", out)
+    out = re.sub(r"(?i)_(d|nm|r|m|o|ao|a|orm|os|rs)$", "", out)
     out = re.sub(r"(?i)_part[0-9]+$", "", out)
     out = re.sub(r"_+", "_", out).strip("_")
     return out
@@ -14040,16 +16190,17 @@ class WARNO_OT_ApplyTextures(Operator):
             _set_status(settings, "stage: preparing runtime", stage="apply_textures")
             runtime_info = _prepare_zz_runtime_sources(extractor_mod, settings)
             _warno_log(settings, "runtime source policy: zz_runtime_only", stage="runtime")
+            game = _normalize_game_id(getattr(settings, "game_preset", "WARNO"))
             mesh_spk_paths = _resolve_mesh_spk_paths(project_root, settings, runtime_info)
             if not mesh_spk_paths:
                 raise RuntimeError("No mesh SPK files found.")
-            pick = _pick_best_asset_spk_path(extractor_mod, mesh_spk_paths, asset)
+            pick = _pick_best_asset_spk_path(extractor_mod, mesh_spk_paths, asset, game=game)
             if pick is None:
                 raise RuntimeError(f"Asset not found in SPK sources: {asset}")
             mesh_spk_path, asset_hint = pick
 
             with ExitStack() as stack:
-                spk = stack.enter_context(extractor_mod.SpkMeshExtractor(mesh_spk_path))
+                spk = stack.enter_context(extractor_mod.SpkMeshExtractor(mesh_spk_path, game=game))
                 hit = spk.find_best_fat_entry_for_asset(asset)
                 if hit is None and asset_hint and asset_hint != asset:
                     hit = spk.find_best_fat_entry_for_asset(asset_hint)
@@ -14088,6 +16239,7 @@ class WARNO_OT_ApplyTextures(Operator):
                     material_role_by_id=material_role_by_id,
                     runtime_info=runtime_info,
                 )
+                _force_opaque_baked_tracks(model, material_name_by_id, material_maps_by_name)
         except Exception as exc:
             msg = f"Texture apply failed: {exc}"
             settings.status = msg
@@ -14123,7 +16275,7 @@ class WARNO_OT_ApplyTextures(Operator):
                     continue
                 # The datablock name may carry our per-asset namespace prefix
                 # (e.g. 'M1038_Humvee__Vitre'). Try the namespaced key first
-                # for correctness, then fall back to the stripped raw key so
+                # for correctness, then fall back to the stgot raw key so
                 # legacy un-namespaced materials in older .blend files still
                 # match the SPK-derived map dictionaries.
                 key_full = _material_key(mat.name)
@@ -14222,6 +16374,144 @@ class WARNO_OT_ManualAutoSmoothApply(Operator):
             return {"CANCELLED"}
 
 
+class WARNO_OT_GetUVFromGame(Operator):
+    bl_idname = "warno.get_uv_from_game"
+    bl_label = "Get UV from game"
+    bl_description = (
+        "Launch the bundled in-game mesh getter (and the game, if found). In the game's "
+        "Armory, show the unit you want, then press INSERT to capture its exact GPU UVs "
+        "into the plugin cache. Re-import the unit afterwards — its track UV is taken 1:1 "
+        "from the get. Captures only read your own offline Armory view; the game is not modified"
+    )
+
+    _EXE_BY_GAME = {"WARGAME_RD": "WarGame3.exe", "WARNO": "WARNO.exe", "STEEL_DIVISION_2": "SteelDivision2.exe"}
+    _ROOT_DEFAULT = {
+        "WARGAME_RD": r"C:\Program Files (x86)\Steam\steamapps\common\Wargame Red Dragon",
+        "WARNO": r"F:\SteamLibrary\steamapps\common\WARNO",
+        "STEEL_DIVISION_2": r"C:\Program Files (x86)\Steam\steamapps\common\Steel Division 2",
+    }
+    _NEW_CONSOLE = 0x00000010  # CREATE_NEW_CONSOLE
+
+    def execute(self, context):
+        import os
+        import subprocess
+        settings = context.scene.warno_import
+        game = _normalize_game_id(getattr(settings, "game_preset", "WARNO"))
+        exe_name = self._EXE_BY_GAME.get(game, "WARNO.exe")
+        addon_dir = Path(os.path.dirname(os.path.abspath(__file__)))
+        # CRITICAL: the getter must write get_cache where the EXTRACTOR reads it back.
+        # The extractor module is loaded from the PROJECT ROOT (config project_root), and
+        # _try_apply_get_bake reads `<extractor_dir>/get_cache` — i.e. project_root/get_cache,
+        # NOT the addon dir. Writing to the addon dir (as before) meant a capture was never
+        # found on re-import. Write to project_root/get_cache; fall back to the addon dir.
+        try:
+            cache_dir = _project_root(settings) / "get_cache"
+        except Exception:
+            cache_dir = addon_dir / "get_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        getter_exe = addon_dir / "game_getter" / "warno_game_getter.exe"
+        getter_py = addon_dir / "game_getter" / "warno_game_getter.py"
+
+        # 1) launch the GETTER FIRST. The post-VS capture must hook the D3D11 device
+        #    BEFORE the game creates its shaders (at load), so the getter has to be
+        #    poll-attaching while the game loads. The standalone exe is preferred only if
+        #    it is newer than the bundled .py (a stale exe = the old pre-VS getter); else
+        #    use a Python that has frida.
+        args = ["--exe", exe_name, "--cache", str(cache_dir)]
+        try:
+            use_exe = getter_exe.exists()
+            try:
+                if use_exe and getter_py.exists() and getter_py.stat().st_mtime > getter_exe.stat().st_mtime + 1:
+                    use_exe = False  # .py is newer than the built exe -> exe is stale
+            except Exception:
+                pass
+            if use_exe:
+                subprocess.Popen([str(getter_exe)] + args, creationflags=self._NEW_CONSOLE)
+                _warno_log(settings, f"launched getter exe: {getter_exe}", stage="get")
+            else:
+                py = self._python_with_frida()
+                if not (py and getter_py.exists()):
+                    msg = ("Getter not found. Build it (tools/game_getter) or `pip install frida` "
+                           "for a Python on PATH, then re-sync the addon.")
+                    settings.status = msg
+                    self.report({"ERROR"}, msg)
+                    return {"CANCELLED"}
+                subprocess.Popen([py, str(getter_py)] + args, creationflags=self._NEW_CONSOLE)
+                _warno_log(settings, f"launched getter (python+frida): {getter_py}", stage="get")
+        except Exception as exc:
+            self.report({"ERROR"}, f"Getter launch failed: {exc}")
+            return {"CANCELLED"}
+
+        # 2) then launch the game (a moment later) if it isn't already running, so the
+        #    getter — now polling — attaches during loading and wins the VS-bytecode race.
+        try:
+            import time as _t
+            _t.sleep(1.5)
+            if not self._is_running(exe_name):
+                root = self._game_root(settings, game)
+                exe_path = self._find_game_exe(root, exe_name) if root else None
+                if exe_path:
+                    subprocess.Popen([str(exe_path)], cwd=str(exe_path.parent))
+                    _warno_log(settings, f"launched game: {exe_path}", stage="get")
+                else:
+                    _warno_log(settings, f"game exe '{exe_name}' not found — launch it yourself NOW (getter is polling).",
+                               level="WARNING", stage="get")
+            else:
+                _warno_log(settings, "game already running — getter attached late (still captures, but for the cleanest "
+                                     "post-VS result close the game and let the button launch it).", level="WARNING", stage="get")
+        except Exception as exc:
+            _warno_log(settings, f"(game auto-launch skipped: {exc})", stage="get")
+
+        msg = ("Getter running (watch its console: VS_captured should climb on the loading screen). "
+               "In the Armory show the unit, press INSERT to capture, then re-import it.")
+        settings.status = msg
+        _warno_log(settings, msg, stage="get")
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+    @staticmethod
+    def _is_running(exe_name):
+        try:
+            import subprocess
+            out = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {exe_name}"],
+                                 capture_output=True, text=True, timeout=10)
+            return exe_name.lower() in (out.stdout or "").lower()
+        except Exception:
+            return False
+
+    @staticmethod
+    def _python_with_frida():
+        import shutil
+        import subprocess
+        for cand in (shutil.which("python"), shutil.which("py"), shutil.which("python3")):
+            if not cand:
+                continue
+            try:
+                if subprocess.run([cand, "-c", "import frida"], capture_output=True, timeout=20).returncode == 0:
+                    return cand
+            except Exception:
+                continue
+        return None
+
+    def _game_root(self, settings, game):
+        for raw in (str(getattr(settings, "warno_root", "") or "").strip(), self._ROOT_DEFAULT.get(game, "")):
+            if raw and Path(raw).is_dir():
+                return Path(raw)
+        return None
+
+    @staticmethod
+    def _find_game_exe(root, exe_name):
+        direct = root / exe_name
+        if direct.is_file():
+            return direct
+        try:
+            for p in root.rglob(exe_name):
+                return p
+        except Exception:
+            pass
+        return None
+
+
 class WARNO_OT_ImportAsset(Operator):
     bl_idname = "warno.import_asset"
     bl_label = "Import To Blender"
@@ -14233,6 +16523,16 @@ class WARNO_OT_ImportAsset(Operator):
         t0 = time.monotonic()
         progress_total_steps = 8
         console_toggled = _toggle_import_console(settings, open_console=True)
+        # Start the cursor progress counter (visible % near the mouse, updates even while
+        # this blocking operator runs) so the user can see the import is working. Torn down
+        # in _toggle_import_console(open_console=False), which every import exit routes through.
+        try:
+            _wm = bpy.context.window_manager
+            if _wm is not None:
+                _wm.progress_begin(0, 100)
+                _wm.progress_update(0)
+        except Exception:
+            pass
         _warno_log(settings, "Import started.", stage="import")
         _log_import_progress(
             settings,
@@ -14304,7 +16604,9 @@ class WARNO_OT_ImportAsset(Operator):
             t0=t0,
             extra=f"mesh_spk_sources={len(mesh_spk_paths)}",
         )
-        pick = _pick_best_asset_spk_path(extractor_mod, mesh_spk_paths, asset)
+        game = _normalize_game_id(getattr(settings, "game_preset", "WARNO"))
+        dev_scale, off_mat_scale = _active_game_scales(settings)
+        pick = _pick_best_asset_spk_path(extractor_mod, mesh_spk_paths, asset, game=game)
         if pick is None:
             msg = f"Asset not found in selected SPK sources: {asset}"
             settings.status = msg
@@ -14347,7 +16649,7 @@ class WARNO_OT_ImportAsset(Operator):
         try:
             with ExitStack() as stack:
                 _set_status(settings, "stage: reading SPK/model", stage="import")
-                spk = stack.enter_context(extractor_mod.SpkMeshExtractor(mesh_spk_path))
+                spk = stack.enter_context(extractor_mod.SpkMeshExtractor(mesh_spk_path, game=game))
                 hit = spk.find_best_fat_entry_for_asset(asset)
                 if hit is None and asset_hint and asset_hint != asset:
                     hit = spk.find_best_fat_entry_for_asset(asset_hint)
@@ -14366,7 +16668,35 @@ class WARNO_OT_ImportAsset(Operator):
                 except Exception:
                     pass
 
-                model = spk.get_model_geometry(asset_real)
+                # Decoding the mesh is the longest blocking phase (per-part IRISZoom decode,
+                # track UV, bone names). Feed a per-part callback so the progress bar/cursor
+                # MOVE during it (otherwise it sat at 38% for ~20s and looked frozen). The
+                # decode spans the 38%->60% band of the overall 8-step bar; throttle to int %.
+                _decode_last_pct = [-1]
+
+                def _decode_progress(done: int, total: int) -> None:
+                    if total <= 0:
+                        return
+                    pct = int(round(38.0 + 22.0 * (float(done) / float(total))))
+                    if pct == _decode_last_pct[0]:
+                        return
+                    _decode_last_pct[0] = pct
+                    try:
+                        cells = 24
+                        filled = max(0, min(cells, int(round(cells * pct / 100.0))))
+                        print(f"[WARNO] {'█' * filled}{'░' * (cells - filled)} {pct:3d}% | "
+                              f"decoding mesh part {done + 1}/{total}", flush=True)
+                    except Exception:
+                        pass
+                    try:
+                        wm = bpy.context.window_manager
+                        if wm is not None:
+                            wm.progress_update(int(pct))
+                            wm.status_text_set(f"WARNO import {pct}% — decoding mesh ({done + 1}/{total})")
+                    except Exception:
+                        pass
+
+                model = spk.get_model_geometry(asset_real, progress_cb=_decode_progress)
                 material_ids = sorted({int(part["material"]) for part in model["parts"]})
                 raw_spk_names = getattr(spk, "material_name_by_id", {}) or {}
                 raw_slot_names = getattr(spk, "material_texture_names_by_id", {}) or {}
@@ -14388,7 +16718,7 @@ class WARNO_OT_ImportAsset(Operator):
                 if need_bone_map:
                     for skeleton_path in _resolve_skeleton_spk_paths(project_root, settings, runtime_info):
                         try:
-                            skeleton_spks.append(stack.enter_context(extractor_mod.SpkMeshExtractor(skeleton_path)))
+                            skeleton_spks.append(stack.enter_context(extractor_mod.SpkMeshExtractor(skeleton_path, game=game)))
                         except Exception:
                             continue
 
@@ -14407,13 +16737,14 @@ class WARNO_OT_ImportAsset(Operator):
                             ),
                             gfx_cli_path=_resolve_path(
                                 project_root,
-                                str(settings.modding_suite_gfx_cli or "").strip() or "moddingSuite/gfx_cli/moddingSuite.GfxCli.exe",
+                                str(settings.modding_suite_gfx_cli or "").strip() or "moddingSuite/moddingSuite.exe",
                             ),
                             timeout_sec=int(settings.gfx_cli_timeout_sec),
                             use_gfx_json_manifest=bool(settings.use_gfx_json_manifest),
                             legacy_ndf_source=None,
                             legacy_operators_source=None,
                             enable_operator_semantics=False,
+                            game=game,
                         )
                         gfx_manifest_info = gfx_resolver.manifest_for_asset(asset_real)
                     except Exception as exc:
@@ -14454,6 +16785,8 @@ class WARNO_OT_ImportAsset(Operator):
                         rot=rot,
                         skeleton_spks=skeleton_spks,
                         gfx_manifest_info=gfx_manifest_info,
+                        dev_scale=dev_scale,
+                        off_mat_scale=off_mat_scale,
                     )
                     _warno_log(
                         settings,
@@ -14485,6 +16818,7 @@ class WARNO_OT_ImportAsset(Operator):
                     material_role_by_id=material_role_by_id,
                     runtime_info=runtime_info,
                 )
+                _force_opaque_baked_tracks(model, material_name_by_id, material_maps_by_name)
                 _log_import_progress(
                     settings,
                     step_idx=5,
@@ -14508,7 +16842,42 @@ class WARNO_OT_ImportAsset(Operator):
                     bone_parent_by_index=bone_payload.get("bone_parent_by_index", {}),
                     bone_positions=bone_payload.get("bone_positions", {}) or {},
                     split_main_parts=bool(settings.auto_split_main_parts),
+                    dev_scale=dev_scale,
+                    material_maps_by_name=material_maps_by_name,
+                    is_rd_asset=str(getattr(settings, "game_preset", "") or "").upper() in ("WARGAME_RD", "STEEL_DIVISION_2"),
                 )
+                # Diagnostic: shows whether the RD track-split / body-whole path ran.
+                # If you see many "Part_NNN" groups here for an RD unit, the running
+                # code is stale (see the build-stamp line above) — restart Blender.
+                _rd_model = any(bool(p.get("vertices", {}).get("chenille")) for p in model.get("parts", []))
+                _warno_log(
+                    settings,
+                    "mesh buckets: %d objects [rd_model=%s] -> %s"
+                    % (len(buckets), _rd_model, ", ".join(str(b.get("group_name", "?")) for b in buckets)),
+                    stage="import",
+                )
+                # Per-part belt diagnostic (RD): nverts, chenille/cutout flags, whether the
+                # within-tile V reconstruction fired (belt_vfixed) and the raw V span
+                # (belt_vmax) — tells us if a belt's UV is file-reconstructable (vmax~8) or
+                # flat/constant (vmax<2 -> needs a post-VS capture). Helps diagnose chains.
+                try:
+                    for _pi, _p in enumerate(model.get("parts", []) or []):
+                        _v = _p.get("vertices", {}) or {}
+                        if not isinstance(_v, dict):
+                            continue
+                        _nv = len(_v.get("xyz", []) or []) // 3
+                        _mn = material_name_by_id.get(int(_p.get("material", -1)), "")
+                        _mm = (material_maps_by_name or {}).get(_mn) or {}
+                        _warno_log(
+                            settings,
+                            "part %d mat=%s nverts=%d chenille=%s cutout=%s belt_vfixed=%s belt_vmax=%.3f"
+                            % (_pi, _mn, _nv, bool(_v.get("chenille")),
+                               bool(_mm.get("alpha_cutout")), bool(_v.get("belt_vfixed")),
+                               float(_v.get("belt_vmax") or 0.0)),
+                            stage="import",
+                        )
+                except Exception:
+                    pass
                 wheel_groups = 0
                 track_groups = 0
                 turret_chain_groups = 0
@@ -14574,6 +16943,10 @@ class WARNO_OT_ImportAsset(Operator):
         except Exception:
             pass
 
+        # RD/SD2 model? (any part carries the IRISZoom chenille flag). Gates the track
+        # tube-unwrap to RD only — WARNO tracks are also named chenille_* but must keep
+        # their own UV untouched (WARNO never sets the chenille flag).
+        _model_is_rd = any(bool(p.get("vertices", {}).get("chenille")) for p in model.get("parts", []))
         for bucket_i, bucket in enumerate(buckets, start=1):
             group_name = str(bucket.get("group_name", f"Part_{bucket_i:03d}"))
             group_bone_index = int(bucket.get("group_bone_index", -1))
@@ -14590,7 +16963,12 @@ class WARNO_OT_ImportAsset(Operator):
                 and "soldat" in raw_name_values
                 and _norm_low(node_name_raw).startswith("bip01")
             )
-            if papyrus_character_mesh_proxy:
+            _peeled_name = str(bucket.get("warno_peeled_name", "") or "").strip()
+            if _peeled_name:
+                # geometry-peeled antenna/detail: name it by its own label, NOT the inherited
+                # chassis bone (which made antennas import as "Chassis_2/Chassis_3").
+                preferred_group_name = _peeled_name
+            elif papyrus_character_mesh_proxy:
                 preferred_group_name = _display_warno_node_name("soldat", asset_real)
                 soldat_proxy_index = next(
                     (
@@ -14602,7 +16980,11 @@ class WARNO_OT_ImportAsset(Operator):
                 )
                 group_bone_index = int(soldat_proxy_index)
             else:
-                preferred_group_name = _display_warno_node_name(node_name_raw, asset_real) if node_name_raw else group_name
+                _disp = _display_warno_node_name(node_name_raw, asset_real) if node_name_raw else ""
+                # RD/SD2 skeleton nodes store no readable names (control bytes), so the
+                # display name sanitises to empty -> fall back to the bucket's semantic
+                # group name ("Chenille"/"MainBody") instead of a meaningless "Part_NNN".
+                preferred_group_name = _disp if _safe_name(_disp, "").strip() else group_name
             if settings.auto_name_parts:
                 base_name = _safe_name(preferred_group_name, f"Part_{bucket_i:03d}")[:63]
             else:
@@ -14621,14 +17003,29 @@ class WARNO_OT_ImportAsset(Operator):
             mesh.update()
             uv_layer = mesh.uv_layers.new(name="UVMap")
             if uv_layer is not None:
-                for poly in mesh.polygons:
+                # Every part uses its GAME-decoded TexCoord0 UV (1:1). For RD track/chains
+                # materials whose atlas half was split into a 1:1 crop
+                # (_split_track_chains_textures sets maps["uv_crop"]=(v0,v1)), remap that
+                # face's V into [0,1] of the crop so the UV fills the cropped texture like
+                # the Ninja-Rip — v' = (v - v0)/(v1 - v0). All other faces keep the exact UV.
+                _bu = bucket["uvs"]; _fmids = bucket["face_mids"]
+                _crop_by_mid: Dict[int, Any] = {}
+                for _mid in {int(m) for m in _fmids}:
+                    _mm = material_maps_by_name.get(material_name_by_id.get(_mid))
+                    if isinstance(_mm, dict) and _mm.get("uv_crop"):
+                        _crop_by_mid[_mid] = _mm["uv_crop"]
+                for fi, poly in enumerate(mesh.polygons):
+                    vc = _crop_by_mid.get(int(_fmids[fi])) if fi < len(_fmids) else None
                     for li, vi in zip(poly.loop_indices, poly.vertices):
-                        if 0 <= vi < len(bucket["uvs"]):
-                            uv_layer.data[li].uv = bucket["uvs"][vi]
+                        if 0 <= vi < len(_bu):
+                            u, v = _bu[vi]
+                            if vc is not None:
+                                v0, v1 = vc
+                                if (v1 - v0) > 1e-6:
+                                    v = (v - v0) / (v1 - v0)
+                            uv_layer.data[li].uv = (u, v)
                         else:
                             uv_layer.data[li].uv = (0.0, 0.0)
-                if _norm_low(obj_name).startswith("chenille_") or "track" in _norm_low(obj_name):
-                    _wrap_track_uv_layer(mesh, uv_layer)
 
             mids_order: List[int] = []
             for mid in bucket["face_mids"]:
@@ -14641,12 +17038,21 @@ class WARNO_OT_ImportAsset(Operator):
                 raw_mat_name = material_name_by_id.get(mid, f"Material_{mid:03d}")
                 role = str(material_role_by_id.get(mid, "other"))
                 maps = material_maps_by_name.get(raw_mat_name, {})
+                # Track meshes: name the material after the per-SIDE bucket
+                # (Chenille_Gauche/Droite/Chains) so each split belt gets its own
+                # distinctly-named material even when both RD belts share one material
+                # id. Textures still come from the real material (maps unchanged); the
+                # post-import finalize later strips the namespace to the object name.
+                display_mat_name = raw_mat_name
+                _gn_low = _norm_low(str(group_name or ""))
+                if _gn_low.startswith("chenille") or _gn_low.startswith("chains"):
+                    display_mat_name = str(group_name)
                 # Per-asset cache key keeps the in-import dedup intact while
                 # the Blender datablock name itself is namespaced.
-                cache_key = f"{raw_mat_name.lower()}::{role}"
+                cache_key = f"{display_mat_name.lower()}::{role}::{raw_mat_name.lower()}"
                 mat = material_cache.get(cache_key)
                 if mat is None:
-                    mat_name = _warno_namespaced_material_name(asset_namespace, raw_mat_name)
+                    mat_name = _warno_namespaced_material_name(asset_namespace, display_mat_name)
                     mat = bpy.data.materials.get(mat_name)
                     if mat is None:
                         mat = bpy.data.materials.new(name=mat_name)
@@ -14657,6 +17063,13 @@ class WARNO_OT_ImportAsset(Operator):
                         ao_multiply_diffuse=False,
                         normal_invert_mode="none",
                     )
+                    # Flag RD/SD2 materials so the post-import pass can de-namespace them
+                    # to clean WARNO-style bare names (WARNO materials never carry this).
+                    if maps.get("rd_material"):
+                        try:
+                            mat["warno_rd_material"] = True
+                        except Exception:
+                            pass
                     material_cache[cache_key] = mat
                 mesh.materials.append(mat)
                 mat_slot_by_mid[mid] = len(mesh.materials) - 1
@@ -14670,8 +17083,32 @@ class WARNO_OT_ImportAsset(Operator):
             obj["warno_group"] = preferred_group_name
             obj["warno_asset"] = asset
             obj["warno_group_bone_index"] = int(group_bone_index)
-            obj["warno_is_track_mesh"] = bool(_norm_low(obj_name).startswith("chenille_") or "track" in _norm_low(obj_name))
+            # Track meshes skip merge-by-distance (keep the clean game vertex topology so
+            # the seam UV isn't collapsed). Match WARNO 'chenille_droite/gauche' AND the RD
+            # 'Chenille' object (exact, no underscore) — the old startswith('chenille_')
+            # missed the RD name, so RD tracks were wrongly merged 908->412.
+            obj["warno_is_track_mesh"] = bool(_norm_low(obj_name).startswith("chenille") or "track" in _norm_low(obj_name))
+            # RD ball-chains object: skip merge-by-distance too (collapsing verts would
+            # destroy the cutout silhouette), same as the track mesh.
+            obj["warno_is_chains_mesh"] = bool(_norm_low(obj_name) == "chains")
             collection.objects.link(obj)
+            # RD auto-split parts have no bone pivots (RD bone names are unusable), so
+            # give each its OWN origin = the part's geometric centroid (the wheel pivot
+            # for wheels, the body/gun/turret centre otherwise). WARNO/non-RD buckets
+            # never set warno_rd_origin and keep their bone-driven origins untouched.
+            if bool(bucket.get("warno_rd_origin")) and getattr(mesh, "vertices", None):
+                try:
+                    _vn = len(mesh.vertices)
+                    if _vn > 0:
+                        _cx = sum(v.co.x for v in mesh.vertices) / _vn
+                        _cy = sum(v.co.y for v in mesh.vertices) / _vn
+                        _cz = sum(v.co.z for v in mesh.vertices) / _vn
+                        _set_object_origin_world(obj, Vector((_cx, _cy, _cz)))
+                        # Mark so the later armature pass does not clobber this centroid
+                        # origin with the bone pivot (RD wheel/track bones sit at 0,0,0).
+                        obj["warno_rd_centroid_origin"] = True
+                except Exception:
+                    pass
             bucket_diag = dict(bucket.get("diagnostics", {}) or {})
             if bucket_diag:
                 bucket_diag["object_name"] = str(obj_name)
@@ -14789,6 +17226,9 @@ class WARNO_OT_ImportAsset(Operator):
         _set_status(settings, "stage: building scene objects", stage="import")
         if bool(settings.use_merge_by_distance):
             _merge_by_distance(imported_objects, float(settings.merge_distance))
+        # NOTE: hole-fill (v1.7.4/v1.7.6) is DISABLED — filling the game's open-shell gaps
+        # made flat sheets across large gaps that look like folds/creases. The open edges are
+        # the game's own mesh; leave them. (_fill_rd_mesh_holes kept but not called.)
         auto_smooth_mode = str(settings.auto_smooth_mode or "OFF").upper()
         if auto_smooth_mode in {"MODIFIER", "APPLY"}:
             try:
@@ -14804,12 +17244,89 @@ class WARNO_OT_ImportAsset(Operator):
         # Keep the first-pass weights authoritative.
         # _refine_track_weights_from_mesh_positions(imported_objects, settings=settings)
 
+        # Record pre-rig WORLD VERTEX POSITIONS of rotor/engine parts (Helice, Bloc_Moteur, ...) so a
+        # later pass can detect & undo a BAD bone-pull that displaces OR re-orients them off their
+        # correct FBX pose (Ka-50: the rig drags the gearbox up AND tips it 90 deg onto its side).
+        _rotor_engine_rx = re.compile(r"(helice|rotor|\bpale|propeller|rotopale|moteur)", re.IGNORECASE)
+        _prepull_world = {}
+        for _o in imported_objects:
+            if getattr(_o, "type", "") == "MESH" and _o.data and len(_o.data.vertices) and _rotor_engine_rx.search(getattr(_o, "name", "")):
+                _prepull_world[_o.name] = [(_o.matrix_world @ _v.co).copy() for _v in _o.data.vertices]
+
         if settings.auto_pull_bones:
             try:
                 hierarchy_root_obj = _build_helper_armature(imported_objects, bone_payload, collection, settings=settings)
             except Exception as exc:
                 self.report({"WARNING"}, f"Hierarchy build failed: {exc}")
                 hierarchy_root_obj = None
+            # Snap any wheel flung to the wrong side by a duplicate/bogus bone (Leopard_1V
+            # Roue_D1) back to the mirror of its opposite-side counterpart. No-op when all
+            # wheels are already on their rows.
+            try:
+                _nfix = _fix_outlier_wheels(imported_objects, collection)
+                if _nfix:
+                    _warno_log(settings, f"outlier wheel fix: {_nfix} wheel(s) snapped to mirror", stage="import")
+            except Exception:
+                pass
+            # A2 + A1-A: split a merged WARNO track belt (both sides in Chenille_Droite) into
+            # Droite/Gauche and weight each belt to its side wheels. No-op for single-side
+            # (RD / already-split) tracks.
+            try:
+                _nsplit = _split_and_weight_merged_track(imported_objects, collection)
+                if _nsplit:
+                    _warno_log(settings, f"track split+weight: {_nsplit} merged belt(s) split into Droite/Gauche", stage="import")
+            except Exception as _exc:
+                _warno_log(settings, f"track split+weight failed: {_exc}", level="WARNING", stage="import")
+
+        # Undo a BAD bone-pull: if the rig moved a rotor/engine part >0.4 m OR re-oriented it
+        # (Ka-50: the Bloc_Moteur gearbox floats up AND tips 90 deg onto its side), restore its
+        # EXACT pre-rig world geometry (position + orientation). No-op when bones are off or the
+        # pull was small and axis-aligned.
+        try:
+            _nrev = 0
+            for _o in imported_objects:
+                _pw = _prepull_world.get(getattr(_o, "name", ""))
+                if not _pw or getattr(_o, "type", "") != "MESH" or not _o.data or len(_pw) != len(_o.data.vertices):
+                    continue
+                _cur = [_o.matrix_world @ _v.co for _v in _o.data.vertices]
+                _n = len(_cur)
+                _pcen = Vector((0.0, 0.0, 0.0)); _ccen = Vector((0.0, 0.0, 0.0))
+                for _p in _pw:
+                    _pcen = _pcen + _p
+                for _p in _cur:
+                    _ccen = _ccen + _p
+                _pcen = _pcen / _n; _ccen = _ccen / _n
+                # per-axis world-bbox dims catch a re-orientation even when the centroid is unchanged
+                _pd = [max(p[i] for p in _pw) - min(p[i] for p in _pw) for i in range(3)]
+                _cd = [max(p[i] for p in _cur) - min(p[i] for p in _cur) for i in range(3)]
+                _moved = (_pcen - _ccen).length > 0.4
+                _tipped = max(abs(_pd[i] - _cd[i]) for i in range(3)) > 0.4
+                if _moved or _tipped:
+                    _mwi = _o.matrix_world.inverted()
+                    for _i, _v in enumerate(_o.data.vertices):
+                        _v.co = _mwi @ _pw[_i]
+                    _o.data.update()
+                    _nrev += 1
+            if _nrev:
+                _warno_log(settings, f"rotor/engine de-displace: {_nrev} part(s) restored to FBX pose", stage="import")
+        except Exception as _exc:
+            _warno_log(settings, f"rotor/engine de-displace failed: {_exc}", level="WARNING", stage="import")
+
+        # Rotor geometry fixes — pure mesh repairs, so run them OUTSIDE the auto_pull_bones gate
+        # (they don't need an armature; otherwise Ka_50_AA etc. stay broken when bones are off).
+        try:
+            _nrot = _fix_flyaway_rotors(collection)
+            if _nrot:
+                _warno_log(settings, f"rotor fly-away fix: {_nrot} rotor(s) re-centered", stage="import")
+        except Exception as _exc:
+            _warno_log(settings, f"rotor fly-away fix failed: {_exc}", level="WARNING", stage="import")
+        # Coaxial rotors (Ka-50/52/27): stack the two discs on one mast (same X,Y).
+        try:
+            _ncox = _align_coaxial_rotors(collection)
+            if _ncox:
+                _warno_log(settings, f"coaxial rotor align: {_ncox} disc(s) stacked on mast", stage="import")
+        except Exception as _exc:
+            _warno_log(settings, f"coaxial rotor align failed: {_exc}", level="WARNING", stage="import")
 
         # Finalize WARNO-reserved material names (e.g. 'Vitre'): rename the
         # namespaced material we just built ('<asset>__Vitre') back to the
@@ -14832,6 +17349,79 @@ class WARNO_OT_ImportAsset(Operator):
                 level="WARNING",
                 stage="import",
             )
+
+        # Both games: de-namespace ALL materials of this asset to clean bare names
+        # ('Chenille_Droite', 'Chassis'). Runs after the reserved-name finalize (Vitre already
+        # canonical) and before the track finalize. The '<unit>__' prefix was only a Blender
+        # collision guard; the cooker wants the bare game name.
+        try:
+            renamed_rd = _warno_finalize_rd_material_names(asset)
+            if renamed_rd > 0:
+                _warno_log(
+                    settings,
+                    f"material rename: {renamed_rd} de-namespaced to bare names",
+                    stage="import",
+                )
+        except Exception as exc:
+            _warno_log(
+                settings,
+                f"RD material rename failed: {exc}",
+                level="WARNING",
+                stage="import",
+            )
+
+        # Tracks: strip the namespace and rename the material to its object name
+        # (Chenille_Gauche_01 / Chenille_Droite_01) now that the build is done.
+        try:
+            renamed_tracks = _warno_finalize_track_material_names(asset)
+            if renamed_tracks > 0:
+                _warno_log(
+                    settings,
+                    f"track material rename: {renamed_tracks} track material(s) renamed to object names",
+                    stage="import",
+                )
+        except Exception as exc:
+            _warno_log(
+                settings,
+                f"track material rename failed: {exc}",
+                level="WARNING",
+                stage="import",
+            )
+
+        # Glass: RD ships the canopy material ('Vitres') opaque; make glass see-through and
+        # normalize its name to the cooker-reserved 'Vitre'.
+        try:
+            n_glass = _finalize_glass_materials()
+            if n_glass > 0:
+                _warno_log(settings, f"glass: {n_glass} material(s) made transparent + named Vitre", stage="import")
+        except Exception as exc:
+            _warno_log(settings, f"glass finalize failed: {exc}", level="WARNING", stage="import")
+
+        # Chains: name the ball-chain curtain object 'Chains' (not the generic 'Chassis_2' peel name).
+        try:
+            n_chain = _name_chain_objects()
+            if n_chain > 0:
+                _warno_log(settings, f"chains: {n_chain} chain object(s) named 'Chains'", stage="import")
+        except Exception:
+            pass
+
+        # Diffuse repair: re-wire a diffuse texture left unlinked from Base Color (keyword-named
+        # units like Alpha_Jet whose diffuse got mis-routed to the alpha input).
+        try:
+            n_diff = _fix_unwired_diffuse()
+            if n_diff > 0:
+                _warno_log(settings, f"diffuse repair: {n_diff} material(s) re-wired to Base Color", stage="import")
+        except Exception as _exc:
+            _warno_log(settings, f"diffuse repair failed: {_exc}", level="WARNING", stage="import")
+
+        # Universal node hygiene: diffuse -> sRGB, other maps -> Non-Color, and the diffuse COLOR
+        # must never drive BSDF Alpha (alpha is always a separate map). WARNO + RD.
+        try:
+            n_norm = _normalize_diffuse_colorspace_and_alpha()
+            if n_norm > 0:
+                _warno_log(settings, f"colorspace/alpha hygiene: {n_norm} fix(es) (diffuse sRGB, maps Non-Color, alpha unlinked)", stage="import")
+        except Exception as _exc:
+            _warno_log(settings, f"colorspace/alpha hygiene failed: {_exc}", level="WARNING", stage="import")
 
         new_scene_objects = [
             obj for obj in bpy.data.objects
@@ -14931,6 +17521,9 @@ class WARNO_PT_ImporterPanel(Panel):
         layout = self.layout
         s = context.scene.warno_import
 
+        game_box = layout.box()
+        game_box.prop(s, "game_preset", text="Game")
+
         root_box = layout.box()
         root_hdr = root_box.row(align=True)
         root_icon = "TRIA_DOWN" if bool(s.show_project_section) else "TRIA_RIGHT"
@@ -14949,10 +17542,13 @@ class WARNO_PT_ImporterPanel(Panel):
         header.prop(s, "show_first_setup_logs", text="First Setup / Logs", icon=setup_icon, emboss=False)
         if s.show_first_setup_logs:
             src = setup.column(align=True)
-            src.prop(s, "warno_root")
+            _game_folder_label = {
+                "WARNO": "WARNO Folder",
+                "WARGAME_RD": "Wargame RD Folder",
+                "STEEL_DIVISION_2": "Steel Division 2 Folder",
+            }.get(_normalize_game_id(getattr(s, "game_preset", "WARNO")), "Game Folder")
+            src.prop(s, "warno_root", text=_game_folder_label)
             src.prop(s, "modding_suite_root")
-            src.prop(s, "modding_suite_atlas_cli")
-            src.prop(s, "modding_suite_gfx_cli")
             src.prop(s, "zz_runtime_dir")
             src.operator("warno.prepare_zz_runtime", text="Prepare ZZ Runtime", icon="FILE_REFRESH")
             src.prop(s, "cache_dir")
@@ -14974,7 +17570,6 @@ class WARNO_PT_ImporterPanel(Panel):
             tex.prop(s, "atlas_assets_dir")
             row = tex.row(align=True)
             row.operator("warno.open_texture_folder", text="Open Texture Folder", icon="FILE_FOLDER")
-            row.operator("warno.rebuild_atlas_json_cache", text="Rebuild Atlas JSON Cache", icon="FILE_REFRESH")
             row.operator("warno.clear_texture_folder", text="Clear texture folder from old files", icon="TRASH")
             tex.operator("warno.apply_textures", text="Apply/Reapply Textures", icon="SHADING_TEXTURE")
 
@@ -15025,6 +17620,9 @@ class WARNO_PT_ImporterPanel(Panel):
         import_row.operator("warno.import_asset", text="Import To Blender", icon="IMPORT")
         import_row.operator("warno.manual_auto_smooth_apply", text="Manual Auto Smooth Apply", icon="MOD_SMOOTH")
         layout.label(text="Auto Smooth mode: modifier | off | apply.", icon="INFO")
+        get_row = layout.row(align=True)
+        get_row.operator("warno.get_uv_from_game", text="Get UV from game (Experimental)", icon="RESTRICT_RENDER_OFF")
+        layout.label(text="Armory: show unit, press INSERT to capture, then re-import.", icon="INFO")
         if s.status:
             layout.label(text=s.status)
 
@@ -15054,11 +17652,11 @@ CLASSES = [
     WARNO_OT_InstallTGVDeps,
     WARNO_OT_OpenSystemConsole,
     WARNO_OT_OpenLogFile,
-    WARNO_OT_RebuildAtlasJsonCache,
     WARNO_OT_OpenTextureFolder,
     WARNO_OT_ClearTextureFolder,
     WARNO_OT_ApplyTextures,
     WARNO_OT_ManualAutoSmoothApply,
+    WARNO_OT_GetUVFromGame,
     WARNO_OT_ImportAsset,
     WARNO_PT_ImporterPanel,
 ]

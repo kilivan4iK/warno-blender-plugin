@@ -32,6 +32,82 @@ WARNO_DEV_SCALE = 20.0 / 43.0
 WARNO_OFF_MAT_SCALE = WARNO_DEV_SCALE / 100.0
 
 
+# ---------------------------------------------------------------------------
+# Multi-game support (Eugen Systems engines).
+#
+# WARNO, Wargame Red Dragon and Steel Division 2 all ship their assets inside
+# EDAT containers named ``ZZ*.dat`` under ``<install>/Data`` (verified on disk),
+# so the container layer is shared. The per-game knobs below isolate the few
+# bits that *could* differ (coordinate scale, mesh-pack folder tokens, preferred
+# SPK file names, atlas folder). The WARNO profile reproduces the historical
+# hardcoded constants EXACTLY so WARNO behaviour stays byte-for-byte unchanged.
+# Wargame RD / Steel Division 2 start identical to WARNO and are tuned here once
+# real-file testing reveals differences (single source of truth = this table).
+# ---------------------------------------------------------------------------
+DEFAULT_GAME_ID = "WARNO"
+
+GAME_PROFILES: Dict[str, Dict[str, Any]] = {
+    "WARNO": {
+        "id": "WARNO",
+        "label": "WARNO",
+        "dev_scale": WARNO_DEV_SCALE,
+        "off_mat_scale": WARNO_OFF_MAT_SCALE,
+        "zz_scan_subdir": "Data",
+        "zz_dat_glob": "ZZ*.dat",
+        "mesh_pack_must_contain": [["pc/mesh/pack/"], ["meshpack/"], ["mesh", "pack"]],
+        "preferred_mesh_tokens": ["mesh_all.spk", "gfxdescriptor/mesh_all.spk"],
+        "preferred_skeleton_tokens": ["skeleton_all.spk", "gfxdescriptor/skeleton_all.spk"],
+        "mesh_spk_rel_dir": ["PC", "mesh", "pack"],
+        "atlas_assets_rel": ["PC", "Atlas", "Assets"],
+        "default_install_path": r"F:\SteamLibrary\steamapps\common\WARNO",
+        "mesh_format_version": "warno",
+        "fat_entry_align": 1,
+    },
+    "WARGAME_RD": {
+        "id": "WARGAME_RD",
+        "label": "Wargame Red Dragon",
+        "dev_scale": WARNO_DEV_SCALE,            # tune after real-file testing
+        "off_mat_scale": WARNO_OFF_MAT_SCALE,
+        "zz_scan_subdir": "Data",
+        "zz_dat_glob": "ZZ*.dat",
+        "mesh_pack_must_contain": [["pc/mesh/pack/"], ["meshpack/"], ["mesh", "pack"]],
+        "preferred_mesh_tokens": ["mesh_all.spk", "gfxdescriptor/mesh_all.spk"],
+        "preferred_skeleton_tokens": ["skeleton_all.spk", "gfxdescriptor/skeleton_all.spk"],
+        "mesh_spk_rel_dir": ["PC", "mesh", "pack"],
+        "atlas_assets_rel": ["PC", "Atlas", "Assets"],
+        "default_install_path": r"C:\Program Files (x86)\Steam\steamapps\common\Wargame Red Dragon",
+        "mesh_format_version": "auto",
+        "fat_entry_align": 2,
+    },
+    "STEEL_DIVISION_2": {
+        "id": "STEEL_DIVISION_2",
+        "label": "Steel Division 2",
+        "dev_scale": WARNO_DEV_SCALE,            # tune after real-file testing
+        "off_mat_scale": WARNO_OFF_MAT_SCALE,
+        "zz_scan_subdir": "Data",
+        "zz_dat_glob": "ZZ*.dat",
+        "mesh_pack_must_contain": [["pc/mesh/pack/"], ["meshpack/"], ["mesh", "pack"]],
+        "preferred_mesh_tokens": ["mesh_all.spk", "gfxdescriptor/mesh_all.spk"],
+        "preferred_skeleton_tokens": ["skeleton_all.spk", "gfxdescriptor/skeleton_all.spk"],
+        "mesh_spk_rel_dir": ["PC", "mesh", "pack"],
+        "atlas_assets_rel": ["PC", "Atlas", "Assets"],
+        "default_install_path": r"C:\Program Files (x86)\Steam\steamapps\common\Steel Division 2",
+        "mesh_format_version": "auto",
+        "fat_entry_align": 2,
+    },
+}
+
+
+def get_game_profile(game: "str | None" = None) -> Dict[str, Any]:
+    """Return the profile dict for ``game``, falling back to the WARNO profile.
+
+    Unknown / empty ids resolve to WARNO so every existing caller that passes
+    nothing keeps the historical WARNO behaviour.
+    """
+    key = str(game or DEFAULT_GAME_ID).strip().upper()
+    return GAME_PROFILES.get(key, GAME_PROFILES[DEFAULT_GAME_ID])
+
+
 @dataclass
 class RawNodeTransform:
     source: str
@@ -385,9 +461,16 @@ def safe_output_relpath(asset_path: str) -> Path:
 
 
 def zlib_decode_compat(data: bytes) -> bytes:
+    # Use a decompress object (not one-shot zlib.decompress) so streams that omit
+    # the trailing checksum / are not byte-exact at the end still decode. WARNO's
+    # complete streams decode byte-identically; Wargame Red Dragon's index buffers
+    # (zlib payload sliced to the table size, no trailer) only decode this way.
     for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
         try:
-            return zlib.decompress(data, wbits)
+            dobj = zlib.decompressobj(wbits)
+            out = dobj.decompress(data)
+            out += dobj.flush()
+            return out
         except zlib.error:
             pass
     raise ValueError("Failed to zlib-decompress buffer")
@@ -1340,12 +1423,14 @@ class GfxManifestResolver:
         legacy_ndf_source: Path | None = None,
         legacy_operators_source: Path | None = None,
         enable_operator_semantics: bool = True,
+        game: "str | None" = None,
     ):
         self.warno_root = Path(warno_root)
         self.modding_suite_root = Path(modding_suite_root)
         self.cache_dir = Path(cache_dir)
         self.wrapper_path = Path(wrapper_path)
         self.gfx_cli_path = Path(gfx_cli_path) if gfx_cli_path is not None and str(gfx_cli_path).strip() else None
+        self.game = get_game_profile(game)["id"]
         self.timeout_sec = max(5, int(timeout_sec))
         self.use_gfx_json_manifest = bool(use_gfx_json_manifest)
         self.legacy_ndf_source = Path(legacy_ndf_source) if legacy_ndf_source is not None and str(legacy_ndf_source).strip() else None
@@ -1634,6 +1719,7 @@ class GfxManifestResolver:
                     gfx_cli_path=self.gfx_cli_path,
                     force_rebuild=force_rebuild,
                     timeout_sec=self.timeout_sec,
+                    game=self.game,
                 )
                 manifest = dict(info.get("gfx_manifest", {}) or {})
                 manifest["source"] = "gfx_manifest"
@@ -1772,17 +1858,20 @@ def channel_from_token(token: str) -> str | None:
         return "diffuse"
     if "normal_reconstructed" in t:
         return "normal"
-    if "occlusion" in t or "_ao" in t or t.endswith("_o") or "_o." in t or "_track_o" in t:
+    # A channel keyword that is the unit-name PREFIX (e.g. "Alpha_Jet" -> the DIFFUSE, "Metal_*"
+    # etc.) must NOT route the bare diffuse to that channel, or the material loses its Base Color
+    # ("all textures present except the diffuse"). Real channel words sit at/after a separator.
+    if ("occlusion" in t and not t.startswith("occlusion")) or "_ao" in t or t.endswith("_o") or "_o." in t or "_track_o" in t:
         return "occlusion"
-    if "roughness" in t or t.endswith("_r") or "_track_r" in t:
+    if ("roughness" in t and not t.startswith("roughness")) or t.endswith("_r") or "_track_r" in t:
         return "roughness"
-    if "metallic" in t or t.endswith("_m") or "_track_m" in t:
+    if ("metallic" in t and not t.startswith("metallic")) or t.endswith("_m") or "_track_m" in t:
         return "metallic"
-    if "normal" in t or "_nm" in t:
+    if ("normal" in t and not t.startswith("normal")) or "_nm" in t:
         return "normal"
     if "diffuse" in t or t.endswith("_d") or "_track_d" in t:
         return "diffuse"
-    if "alpha" in t or t.endswith("_a") or "_track_a" in t:
+    if ("alpha" in t and not t.startswith("alpha")) or t.endswith("_a") or "_track_a" in t:
         return "alpha"
     return None
 
@@ -2042,6 +2131,154 @@ def influential_bone_sets(
             best = max(range(4), key=lambda i: ws[i])
             influenced.add(idxs[best])
         out.append(influenced)
+    return out
+
+
+def rd_split_body_part(
+    verts: Dict[str, List[float]],
+    rotated: Sequence[Tuple[float, float, float]],
+    tris: Sequence[Tuple[int, int, int]],
+) -> List[Dict[str, Any]]:
+    """RD/Wargame-only: split the single RD body mesh part into semantic sub-parts
+    (MainBody / Canon[gun] / Tourelle[gun mount or turret] / Roue_D*/Roue_G*[roadwheels])
+    using the IRISZoom per-vertex DOMINANT bone index + geometry. RD bone NAMES are
+    unusable (control bytes), so we cluster faces by dominant bone index and classify
+    each cluster GEOMETRICALLY with scale-free RELATIVE thresholds (mesh frame: +X
+    forward, Y sided, Z up). Returns a list of group payloads
+    {group_name_raw, group_name_sanitized, group_bone_index, tris, origin(x,y,z)}.
+    NEVER shatters: returns a single MainBody bucket on any ambiguity/error so a
+    misjudged unit just behaves like today's whole-body import.
+    WARNO never reaches this (it splits by named bones); pure geometry, no bpy."""
+    from collections import Counter, defaultdict
+
+    nver = len(rotated)
+    tri_list = [
+        (int(t[0]), int(t[1]), int(t[2]))
+        for t in tris
+        if len(t) == 3 and all(0 <= int(v) < nver for v in t)
+    ]
+
+    def _single() -> List[Dict[str, Any]]:
+        return [{
+            "group_name_raw": "MainBody",
+            "group_name_sanitized": "MainBody",
+            "group_bone_index": -1,
+            "tris": list(tri_list),
+            "origin": None,
+        }]
+
+    if len(tri_list) < 48:
+        return _single()
+    try:
+        dom = dominant_bone_indices(verts, nver)
+    except Exception:
+        dom = []
+    if not dom or len(dom) < nver:
+        return _single()
+
+    tris_by_bone: Dict[int, List[Tuple[int, int, int]]] = defaultdict(list)
+    for tri in tri_list:
+        votes = [dom[v] for v in tri]
+        tris_by_bone[int(Counter(votes).most_common(1)[0][0])].append(tri)
+    if len(tris_by_bone) < 4:
+        return _single()
+
+    st: Dict[int, Dict[str, float]] = {}
+    for b, bt in tris_by_bone.items():
+        vs: set[int] = set()
+        for tri in bt:
+            vs.update(tri)
+        xs = [rotated[v][0] for v in vs]
+        ys = [rotated[v][1] for v in vs]
+        zs = [rotated[v][2] for v in vs]
+        st[b] = dict(
+            n=len(bt),
+            cx=sum(xs) / len(xs), cy=sum(ys) / len(ys), cz=sum(zs) / len(zs),
+            dx=max(xs) - min(xs), dy=max(ys) - min(ys), dz=max(zs) - min(zs),
+            maxx=max(xs), minx=min(xs),
+        )
+
+    all_cz = [s["cz"] for s in st.values()]
+    zmin, zmax = min(all_cz), max(all_cz)
+    zspan = (zmax - zmin) or 1.0
+    body_dx = (max(s["maxx"] for s in st.values()) - min(s["minx"] for s in st.values())) or 1.0
+    body_dy = max((abs(s["cy"]) for s in st.values()), default=1.0) or 1.0
+    total = len(tri_list)
+
+    label: Dict[int, str] = {}
+
+    # (1) Roadwheels: compact, low-Z, sided, repeated. Several required.
+    wheel_bones = [
+        b for b, s in st.items()
+        if max(s["dx"], s["dy"], s["dz"]) <= 0.22 * body_dx
+        and s["cz"] <= zmin + 0.42 * zspan
+        and abs(s["cy"]) >= 0.18 * body_dy
+        and s["n"] <= 0.12 * total
+    ]
+    if len(wheel_bones) >= 3:
+        for side, neg in (("G", True), ("D", False)):
+            side_bones = sorted(
+                [b for b in wheel_bones if (st[b]["cy"] < 0) == neg],
+                key=lambda b: st[b]["cx"],
+            )
+            for i, b in enumerate(side_bones, 1):
+                label[b] = "Roue_%s%d" % (side, i)
+
+    # (2) Gun (Canon): elongated (dx >> dy,dz), forward, elevated.
+    gun_cands = [
+        b for b, s in st.items()
+        if b not in label
+        and s["dx"] >= 2.5 * max(s["dy"], s["dz"], 1e-6)
+        and s["cz"] >= zmin + 0.40 * zspan
+    ]
+    if gun_cands:
+        gun_b = max(gun_cands, key=lambda b: st[b]["maxx"])
+        label[gun_b] = "Canon_01"
+        for b in gun_cands:  # barrel tip / second segment ahead of the breech
+            if b != gun_b and st[b]["maxx"] >= st[gun_b]["cx"]:
+                label[b] = "Canon_01"
+
+    # (3) Turret / gun-mount (Tourelle): among the big residual clusters, the LOWER-Z
+    # one is the hull (-> MainBody) and a clearly-HIGHER-Z big one is the turret/cradle.
+    # (Picking "biggest = hull" fails when the turret out-triangles the hull, e.g. M1A1.)
+    big_rest = sorted([b for b in st if b not in label and st[b]["n"] >= 0.08 * total],
+                      key=lambda b: st[b]["cz"])
+    if len(big_rest) >= 2:
+        hi = big_rest[-1]
+        lo = big_rest[0]
+        if (st[hi]["cz"] >= st[lo]["cz"] + 0.18 * zspan
+                and abs(st[hi]["cy"]) <= 0.30 * body_dy):
+            label[hi] = "Tourelle_01"
+
+    # (4) Everything else -> MainBody. Merge per group name.
+    groups: Dict[str, List[Tuple[int, int, int]]] = defaultdict(list)
+    rep_bone: Dict[str, int] = {}
+    for b in st:
+        name = label.get(b, "MainBody")
+        groups[name].extend(tris_by_bone[b])
+        rep_bone.setdefault(name, b)
+
+    # Conservative guard: never shatter. Unclassified clusters already fall into
+    # MainBody (so it is never empty), and a big turret can legitimately exceed the
+    # hull in triangles — so only bail when nothing meaningfully separated.
+    if len(groups) < 2 or "MainBody" not in groups:
+        return _single()
+
+    out: List[Dict[str, Any]] = []
+    for name, gt in groups.items():
+        vs = set()
+        for tri in gt:
+            vs.update(tri)
+        ox = sum(rotated[v][0] for v in vs) / len(vs)
+        oy = sum(rotated[v][1] for v in vs) / len(vs)
+        oz = sum(rotated[v][2] for v in vs) / len(vs)
+        out.append({
+            "group_name_raw": name,
+            "group_name_sanitized": sanitize_material_name(name) or name,
+            "group_bone_index": int(rep_bone[name]),
+            "tris": list(gt),
+            "origin": (ox, oy, oz),
+        })
     return out
 
 
@@ -2538,6 +2775,171 @@ def _build_group_split_diagnostics(
         "significant_raw_nodes": significant_raw_nodes,
         "contamination_verdict": str(contamination_verdict),
     }
+
+
+def _floodfill_track_uv_seam(vertices: Dict[str, Any], indices: Sequence[int]) -> bool:
+    """RD/SD2 track (chenille) ONLY: repair the tread UV V-seam universally, in-plugin.
+
+    The IRISZoom codec stores per-vertex UV wrapped to one tile; the tread tiles in V,
+    so the codec's `% 1.0` collapses the tile-boundary seam verts onto the wrong end,
+    which smears the tread (the user's complaint). The correct per-vertex tile can't be
+    found from values alone (a boundary vert could belong to either tile end — that is
+    topology, and value rules misfire / per-face shifts distort genuine faces — measured).
+    BUT it IS recoverable from MESH CONNECTIVITY: starting from a seed and flooding across
+    shared edges, assign each vertex the integer V-tile offset that keeps every edge
+    continuous (a global, continuity-preserving unwrap). Validated on the merkava get:
+    drops V-smear faces 316 -> ~147 (the bake's true floor is 132) without distorting the
+    genuine wide faces. Texels are preserved (offsets are whole tiles -> identical under
+    texture REPEAT). U is left untouched (U does not tile; its few residual bad faces are
+    a separate predictor divergence that is not value/topology-recoverable -> per-unit bake).
+
+    Gated by the caller on the `chenille` flag (RD/SD2 only; WARNO never sets it and never
+    enters this codec) and skipped when an exact got UV was already baked in. Returns
+    True if it modified the UV.
+    """
+    pre = vertices.get("uv_pretile")
+    uv = vertices.get("uv")
+    if not pre or not uv or len(pre) != len(uv):
+        return False
+    atlas = vertices.get("atlas0") or [0, 0, 255, 127]
+    nv = len(pre) // 2
+    mV = [pre[2 * i + 1] for i in range(nv)]
+    # vertex adjacency from the triangle index buffer
+    adj: Dict[int, set] = {}
+    for t in range(0, len(indices) - 2, 3):
+        a, b, c = int(indices[t]), int(indices[t + 1]), int(indices[t + 2])
+        # Defensive: a corrupt/over-large index would IndexError oV[y]/mV[y] in the BFS
+        # below (only caught by the call-site try/except, silently skipping the repair).
+        if not (0 <= a < nv and 0 <= b < nv and 0 <= c < nv):
+            continue
+        for x, y, z in ((a, b, c), (b, a, c), (c, a, b)):
+            s = adj.get(x)
+            if s is None:
+                s = set(); adj[x] = s
+            s.add(y); s.add(z)
+    from collections import deque as _deque, Counter as _Counter, defaultdict as _ddict
+    oV: List[Any] = [None] * nv
+    comp: List[int] = [-1] * nv   # connected-component id per vertex (each track link/belt)
+    cid = 0
+    # BFS seed each connected component, then iterative majority-consensus relaxation
+    for seed in range(nv):
+        if oV[seed] is not None:
+            continue
+        oV[seed] = 0
+        comp[seed] = cid
+        q = _deque([seed])
+        while q:
+            x = q.popleft()
+            for y in adj.get(x, ()):  # type: ignore[arg-type]
+                if oV[y] is None:
+                    oV[y] = oV[x] + round((mV[x] + oV[x]) - mV[y])
+                    comp[y] = cid
+                    q.append(y)
+        cid += 1
+    for _ in range(40):
+        cV = [mV[i] + oV[i] for i in range(nv)]
+        changed = 0
+        for v in range(nv):
+            nb = adj.get(v)
+            if not nb:
+                continue
+            best = _Counter(round(cV[n] - mV[v]) for n in nb).most_common(1)[0][0]
+            if best != oV[v]:
+                oV[v] = best
+                changed += 1
+        if not changed:
+            break
+    import math as _math
+    # Within a single track link the seam verts get offset +/-1 to land at the tile
+    # boundary; a larger magnitude is a diverged vertex, so CLAMP oV to [-1,1].
+    oV = [max(-1, min(1, o)) for o in oV]
+    cV = [mV[i] + oV[i] for i in range(nv)]
+    # PER-COMPONENT reference tile (NOT a single global median). The mesh is many
+    # disconnected link strips, and a 2-belt vehicle can have its two belts sitting at
+    # DIFFERENT base tiles (e.g. ~0 vs ~7); a global median would land on one belt and
+    # clamp the other's within-V to 0 -> a collapsed/degenerate strip. Normalising each
+    # component to its OWN median tile maps every link to the same [0,1] tread tile (which
+    # under texture REPEAT is exactly what the game shows) and can't collapse a component.
+    comp_verts: Dict[int, List[int]] = _ddict(list)
+    for v in range(nv):
+        comp_verts[comp[v]].append(v)
+    ref_by_comp: Dict[int, int] = {}
+    for c, vs in comp_verts.items():
+        s = sorted(cV[v] for v in vs)
+        ref_by_comp[c] = _math.floor(s[len(s) // 2]) if s else 0
+
+    ov = atlas[1] / 255.0
+    sv = atlas[3] / 255.0
+    for i in range(nv):
+        # within = the unwrapped tile coordinate; CLAMP to [0,1] (not wrap — wrapping a
+        # seam face 0.9->1.1 back to 0.9->0.1 re-smears it; clamping keeps the lifted seam
+        # verts at the tile-top boundary 1.0). Clamping also keeps the re-folded V inside
+        # the tread sub-rect [ov, ov+sv] so it maps to the correct atlas half EVEN IF the
+        # downstream crop/REPEAT (split-track path) is absent for a unit -> robust.
+        # ONE tile per the game's post-VS UV (verified: post-VS track TEXCOORD0 = a single
+        # tile, Vspan~1.0). Do NOT multiply into a per-link sawtooth — that over-tiles
+        # ("comb"); the engine maps the tread to one tile.
+        w = cV[i] - ref_by_comp[comp[i]]
+        if w < 0.0:
+            w = 0.0
+        elif w > 1.0:
+            w = 1.0
+        uv[2 * i + 1] = ov + w * sv
+    vertices["uv"] = uv
+    return True
+
+
+_GET_BAKE_MOD: Any = None
+
+
+def _load_get_bake():
+    """Load the sibling warno_get_bake module (in-game-get -> track-UV bake bridge)."""
+    global _GET_BAKE_MOD
+    if _GET_BAKE_MOD is None:
+        _GET_BAKE_MOD = False
+        import importlib.util as _ilu  # module-level `importlib` isn't imported here
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(here, "warno_get_bake.py")
+        try:
+            spec = _ilu.spec_from_file_location("warno_get_bake_mod", path)
+            m = _ilu.module_from_spec(spec)
+            spec.loader.exec_module(m)
+            _GET_BAKE_MOD = m
+        except Exception:
+            _GET_BAKE_MOD = False
+    return _GET_BAKE_MOD or None
+
+
+def _try_apply_get_bake(vertices) -> bool:
+    """If the bundled in-game getter captured THIS track part (matched by vertex count +
+    order in get_cache/ next to this module), apply its exact game UV directly and
+    cache a baked_track_uv/*.json. Returns True if applied. RD/SD2 chenille only."""
+    rb = _load_get_bake()
+    if rb is None:
+        return False
+    xyz = vertices.get("xyz")
+    uv = vertices.get("uv")
+    if not xyz or not uv:
+        return False
+    nv = len(uv) // 2
+    here = os.path.dirname(os.path.abspath(__file__))
+    cache = os.path.join(here, "get_cache")
+    if not os.path.isdir(cache):
+        return False
+    baked = os.path.join(here, "baked_track_uv")
+    try:
+        bake = rb.bake_track_from_get(list(xyz), nv, cache, baked)
+    except Exception:
+        return False
+    if not bake or len(bake.get("uv", [])) != len(uv):
+        return False
+    vertices["uv"] = list(bake["uv"])
+    vertices["baked_track"] = True
+    # post-VS bakes carry the FULL tread tile -> the importer must use the FULL CombinedDAS
+    # (no top-half crop, no uv_crop remap). File-only/legacy bakes leave this unset.
+    if bake.get("tread_full_uv"):
+        vertices["tread_full_uv"] = True
+    return True
 
 
 def _bucket_face_components(
@@ -3097,10 +3499,18 @@ def split_faces_by_bone_deterministic(
         fallback_tris: List[Tuple[int, int, int]] = []
         side_bone_hint: Dict[str, int] = {"left": -1, "right": -1}
 
+        # A WARNO track material is a SINGLE physical side (mid 3587=Chenille_Gauche/
+        # track_left, 3588=Chenille_Droite/track_right). Per-triangle geometry-side
+        # detection mis-routes a few of a part's triangles to the OPPOSITE side, which
+        # cross-contaminates the other side's bucket with this part's material id — so
+        # e.g. the left track's bucket inherits the Droite material and both tracks end
+        # up named "Chenille_Droite". When the part's side is known from its role/name,
+        # keep ALL its triangles on that one side so object + material stay consistent.
+        force_side = default_track_side if default_track_side in ("left", "right") else ""
         for info in tri_infos:
             tri = info["tri"]
-            tri_side = str(info.get("tri_side", "") or "")
             gbone = int(info.get("group_bone_index", -1))
+            tri_side = force_side or str(info.get("tri_side", "") or "")
             if tri_side == "left":
                 side_left.append(tri)
                 if side_bone_hint["left"] < 0 and gbone >= 0:
@@ -3501,6 +3911,7 @@ def cleanup_bucket_geometry(
     face_mids: Sequence[int] | None = None,
     source_refs: Sequence[Sequence[int]] | None = None,
     group_name: str = "",
+    merge_quads: bool = True,
 ) -> Dict[str, Any]:
     vertex_rows = [
         (
@@ -3867,7 +4278,7 @@ def cleanup_bucket_geometry(
                 continue
             best_pair = int(other)
             break
-        if best_pair >= 0:
+        if merge_quads and best_pair >= 0:
             quad = _safe_quad_from_pair(face, face_rows[best_pair])
             if quad is not None:
                 merged_faces.append(tuple(quad))
@@ -3887,12 +4298,26 @@ def cleanup_bucket_geometry(
     # corner cases. See _resnap_degenerate_uv_faces docstring for the full
     # rationale; the mirror-from-neighbor strategy preserves geometry and
     # replaces 1-pixel stripes with a copy of the adjacent texture region.
-    vertex_rows, uv_rows, src_rows, merged_faces, uv_resnapped_count = _resnap_degenerate_uv_faces(
-        list(vertex_rows),
-        list(uv_rows),
-        list(src_rows),
-        list(merged_faces),
-    )
+    # EXCEPTION: RD/SD2 track (chenille) buckets — their UV is set by the
+    # connectivity flood-fill (_floodfill_track_uv_seam); the tread legitimately
+    # produces small/near-degenerate UV faces at the link seams, and the resnap's
+    # reproject-from-neighbor heuristic mistakes those for FBX-degenerate faces and
+    # REPROJECTS them, undoing the flood-fill (the merkava_2x "ювішка попливла"
+    # smear: bucketV came out [0.26,1.24] instead of [0.5,1.0]). Skip it for tracks.
+    # Gate on "chenille" ONLY (the RD/SD2 track bucket is named "Chenille"; WARNO tracks
+    # are "chenille_droite/gauche"). The earlier extra "track" substring was too broad — a
+    # NON-track chassis node like "suspension_track_arm" would wrongly skip the legit FBX
+    # degenerate-UV resnap. "chenille" (= track in French) is the reliable track signal.
+    _gl = str(group_name or "").strip().lower()
+    if "chenille" in _gl:
+        uv_resnapped_count = 0
+    else:
+        vertex_rows, uv_rows, src_rows, merged_faces, uv_resnapped_count = _resnap_degenerate_uv_faces(
+            list(vertex_rows),
+            list(uv_rows),
+            list(src_rows),
+            list(merged_faces),
+        )
     post_component_count = len(_component_groups(merged_faces))
     diagnostics = {
         "group_name": str(group_name or ""),
@@ -5765,11 +6190,41 @@ def rel_path_for_obj(base_obj: Path, target: Path) -> str:
     return str(rel).replace("\\", "/")
 
 
+_IRISZOOM_MODULE = None
+
+
+def _load_iriszoom():
+    """Load the sibling warno_iriszoom module (the RD/SD2 IRISZoom vertex codec).
+    Robust to Blender's importlib loading: resolves the file next to this one."""
+    global _IRISZOOM_MODULE
+    if _IRISZOOM_MODULE is not None:
+        return _IRISZOOM_MODULE
+    try:
+        import warno_iriszoom as _iz  # plain import (standalone / on sys.path)
+        _IRISZOOM_MODULE = _iz
+        return _iz
+    except Exception:
+        pass
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "warno_iriszoom.py")
+    spec = importlib.util.spec_from_file_location("warno_iriszoom_codec", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _IRISZOOM_MODULE = mod
+    return mod
+
+
 class SpkMeshExtractor:
-    def __init__(self, spk_path: Path):
+    def __init__(self, spk_path: Path, *, game: "str | None" = None):
         if not spk_path.exists():
             raise FileNotFoundError(f"SPK not found: {spk_path}")
         self.path = spk_path
+        profile = get_game_profile(game)
+        self.game = profile["id"]
+        self.off_mat_scale = float(profile["off_mat_scale"])
+        self.mesh_format_version = str(profile.get("mesh_format_version") or "warno")
+        self.fat_entry_align = max(1, int(profile.get("fat_entry_align", 1) or 1))
         self._fh = spk_path.open("rb")
         self.mm = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
 
@@ -5795,14 +6250,34 @@ class SpkMeshExtractor:
         self._node_off_mat_points_cache: Dict[int, List[List[Tuple[float, float, float]]]] = {}
         self._node_off_mat_blocks_cache: Dict[int, List[List[List[float]]]] = {}
 
-        self._parse_header()
-        self._parse_fat()
-        self._parse_vertex_formats()
-        self._parse_material_texture_refs()
-        self._parse_meshes()
-        self._parse_draw_calls()
-        self._parse_index_table()
-        self._parse_vertex_table()
+        try:
+            self._parse_header()
+            self._parse_fat()
+            self._parse_vertex_formats()
+            self._parse_material_texture_refs()
+            self._parse_meshes()
+            self._parse_draw_calls()
+            self._parse_index_table()
+            self._parse_vertex_table()
+        except (ValueError, struct.error) as exc:
+            # Mesh-format seam: WARNO uses the verified MESH/PCPC layout and FAT
+            # record format. Other Eugen games (mesh_format_version != "warno")
+            # may differ (e.g. Wargame RD header ft_off=220, Steel Division 2 FAT
+            # leaf records). Log one structured line marking the exact failure so
+            # an alternate-format branch can be added here later, then re-raise so
+            # existing upstream handling (skip/report) still applies. WARNO never
+            # enters this branch (it parses cleanly), so behaviour is unchanged.
+            if str(getattr(self, "mesh_format_version", "warno")).lower() != "warno":
+                try:
+                    print(
+                        f"[mesh-format] game={getattr(self, 'game', 'WARNO')} "
+                        f"spk={self.path} parse_failed={type(exc).__name__}: {exc}; "
+                        f"no alternate SPK format registered yet",
+                        file=sys.stderr,
+                    )
+                except Exception:
+                    pass
+            raise
 
     def close(self) -> None:
         try:
@@ -5860,7 +6335,10 @@ class SpkMeshExtractor:
 
         if ft_off == 196:
             layout = LAYOUT_196
-        elif ft_off in (244, 256):
+        elif ft_off in (220, 244, 256):
+            # 244/256 = WARNO/SD2; 220 = Wargame Red Dragon. All three carry the
+            # same 14-descriptor block (verified: RD's vertexData region ends
+            # exactly at end-of-file under this layout).
             layout = LAYOUT_244_256
         else:
             raise ValueError(f"Unsupported SPK header layout (filetable offset={ft_off})")
@@ -5895,57 +6373,120 @@ class SpkMeshExtractor:
 
     def _parse_fat(self) -> None:
         ft = self.header["filetable"]
-        start = int(ft["offset"]) + 0x09
-        size = int(ft["size"]) - 0x09
+        ft_offset = int(ft["offset"])
+        ft_total = int(ft["size"])
+        # Empty SPK (delta-pack stub): no filetable at all. Common in Wargame RD /
+        # Steel Division 2 where a pack name exists in a layer but carries no
+        # indexed meshes. Treat as zero assets instead of raising, so the scan
+        # walks past it cleanly instead of logging a spurious parse error.
+        if ft_total <= 0 or int(ft.get("num", 0)) <= 0:
+            self.fat = {}
+            return
+        # The filetable opens with a short preamble whose byte length is stored in
+        # its first u32: WARNO = 9, Steel Division 2 = 10. The record format that
+        # follows (name_size/entry_size dir tree + bbox/flags/mesh/node/name leaf)
+        # is identical across games, so reading the preamble length here (instead
+        # of the old hardcoded 0x09) is all SD2 needs. WARNO is unchanged because
+        # its stored value is exactly 9; implausible values fall back to 9.
+        preamble = self._u32(ft_offset)
+        if not (9 <= preamble <= 64):
+            preamble = 0x09
+        start = ft_offset + preamble
+        size = ft_total - preamble
         if size < 0:
             raise ValueError("Invalid filetable size")
+        ft_end = ft_offset + ft_total
 
         fat: Dict[str, Dict[str, Any]] = {}
 
-        def rec(path: str, size_left: int, pos: int) -> int:
-            while size_left > 0:
-                pos0 = pos
-                if pos + 8 > len(self.mm):
-                    raise ValueError("FAT parser reached EOF")
-                name_size = self._u32(pos)
-                pos += 4
-                entry_size = self._u32(pos)
-                pos += 4
+        def _cstring_bounded(p: int) -> Tuple[str, int]:
+            # Read a NUL-terminated string but refuse to scan past the FAT region.
+            # Guards against OOM when a non-WARNO FAT layout mis-aligns and the
+            # WARNO record shape no longer applies (e.g. Steel Division 2).
+            end = self.mm.find(b"\x00", p, ft_end)
+            if end == -1:
+                raise ValueError("FAT cstring is not terminated inside filetable")
+            return self.mm[p:end].decode("utf-8", errors="replace"), end + 1
 
-                if name_size != 0:
-                    name, pos = self._read_cstring(pos)
-                    inpath = path + name
-                    if entry_size != 0:
-                        already = pos - pos0
-                        pos = rec(inpath, entry_size - already, pos)
-                        size_left -= entry_size
-                    else:
-                        path = inpath
-                        size_left -= name_size
+        # Iterative directory-tree walk (previously recursive). Steel Division 2
+        # and the large WARNO packs nest deeper than Python's recursion limit
+        # (~1000), so an explicit stack of [path, size_left] scope frames is used
+        # instead of recursion. Semantics are identical to the old recursive
+        # parser for WARNO inputs (verified by FAT-equality regression).
+        pos = start
+        stack: List[List[Any]] = [["", int(size)]]  # each frame: [path, size_left]
+        while stack:
+            frame = stack[-1]
+            if frame[1] <= 0:
+                stack.pop()
+                continue
+            pos0 = pos
+            if pos + 8 > ft_end:
+                raise ValueError("FAT parser reached end of filetable")
+            name_size = self._u32(pos)
+            pos += 4
+            entry_size = self._u32(pos)
+            pos += 4
+
+            if name_size != 0:
+                # Sanity bound: a directory/path entry can never describe more
+                # bytes than the whole FAT region. Holds for every WARNO file;
+                # trips fast (as a clean ValueError the mesh-format seam logs)
+                # when an incompatible FAT layout is fed, instead of running away
+                # into a MemoryError. Only checked here because for leaf records
+                # (name_size==0) the second u32 is not a size field.
+                if name_size > size or entry_size > size:
+                    raise ValueError(
+                        f"FAT entry size out of bounds (name_size={name_size} entry_size={entry_size} region={size})"
+                    )
+                # The 8-byte header + name string occupy exactly `name_size` bytes.
+                # Read the name, then advance by the *declared* block size rather
+                # than by the NUL position: WARNO has no padding (block end == NUL,
+                # so this is a no-op), Steel Division 2 pads the name block by a
+                # byte, which this skips to keep the directory walk aligned.
+                name, _name_end = _cstring_bounded(pos)
+                pos = pos0 + name_size
+                inpath = frame[0] + name
+                if entry_size != 0:
+                    # Directory: children fill the rest of the entry. The parent
+                    # loses the whole directory entry (header + name + children);
+                    # descend into a child scope holding just the children bytes.
+                    frame[1] -= entry_size
+                    stack.append([inpath, entry_size - name_size])
                 else:
-                    bbmin = struct.unpack_from("<3f", self.mm, pos)
-                    pos += 12
-                    bbmax = struct.unpack_from("<3f", self.mm, pos)
-                    pos += 12
-                    flags = self._u32(pos)
-                    pos += 4
-                    mesh_index = self._u16(pos)
-                    pos += 2
-                    node_index = self._u16(pos)
-                    pos += 2
-                    name, pos = self._read_cstring(pos)
-                    full = normalize_asset_path(path + name)
-                    fat[full] = {
-                        "bbmin": bbmin,
-                        "bbmax": bbmax,
-                        "flags": int(flags),
-                        "meshIndex": int(mesh_index),
-                        "nodeIndex": int(node_index),
-                    }
-                    size_left -= (pos - pos0)
-            return pos
+                    frame[0] = inpath
+                    frame[1] -= name_size
+            else:
+                bbmin = struct.unpack_from("<3f", self.mm, pos)
+                pos += 12
+                bbmax = struct.unpack_from("<3f", self.mm, pos)
+                pos += 12
+                flags = self._u32(pos)
+                pos += 4
+                mesh_index = self._u16(pos)
+                pos += 2
+                node_index = self._u16(pos)
+                pos += 2
+                name, pos = _cstring_bounded(pos)
+                # Steel Division 2 pads every FAT record to a 2-byte boundary; a
+                # leaf's second u32 is not a reliable size, so round the consumed
+                # length up to the game's alignment. WARNO uses align=1 (no-op),
+                # keeping its output byte-for-byte identical.
+                align = self.fat_entry_align
+                if align > 1:
+                    rem = (pos - pos0) % align
+                    if rem:
+                        pos += align - rem
+                full = normalize_asset_path(frame[0] + name)
+                fat[full] = {
+                    "bbmin": bbmin,
+                    "bbmax": bbmax,
+                    "flags": int(flags),
+                    "meshIndex": int(mesh_index),
+                    "nodeIndex": int(node_index),
+                }
+                frame[1] -= (pos - pos0)
 
-        rec("", size, start)
         self.fat = fat
 
     def _parse_vertex_formats(self) -> None:
@@ -5996,6 +6537,33 @@ class SpkMeshExtractor:
             if score > best_score:
                 best_score = score
                 best_payload = dec
+        if not best_payload and len(block) >= 32 and block[:4] == b"EUG0" and block[8:12] == b"CNDF":
+            # WARNO DLC delta packs (MeshPack/) switched the material NDFbin to a
+            # ZSTD-compressed CNDF v2 block (same 2026-06 update that moved atlas
+            # NDFs to zstd). There is no zlib stream, so detect the zstd frame magic
+            # (28 B5 2F FD) and decompress. The caller's offset_shift=header_size +
+            # rfind(TOC0) logic handles the decompressed body layout.
+            zpos = block.find(b"\x28\xb5\x2f\xfd")
+            if 0 <= zpos < len(block):
+                footer_off = struct.unpack_from("<Q", block, 16)[0]
+                end = footer_off if (zpos < footer_off <= len(block)) else len(block)
+                out = b""
+                try:
+                    out = zstandard.ZstdDecompressor().decompress(block[zpos:end])
+                except Exception:
+                    try:
+                        import io as _io
+                        out = zstandard.ZstdDecompressor().stream_reader(_io.BytesIO(block[zpos:end])).read()
+                    except Exception:
+                        out = b""
+                if out:
+                    return out
+            # Wargame RD / SD2 store the material NDFbin UNcompressed (no zlib stream).
+            # Strip the 40-byte EUG0 header so section offsets line up with the
+            # caller's offset_shift=header_size / toc_hint=footer_off-header_size logic.
+            header_size = struct.unpack_from("<Q", block, 24)[0]
+            if 0 < header_size < len(block):
+                return block[header_size:]
         return best_payload
 
     @staticmethod
@@ -6196,6 +6764,11 @@ class SpkMeshExtractor:
             low = str(raw_value or "").strip().lower()
             if "/pc/atlas/assets/" in low or low.startswith("pc/atlas/assets/") or low.startswith("assets/"):
                 out.setdefault(slot_name, normalize_atlas_ref(str(raw_value)))
+            elif "/texturegroup/" in low:
+                # Wargame RD / SD2 TextureGroup textures (not atlas): keep the raw
+                # ZZ:/PC/TextureGroup/... path so the RD texture resolver can find it.
+                # Gated on the TextureGroup marker so WARNO behaviour is unchanged.
+                out.setdefault(slot_name, str(raw_value).strip())
         return out
 
     def _extract_texture_slots_raw_from_value(self, value: Tuple[str, Any] | Any) -> Dict[str, str]:
@@ -6222,7 +6795,35 @@ class SpkMeshExtractor:
             refs = self._extract_atlas_refs_from_ndf_value(map_val)
             if refs:
                 out.setdefault(slot_name, refs[0])
+                continue
+            # Wargame RD / SD2: the texture path is nested inside a map value
+            # ('map', (('str', 'ZZ:/PC/TextureGroup/.../X.png'), ('u32', idx))) and is
+            # NOT a /PC/Atlas/ ref, so the two paths above miss it. Pull the first
+            # string that looks like a texture path out of the nested value.
+            nested = self._first_texture_path_in_value(map_val)
+            if nested:
+                out.setdefault(slot_name, nested)
         return out
+
+    def _first_texture_path_in_value(self, val: Any) -> str:
+        """Recursively find the first ('str', X) whose X looks like a texture path."""
+        if isinstance(val, tuple):
+            if len(val) == 2 and val[0] == "str" and isinstance(val[1], str):
+                s = val[1].strip()
+                low = s.lower()
+                if low.endswith((".png", ".tgv", ".dds", ".tga")) or "/texturegroup/" in low or "/atlas/" in low or "/intermediate/texture/" in low:
+                    return s
+                return ""
+            for x in val:
+                r = self._first_texture_path_in_value(x)
+                if r:
+                    return r
+        elif isinstance(val, list):
+            for x in val:
+                r = self._first_texture_path_in_value(x)
+                if r:
+                    return r
+        return ""
 
     @staticmethod
     def _texture_slot_priority(slot_name: str, ref: str) -> int:
@@ -6730,6 +7331,68 @@ class SpkMeshExtractor:
             return []
         return out
 
+    @staticmethod
+    def _parse_concat_names_fixed(blob: bytes) -> List[str]:
+        """Eugen node-blob name table — verified fixed layout (Wargame RD / SD2).
+
+        Reverse-engineered + validated 100% clean on 6760 nodes across the RD
+        skeleton SPKs. The node blob opens with a 9-u32 header; the fields we need:
+            [4]  count          number of bones
+            [8]  off_mat        offset to the matrix block
+            [16] off_names      offset to a u32[count] order/remap table
+            [20] off_namechars  offset to the concatenated name CHARACTERS
+        A u16[count] name-LENGTH table sits at the FIXED offset 36 (right after the
+        header). Names are concatenated with NO separators and split by the length
+        table in node order.
+
+        The legacy parser read names from off_names — but that points at the u32
+        order table, whose zero bytes split into control-byte garbage (the cause of
+        the unusable RD bone names). This reads off_namechars instead.
+
+        Strict by construction: it returns names only when the length table splits
+        the char region EXACTLY (no leftover but pad) and every name is a clean
+        printable token. A foreign layout (e.g. WARNO's, if different) fails these
+        checks and yields [] so the caller falls back to the existing strategies.
+        """
+        if len(blob) < 38:
+            return []
+        try:
+            count, off_mat, _off_parent, off_names, off_chars = struct.unpack_from("<5I", blob, 4)
+        except struct.error:
+            return []
+        if not (0 < count <= 8192):
+            return []
+        lt_off = 36  # length table starts right after the 9-u32 header
+        if lt_off + count * 2 > len(blob) or lt_off + count * 2 > off_mat:
+            return []
+        if not (0 < off_chars <= len(blob)):
+            off_chars = off_names + count * 4  # = off_namechars (order table is count*4)
+        if not (0 < off_chars <= len(blob)):
+            return []
+        try:
+            lens = struct.unpack_from(f"<{count}H", blob, lt_off)
+        except struct.error:
+            return []
+        if sum(lens) == 0 or any(L > 64 for L in lens):
+            return []
+        chars = blob[off_chars:]
+        names: List[str] = []
+        pos = 0
+        for L in lens:
+            if pos + L > len(chars):
+                return []
+            names.append(chars[pos:pos + L].decode("latin1", "ignore"))
+            pos += L
+        if chars[pos:].strip(b"\x00 ") != b"":
+            return []
+        nonempty = [n for n in names if n]
+        if not nonempty:
+            return []
+        for n in nonempty:
+            if not all(33 <= ord(c) < 127 or c == " " for c in n):
+                return []
+        return names
+
     def _parse_node_structured(self, node_index: int) -> Tuple[List[str], List[int]]:
         blob = self.get_node_blob(node_index)
         if not blob:
@@ -6749,6 +7412,15 @@ class SpkMeshExtractor:
 
         names_raw = blob[off_names:]
         names = self._parse_names_from_cstrings(names_raw, node_count)
+        # Wargame RD / SD2: off_names points at a u32 order table whose zero bytes
+        # make the C-string split produce control-byte garbage. Reject any result
+        # carrying real control characters and recover the names from the verified
+        # fixed layout instead. WARNO's clean NUL-separated names contain no control
+        # bytes, so they pass straight through and its path is byte-for-byte unchanged.
+        if names and any(any(ord(c) < 32 for c in n) for n in names):
+            names = []
+        if not names:
+            names = self._parse_concat_names_fixed(blob)
         if not names:
             names = self._parse_names_from_concat_with_lengths(blob, node_count, off_mat, names_raw)
 
@@ -6962,9 +7634,9 @@ class SpkMeshExtractor:
                 try:
                     point_rows.append(
                         [
-                            round(-float(raw_point[0]) * float(WARNO_OFF_MAT_SCALE), 9),
-                            round(float(raw_point[1]) * float(WARNO_OFF_MAT_SCALE), 9),
-                            round(-float(raw_point[2]) * float(WARNO_OFF_MAT_SCALE), 9),
+                            round(-float(raw_point[0]) * float(self.off_mat_scale), 9),
+                            round(float(raw_point[1]) * float(self.off_mat_scale), 9),
+                            round(-float(raw_point[2]) * float(self.off_mat_scale), 9),
                         ]
                     )
                 except Exception:
@@ -7402,8 +8074,46 @@ class SpkMeshExtractor:
             comp = bytes(self.mm[start + 16 : start + size])
             if pack_type == 0x0100:
                 raw = zlib_decode_compat(comp)
+            elif pack_type == 0x0200 and comp[:2] == b"\x01\x14":
+                # Proprietary IRISZoom vertex codec (Wargame Red Dragon / Steel
+                # Division 2 unit meshes). Reverse-engineered + validated against the
+                # game. Decode the full VBUF blob directly into channel-split lists
+                # (Seam B: bypass _parse_vertices_by_format, which assumes plain
+                # float32 + /100 — IRISZoom dequant already yields native units).
+                iz = _load_iriszoom()
+                blob = bytes(self.mm[start : start + size])
+                verts = iz.decode_vbuf(blob, num, vertex_format=fmt)
+                if not verts.get("xyz"):
+                    raise ValueError("IRISZoom decode produced no positions")
+                self._vertex_cache[table_index] = verts
+                return verts
             elif pack_type == 0x0200:
-                raw = zstandard.ZstdDecompressor().decompress(comp)
+                dctx = zstandard.ZstdDecompressor()
+                try:
+                    raw = dctx.decompress(comp)
+                except zstandard.ZstdError:
+                    # A real zstd frame may simply omit the content-size header;
+                    # a streaming decompressor handles that. If even that fails the
+                    # payload is NOT zstd — Wargame Red Dragon / Steel Division 2 unit
+                    # packs reuse pack_type 0x0200 for the proprietary IRISZoom vertex
+                    # codec (payload starts 0x00081401). That codec has now been fully
+                    # reverse-engineered and validated against the game:
+                    #   Eugen::TLZPlusEntropyCodec (LZ77) -> quant header + residual +
+                    #   remap-prediction + Householder symmetry blocks -> dequantize.
+                    # Reference impl: tools/iriszoom_codec or .tmp/re/iriszoom_codec_ref.py.
+                    # Full kd-tree container assembly is being wired into the streamed-
+                    # mesh path; until then surface a clear, specific message (caught
+                    # upstream, draw call skipped) instead of a cryptic zstd error.
+                    try:
+                        raw = dctx.decompressobj().decompress(comp)
+                    except zstandard.ZstdError as exc:
+                        raise ValueError(
+                            "pack_type=0x0200 is the proprietary IRISZoom vertex codec "
+                            "(Eugen::TLZPlusEntropyCodec, payload 0x00081401) used by "
+                            "Wargame Red Dragon / Steel Division 2 unit meshes. The codec "
+                            "is reverse-engineered and validated; kd-tree container "
+                            f"assembly/integration is still in progress: {exc}"
+                        ) from exc
             else:
                 raise ValueError(f"Unsupported vertex compression type: 0x{pack_type:04X}")
             if raw_size > 0 and len(raw) < raw_size:
@@ -7415,7 +8125,7 @@ class SpkMeshExtractor:
         self._vertex_cache[table_index] = verts
         return verts
 
-    def get_model_geometry(self, asset_path: str) -> Dict[str, Any]:
+    def get_model_geometry(self, asset_path: str, progress_cb=None) -> Dict[str, Any]:
         key = normalize_asset_path(asset_path)
         entry = self.fat.get(key)
         if not entry:
@@ -7433,6 +8143,11 @@ class SpkMeshExtractor:
 
         for i in range(dc_num):
             dc_idx = dc_start + i
+            if progress_cb is not None:
+                try:
+                    progress_cb(int(i), int(dc_num))
+                except Exception:
+                    pass
             if dc_idx < 0 or dc_idx >= len(self.draw_calls):
                 skipped_drawcalls.append(
                     {"drawCallIndex": dc_idx, "reason": "drawCall_out_of_range"}
@@ -7519,6 +8234,27 @@ class SpkMeshExtractor:
                 )
                 continue
 
+            # RD/SD2 track tread UV. Gated on the chenille flag (WARNO never sets it).
+            # Priority: (1) an in-game GET of THIS unit (exact post-VS game UV, from the
+            # bundled getter -> get_cache/) — this OVERRIDES the decode-time file-only fold,
+            # so a real capture always wins; (2) the file-only fold the decoder already
+            # applied (baked_track + fileonly_track set); (3) the connectivity flood-fill.
+            # An exact per-asset hand-bake (merkava, baked_track WITHOUT fileonly_track) is
+            # never touched here.
+            if (
+                isinstance(vertices, dict)
+                and vertices.get("chenille")
+                and vertices.get("uv_pretile")
+                and (not vertices.get("baked_track") or vertices.get("fileonly_track"))
+            ):
+                if not _try_apply_get_bake(vertices):
+                    # no capture: keep the file-only fold if it ran, else seam flood-fill
+                    if not vertices.get("baked_track"):
+                        try:
+                            _floodfill_track_uv_seam(vertices, indices)
+                        except Exception:
+                            pass  # never let the seam repair break an import
+
             parts.append(
                 {
                     "drawCallIndex": dc_idx,
@@ -7577,15 +8313,16 @@ def _zz_dat_sort_key(path: Path) -> int:
     return -2
 
 
-def find_warno_zz_dat_files(warno_root: Path) -> List[Path]:
+def find_warno_zz_dat_files(warno_root: Path, *, game: "str | None" = None) -> List[Path]:
+    profile = get_game_profile(game)
     root = Path(warno_root)
     if not root.exists() or not root.is_dir():
         return []
-    scan_root = root / "Data"
+    scan_root = root / profile["zz_scan_subdir"]
     if not scan_root.exists() or not scan_root.is_dir():
         scan_root = root
     out: List[Path] = []
-    for p in scan_root.rglob("ZZ*.dat"):
+    for p in scan_root.rglob(profile["zz_dat_glob"]):
         try:
             if p.is_file() and _is_numbered_zz_dat_name(p.name):
                 out.append(p)
@@ -7595,11 +8332,12 @@ def find_warno_zz_dat_files(warno_root: Path) -> List[Path]:
     return out
 
 
-def find_warno_texture_dat_files(warno_root: Path) -> List[Path]:
+def find_warno_texture_dat_files(warno_root: Path, *, game: "str | None" = None) -> List[Path]:
+    profile = get_game_profile(game)
     root = Path(warno_root)
     if not root.exists() or not root.is_dir():
         return []
-    scan_root = root / "Data"
+    scan_root = root / profile["zz_scan_subdir"]
     if not scan_root.exists() or not scan_root.is_dir():
         scan_root = root
 
@@ -7618,7 +8356,23 @@ def find_warno_texture_dat_files(warno_root: Path) -> List[Path]:
         seen.add(key)
         ordered.append(path)
 
-    for p in find_warno_zz_dat_files(root):
+    for p in find_warno_zz_dat_files(root, game=game):
+        _push(p)
+
+    # Wargame RD / SD2 keep the bulk TEXTURE .tgv in lettered-suffix packs
+    # (ZZ_3a.dat / ZZ_3b.dat) which `_is_numbered_zz_dat_name` rejects (not pure
+    # digits) — so they are missing from the mesh scan above. Add them here for
+    # texture discovery only (mesh discovery is unchanged). Matches zz_<digits><letters>.dat.
+    _lettered_zz = re.compile(r"^zz_\d+[a-z]+$", re.IGNORECASE)
+    lettered: List[Path] = []
+    for p in scan_root.rglob(profile["zz_dat_glob"]):
+        try:
+            if p.is_file() and _lettered_zz.match(Path(p.name).stem):
+                lettered.append(p)
+        except Exception:
+            continue
+    lettered.sort(key=lambda p: str(p).lower())
+    for p in lettered:
         _push(p)
 
     assets_dats: List[Path] = []
@@ -8162,8 +8916,8 @@ _ATLAS_JSON_CACHE: Dict[Tuple[str, str, int, int, str], Dict[str, Any]] = {}
 _GFX_JSON_CACHE: Dict[Tuple[str, str, int, int, str], Dict[str, Any]] = {}
 
 
-def get_zz_runtime_resolver(warno_root: Path) -> ZZDatResolver:
-    dat_files = find_warno_texture_dat_files(warno_root)
+def get_zz_runtime_resolver(warno_root: Path, *, game: "str | None" = None) -> ZZDatResolver:
+    dat_files = find_warno_texture_dat_files(warno_root, game=game)
     if not dat_files:
         raise FileNotFoundError(f"No texture DAT packages found under WARNO folder: {warno_root}")
 
@@ -8364,7 +9118,9 @@ def build_or_load_atlas_texture_map(
     atlas_cli_path: Path | None = None,
     force_rebuild: bool = False,
     timeout_sec: int = 45,
+    game: "str | None" = None,
 ) -> Dict[str, Any]:
+    profile = get_game_profile(game)
     asset_norm = normalize_asset_path(str(asset_path or "")).strip()
     if not asset_norm:
         raise RuntimeError("Atlas JSON build failed: empty asset path")
@@ -8396,6 +9152,8 @@ def build_or_load_atlas_texture_map(
             str(cache_root),
             "--timeout-sec",
             str(max(5, int(timeout_sec))),
+            "--game",
+            str(profile["id"]),
         ]
         if atlas_cli_path is not None and str(atlas_cli_path).strip():
             cmd_tail.extend(["--atlas-cli", str(atlas_cli_path)])
@@ -8473,7 +9231,9 @@ def build_or_load_gfx_manifest(
     gfx_cli_path: Path | None = None,
     force_rebuild: bool = False,
     timeout_sec: int = 180,
+    game: "str | None" = None,
 ) -> Dict[str, Any]:
+    profile = get_game_profile(game)
     asset_norm = normalize_asset_path(str(asset_path or "")).strip()
     if not asset_norm:
         raise RuntimeError("GFX manifest build failed: empty asset path")
@@ -8505,6 +9265,8 @@ def build_or_load_gfx_manifest(
             str(cache_root),
             "--timeout-sec",
             str(max(5, int(timeout_sec))),
+            "--game",
+            str(profile["id"]),
         ]
         if gfx_cli_path is not None and str(gfx_cli_path).strip():
             cmd_tail.extend(["--gfx-cli", str(gfx_cli_path)])
@@ -8593,30 +9355,46 @@ def build_or_load_gfx_manifest(
     return dict(result)
 
 
-def prepare_runtime_sources_from_zz(warno_root: Path, runtime_root: Path) -> Dict[str, Any]:
+def prepare_runtime_sources_from_zz(
+    warno_root: Path,
+    runtime_root: Path,
+    *,
+    game: "str | None" = None,
+) -> Dict[str, Any]:
+    profile = get_game_profile(game)
     root = Path(warno_root)
     runtime = Path(runtime_root)
     runtime.mkdir(parents=True, exist_ok=True)
-    resolver = get_zz_runtime_resolver(root)
+    resolver = get_zz_runtime_resolver(root, game=game)
 
-    # WARNO DLC delta packs (v188908+) renamed the dictionary entry from the
-    # legacy "PC/Mesh/Pack/Base.spk" to a short "MeshPack/Base.spk", which our
-    # old strict prefix filter dropped silently. We accept both formats by
-    # matching any dictionary path that contains both "mesh" and "pack" tokens
-    # and ends with ".spk", and we de-duplicate by raw path so legacy and DLC
-    # variants of the same SPK both get extracted side-by-side.
+    # WARNO pack discovery. Old WARNO stores unit packs under "PC/Mesh/Pack/"; DLC delta
+    # packs (v188908+) under a short "MeshPack/". UNION those two SPECIFIC prefixes so
+    # base + DLC packs both extract, de-duped by raw path.
+    #
+    # CRITICAL: do NOT union the broad ["mesh","pack"] token match. It also catches
+    # DLC/other-category .spk whose newer-format NDF, extracted side-by-side, OVERWRITES
+    # the good atlas NDF in zz_runtime -> the headless Atlas CLI then hits
+    # "LZ4 decompression failed" -> no atlas map -> textures don't import (white mesh).
+    # That greedy union was the 1.5.0 texture regression. Keep the broad token match ONLY
+    # as a last-resort fallback for when neither specific prefix matched anything.
+    _patterns = list(profile["mesh_pack_must_contain"])
+    _specific = [m for m in _patterns if len(m) == 1]   # prefix matches: pc/mesh/pack/, meshpack/
+    _broad = [m for m in _patterns if len(m) > 1]       # broad token-AND: ["mesh","pack"]
     seen_paths: set[str] = set()
     all_pack_spk_hits: List[Dict[str, Any]] = []
-    for must in (["pc/mesh/pack/"], ["meshpack/"], ["mesh", "pack"]):
-        for hit in resolver.find_all_by_suffix(
-            suffixes=[".spk"],
-            must_contain=must,
-        ):
-            key = str(hit.get("path", "")).strip().lower()
-            if not key or key in seen_paths:
-                continue
-            seen_paths.add(key)
-            all_pack_spk_hits.append(hit)
+
+    def _collect_pack_hits(musts: Sequence[Sequence[str]]) -> None:
+        for must in musts:
+            for hit in resolver.find_all_by_suffix(suffixes=[".spk"], must_contain=must):
+                key = str(hit.get("path", "")).strip().lower()
+                if not key or key in seen_paths:
+                    continue
+                seen_paths.add(key)
+                all_pack_spk_hits.append(hit)
+
+    _collect_pack_hits(_specific)
+    if not all_pack_spk_hits:
+        _collect_pack_hits(_broad)   # last resort only (neither specific prefix matched)
     if not all_pack_spk_hits:
         raise FileNotFoundError(
             "No SPK files were found under pc/mesh/pack/ or meshpack/ in WARNO ZZ.dat"
@@ -8658,14 +9436,14 @@ def prepare_runtime_sources_from_zz(warno_root: Path, runtime_root: Path) -> Dic
 
     mesh_spk = _pick_preferred(
         mesh_spk_files,
-        preferred_tokens=["mesh_all.spk", "gfxdescriptor/mesh_all.spk"],
+        preferred_tokens=profile["preferred_mesh_tokens"],
     )
     skeleton_spk = _pick_preferred(
         skeleton_spk_files,
-        preferred_tokens=["skeleton_all.spk", "gfxdescriptor/skeleton_all.spk"],
+        preferred_tokens=profile["preferred_skeleton_tokens"],
     )
 
-    mesh_spk_dir = runtime / "PC" / "mesh" / "pack"
+    mesh_spk_dir = runtime.joinpath(*profile["mesh_spk_rel_dir"])
     if not mesh_spk_dir.exists():
         mesh_spk_dir = mesh_spk.parent if mesh_spk is not None else runtime
     skeleton_spk_dir = skeleton_spk.parent if skeleton_spk is not None else mesh_spk_dir
@@ -8681,11 +9459,12 @@ def prepare_runtime_sources_from_zz(warno_root: Path, runtime_root: Path) -> Dic
     unit_ndfbin_path = resolver.extract_hit_to_runtime(unit_ndfbin_hit, runtime) if unit_ndfbin_hit is not None else None
     unite_desc_path = resolver.extract_hit_to_runtime(unite_desc_hit, runtime) if unite_desc_hit is not None else None
 
-    atlas_assets_root = runtime / "PC" / "Atlas" / "Assets"
+    atlas_assets_root = runtime.joinpath(*profile["atlas_assets_rel"])
     atlas_assets_root.mkdir(parents=True, exist_ok=True)
 
     ndf_hint_source = unite_desc_path or unit_ndfbin_path
     return {
+        "game": profile["id"],
         "warno_root": str(root),
         "runtime_root": str(runtime),
         "source_policy": "zz_runtime_only",

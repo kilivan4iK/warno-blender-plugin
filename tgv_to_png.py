@@ -3,6 +3,7 @@ import io
 import json
 import re
 import struct
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -32,6 +33,14 @@ class TGVInfo:
 
 def normalize_format(raw_fmt: bytes) -> str:
     text = raw_fmt.decode("ascii", errors="ignore").upper()
+    # Wargame RD / SD2 textures use D3D9 DXTn names; map them to the BCn the
+    # decoder/sizer understand (suffixes like _SRGB are kept as a tag).
+    dxt_alias = (("DXT1", "BC1"), ("DXT2", "BC2"), ("DXT3", "BC2"),
+                 ("DXT4", "BC3"), ("DXT5", "BC3"), ("ATI1", "BC4"),
+                 ("ATI2", "BC5"), ("BC5N", "BC5"))
+    for dxt, bc in dxt_alias:
+        if text.startswith(dxt):
+            return bc + text[len(dxt):]
     patterns = (
         r"BC[1-7](?:_[A-Z0-9]+)?",
         r"A8B8G8R8(?:_[A-Z0-9]+)?",
@@ -57,7 +66,7 @@ def try_table(data: bytes, table_start: int, mip_count: int) -> tuple[int, list[
             0 <= offset <= len(data) - 12
             and 12 <= size <= len(data)
             and offset + size <= len(data)
-            and data[offset : offset + 4] == b"ZSTD"
+            and data[offset : offset + 4] in (b"ZSTD", b"ZIPO")
         ):
             valid += 1
     return valid, offsets, sizes
@@ -103,19 +112,24 @@ def iter_valid_mips(info: TGVInfo) -> Iterable[tuple[int, int, int, int]]:
             0 <= offset <= len(info.data) - 12
             and 12 <= size <= len(info.data)
             and offset + size <= len(info.data)
-            and info.data[offset : offset + 4] == b"ZSTD"
+            and info.data[offset : offset + 4] in (b"ZSTD", b"ZIPO")
         ):
             raw_size = struct.unpack_from("<I", info.data, offset + 4)[0]
             yield idx, offset, size, raw_size
 
 
 def decompress_mip(info: TGVInfo, offset: int, size: int, raw_size: int) -> bytes:
+    magic = info.data[offset : offset + 4]
     comp = info.data[offset + 8 : offset + size]
-    reader = zstd.ZstdDecompressor().stream_reader(io.BytesIO(comp))
-    try:
-        raw = reader.read(raw_size)
-    finally:
-        reader.close()
+    if magic == b"ZIPO":
+        # Wargame RD / SD2: per-mip zlib stream (trailing block padding -> decompressobj).
+        raw = zlib.decompressobj().decompress(comp, raw_size)
+    else:
+        reader = zstd.ZstdDecompressor().stream_reader(io.BytesIO(comp))
+        try:
+            raw = reader.read(raw_size)
+        finally:
+            reader.close()
 
     if len(raw) != raw_size:
         raise RuntimeError(
@@ -150,6 +164,19 @@ def pick_fullres_mip(info: TGVInfo) -> tuple[int, int, int, int]:
             if mip[3] == expected:
                 return mip
     return max(mips, key=lambda x: x[3])
+
+
+def convert_single_tgv(tgv_path, out_png) -> bool:
+    """Decode one standalone Eugen TGV (ZSTD or RD/SD2 ZIPO framing) to a PNG.
+    Returns True on success. Used by the Wargame RD / SD2 texture path (no atlas)."""
+    from pathlib import Path as _P
+    info = parse_tgv(_P(tgv_path))
+    _, off, size, raw_size = pick_fullres_mip(info)
+    raw = decompress_mip(info, off, size, raw_size)
+    img = decode_tgv_image(info, raw)
+    _P(out_png).parent.mkdir(parents=True, exist_ok=True)
+    img.save(str(out_png))
+    return True
 
 
 def build_dds_header_compressed(

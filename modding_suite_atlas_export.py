@@ -228,11 +228,17 @@ def _load_and_validate(path: Path, asset_path: str, atlas_source: str) -> Dict[s
 
 def _resolve_cli_exe(modding_suite_root: Path, atlas_cli_override: str) -> tuple[Path | None, List[Path]]:
     script_root = Path(__file__).resolve().parent
-    primary = script_root / "moddingSuite" / "atlas_cli" / "moddingSuite.AtlasCli.exe"
-    secondary = modding_suite_root / "atlas_cli" / "moddingSuite.AtlasCli.exe"
+    # Preferred: unified moddingSuite.exe (one binary, subcommand routes the
+    # call). Legacy AtlasCli.exe kept as fallback for older plugin installs.
+    unified_primary   = script_root / "moddingSuite" / "moddingSuite.exe"
+    unified_secondary = modding_suite_root / "moddingSuite.exe"
+    legacy_a = script_root / "moddingSuite" / "atlas_cli" / "moddingSuite.AtlasCli.exe"
+    legacy_b = script_root / "moddingSuite" / "moddingSuite.AtlasCli.exe"
+    legacy_c = modding_suite_root / "atlas_cli" / "moddingSuite.AtlasCli.exe"
+    legacy_d = modding_suite_root / "moddingSuite.AtlasCli.exe"
     override = Path(atlas_cli_override).expanduser() if atlas_cli_override.strip() else None
 
-    candidates: List[Path] = [primary, secondary]
+    candidates: List[Path] = [unified_primary, unified_secondary, legacy_a, legacy_b, legacy_c, legacy_d]
     if override is not None:
         candidates.append(override if override.is_absolute() else (script_root / override))
 
@@ -249,6 +255,16 @@ def _resolve_cli_exe(modding_suite_root: Path, atlas_cli_override: str) -> tuple
         if p.exists() and p.is_file():
             return p, uniq
     return None, uniq
+
+
+def _build_cli_cmd(cli_exe: Path, base_args: List[str]) -> List[str]:
+    """Construct argv for the resolved CLI. Unified moddingSuite.exe needs the
+    'atlas' subcommand prepended; legacy AtlasCli.exe is invoked directly."""
+    cmd = [str(cli_exe)]
+    if cli_exe.name.lower() == "moddingsuite.exe":
+        cmd.append("atlas")
+    cmd.extend(base_args)
+    return cmd
 
 
 def _run_cli(cmd: List[str], timeout_sec: int) -> tuple[int, str, str, float, bool]:
@@ -287,6 +303,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--cache-dir", required=True)
     ap.add_argument("--atlas-cli", default="", help="Optional explicit path to moddingSuite.AtlasCli.exe")
     ap.add_argument("--timeout-sec", type=int, default=45)
+    ap.add_argument(
+        "--game",
+        default="WARNO",
+        help="Active Eugen game id (WARNO|WARGAME_RD|STEEL_DIVISION_2); informational, passed via --warno-root",
+    )
     ap.add_argument("--verbose", action="store_true")
     return ap
 
@@ -297,6 +318,7 @@ def main() -> int:
     warno_root = Path(args.warno_root)
     modding_suite_root = Path(args.modding_suite_root)
     asset_path = _norm_asset(args.asset_path)
+    print(f"[atlas-wrapper] game: {args.game}", file=sys.stderr)
     out_json = _resolve_output(Path(args.out_json))
     cache_dir = Path(args.cache_dir)
     lookup_cache_dir = _resolve_lookup_cache_dir(cache_dir)
@@ -329,10 +351,7 @@ def main() -> int:
         "--include-sibling-assets",
     ]
 
-    cmd = [
-        str(cli_exe),
-        *base_args,
-    ]
+    cmd = _build_cli_cmd(cli_exe, base_args)
     if bool(args.verbose):
         cmd.append("--verbose")
 
@@ -364,7 +383,10 @@ def main() -> int:
     if not timed_out and rc not in {0, 2}:
         dotnet_exec = _build_dotnet_fallback_cmd(cli_exe)
         if dotnet_exec is not None:
-            retry_cmd = [*dotnet_exec, *base_args]
+            retry_cmd = list(dotnet_exec)
+            if cli_exe.name.lower() == "moddingsuite.exe":
+                retry_cmd.append("atlas")
+            retry_cmd.extend(base_args)
             if bool(args.verbose):
                 retry_cmd.append("--verbose")
             quoted_retry = " ".join(shlex.quote(x) for x in retry_cmd)

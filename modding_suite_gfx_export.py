@@ -105,9 +105,16 @@ def _resolve_cli_exe(modding_suite_root: Path, gfx_cli_override: str) -> tuple[P
     sibling_modding_suite = script_root.parent / "moddingSuite"
     override = Path(gfx_cli_override).expanduser() if gfx_cli_override.strip() else None
     candidates: List[Path] = [
+        # Preferred: unified single-exe (subcommand routes the call).
+        script_root / "moddingSuite" / "moddingSuite.exe",
+        sibling_modding_suite / "moddingSuite.exe",
+        modding_suite_root / "moddingSuite.exe",
+        # Legacy: dedicated GfxCli.exe (kept for backwards compatibility).
         script_root / "moddingSuite" / "gfx_cli" / "moddingSuite.GfxCli.exe",
+        script_root / "moddingSuite" / "moddingSuite.GfxCli.exe",
         sibling_modding_suite / "gfx_cli" / "moddingSuite.GfxCli.exe",
         modding_suite_root / "gfx_cli" / "moddingSuite.GfxCli.exe",
+        modding_suite_root / "moddingSuite.GfxCli.exe",
         sibling_modding_suite / "moddingSuite.GfxCli" / "bin" / "Release" / "net9.0-windows10.0.19041" / "moddingSuite.GfxCli.exe",
         sibling_modding_suite / "moddingSuite.GfxCli" / "bin" / "Debug" / "net9.0-windows10.0.19041" / "moddingSuite.GfxCli.exe",
         modding_suite_root / "moddingSuite.GfxCli" / "bin" / "Release" / "net9.0-windows10.0.19041" / "moddingSuite.GfxCli.exe",
@@ -147,8 +154,14 @@ def _build_cli_exec_cmd(cli_exe: Path) -> List[str]:
     # Framework-dependent EXEs already include the apphost and must be launched directly,
     # otherwise dotnet sees the EXE and sibling DLL as duplicate assemblies.
     if exe.suffix.lower() == ".dll" and runtimeconfig.exists():
-        return ["dotnet", str(exe)]
-    return [str(exe)]
+        base = ["dotnet", str(exe)]
+    else:
+        base = [str(exe)]
+    # Unified moddingSuite[.exe|.dll] dispatches by subcommand — first arg.
+    name_stem = exe.stem.lower()
+    if name_stem == "moddingsuite":
+        base.append("gfx")
+    return base
 
 
 def _run_cli(cmd: List[str], timeout_sec: int) -> tuple[int, str, str, float, bool]:
@@ -178,6 +191,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--cache-dir", required=True)
     ap.add_argument("--gfx-cli", default="", help="Optional explicit path to moddingSuite.GfxCli.exe")
     ap.add_argument("--timeout-sec", type=int, default=180)
+    ap.add_argument(
+        "--game",
+        default="WARNO",
+        help="Active Eugen game id (WARNO|WARGAME_RD|STEEL_DIVISION_2); informational, passed via --warno-root",
+    )
     ap.add_argument("--verbose", action="store_true")
     return ap
 
@@ -188,6 +206,7 @@ def main() -> int:
     warno_root = Path(args.warno_root)
     modding_suite_root = Path(args.modding_suite_root)
     asset_path = _norm_asset(args.asset_path)
+    print(f"[gfx-wrapper] game: {args.game}", file=sys.stderr)
     out_json = _resolve_output(Path(args.out_json))
     cache_dir = Path(args.cache_dir)
     out_json.parent.mkdir(parents=True, exist_ok=True)
