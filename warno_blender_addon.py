@@ -1,7 +1,7 @@
 bl_info = {
     "name": "WARNO Importer",
     "author": "Kilivanchik",
-    "version": (1, 6, 0),
+    "version": (1, 6, 3),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > WARNO",
     "description": "Direct WARNO SPK importer with textures and optional helper bones",
@@ -49,7 +49,7 @@ SAFE_NAME_RX = re.compile(r"[^A-Za-z0-9_.-]+")
 LOD_SUFFIX_LOCAL_RX = re.compile(r"_(LOW|MID|HIGH|LOD[0-9]+)$", re.IGNORECASE)
 CONTROL_CHAR_RX = re.compile(r"[\x00-\x1f\x7f]+")
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tga", ".tif", ".tiff"}
-WARNO_BUILD_STAMP = "v1.6.0"
+WARNO_BUILD_STAMP = "v1.6.2"
 WARNO_DEV_SCALE = 20.0 / 43.0
 WARNO_OFF_MAT_SCALE = WARNO_DEV_SCALE / 100.0
 WARNO_HELPER_BONE_LENGTH = 0.4
@@ -4726,6 +4726,30 @@ def _rd_alpha_is_cutout(png_path) -> bool:
         return False
 
 
+def _rd_alpha_is_glass_mask(png_path) -> bool:
+    """True when a combined texture's alpha is a SMOOTH MID-GREY canopy/windshield mask (RD glass):
+    almost no near-transparent AND no near-opaque pixels, mean alpha in the mid range. Distinguishes
+    glass (CombinedDA: mean ~0.5, zero extremes) from a packed SPEC mask (body CombinedDS: mostly
+    near-0) and a binary CUTOUT (tracks/chains: near-0 + near-255). PIL is on sys.path by now."""
+    name = Path(str(png_path)).name.lower()
+    if ("combds" in name) or ("combinedds" in name) or ("ddstexture" in name):
+        return False
+    try:
+        from PIL import Image
+        im = Image.open(str(png_path))
+        if im.mode not in ("RGBA", "LA"):
+            return False
+        a = im.getchannel("A").resize((64, 128))
+        data = list(a.getdata())
+        n = len(data) or 1
+        fz = sum(1 for v in data if v < 32) / n           # near-transparent
+        ff = sum(1 for v in data if v > 224) / n          # near-opaque
+        mean = (sum(data) / n) / 255.0
+        return fz < 0.03 and ff < 0.03 and 0.2 < mean < 0.8
+    except Exception:
+        return False
+
+
 def _resolve_rd_textures(
     extractor_mod,
     spk,
@@ -4893,6 +4917,34 @@ def _resolve_rd_textures(
             # RD-specific node graph (spec-in-alpha -> roughness) instead of the
             # WARNO atlas graph. WARNO materials never carry this key.
             maps["rd_material"] = True
+            # RD glass: source is a CombinedDA (NOT CombinedDAS=tracks/chains, NOT CombinedDS=body)
+            # whose alpha is a smooth mid-grey windshield/canopy mask. Flag it so the glass finalizer
+            # renames it 'Vitre' + makes it see-through (parity with WARNO glass). CombinedDA only
+            # appears on glass-bearing units (canopies, truck/boat windows, NASAMS); hulls use DS.
+            try:
+                if best_base_combined and best_base is not None:
+                    _gbn = Path(str(best_base)).name.lower()
+                    if ("combinedda" in _gbn) and ("combineddas" not in _gbn) \
+                            and ("spec_alpha" in maps) and ("alpha_cutout" not in maps) \
+                            and _rd_alpha_is_glass_mask(best_base):
+                        maps["rd_glass"] = True
+                        # Generate a real ALPHA TEXTURE next to the diffuse so the WARNO cooker
+                        # re-reads the glass transparency from a FILE (it ignores a flat BSDF Alpha
+                        # value on re-export). Uniform 0.2 = the same see-through look, as <mat>_A.png.
+                        _gdiff = maps.get("diffuse")
+                        if _gdiff is not None:
+                            from PIL import Image as _PILImage
+                            _gstem = Path(str(_gdiff)).stem
+                            _gbase = _gstem[:-2] if _gstem.lower().endswith("_d") else _gstem
+                            _gapath = Path(str(_gdiff)).with_name(_gbase + "_A.png")
+                            try:
+                                _gsz = _PILImage.open(str(_gdiff)).size
+                            except Exception:
+                                _gsz = (256, 256)
+                            _PILImage.new("L", _gsz, 51).save(str(_gapath))
+                            maps["glass_alpha"] = _gapath
+            except Exception:
+                pass
             maps_by_name[name] = maps
             report["resolved"].append(name)
     report["atlas_mode"] = "rd_texturegroup"
@@ -5102,24 +5154,69 @@ def _split_track_chains_textures(model, material_name_by_id, maps_by_name):
             if isinstance(p.get("vertices"), dict) and p["vertices"].get("chenille")
             and p["vertices"].get("tread_full_uv") and p.get("material") is not None
         }
-        # WARNO-safety: this whole split (track AND chains) is an RD/SD2-only feature.
-        # Gate it on the chenille flag — if the model has no track part, do NOT touch any
-        # material (the chain-name match alone is NOT a reliable RD signal, and WARNO must
-        # stay byte-for-byte unchanged). Only RD/SD2 track units have a chenille part.
-        if not track_mids:
-            return
+        # NAME-BASED RD track materials: some track geometry decodes WITHOUT the chenille flag
+        # (VCC-1 TUA's welded belts -> no chenille part at all; M107's second 'Droite' material)
+        # yet samples the same CombinedDAS cutout. Treat any material named chenille/droite/
+        # gauche as a track too — gated on the maps' rd_material marker (WARNO never sets it,
+        # so WARNO stays byte-for-byte unchanged). These use the FULL atlas (their UVs were
+        # never crop-remapped).
+        _name_rx = re.compile(r"^(chenille|droite|gauche)", re.IGNORECASE)
+        named_mids = set()
+        for p in parts:
+            _mid = p.get("material")
+            if _mid is None or int(_mid) in track_mids:
+                continue
+            _nm = mname(_mid)
+            _mm = (maps_by_name or {}).get(_nm)
+            if _nm and _name_rx.match(_nm) and isinstance(_mm, dict) and _mm.get("rd_material"):
+                named_mids.add(int(_mid))
         chain_mids = {
             int(p["material"]) for p in parts
             if p.get("material") is not None and int(p["material"]) not in track_mids
+            and int(p["material"]) not in named_mids
             and "chain" in mname(p["material"]).lower()
         }
+        # BODY materials mis-classified as cutout: the hull's CombinedDAS alpha can carry a small
+        # genuine-cutout SUB-REGION, so alpha_cutout gets set for the whole material and the hull
+        # renders GHOSTED through its mid-grey spec alpha (VCC-1 TUA — also mis-named 'Chains').
+        # Convert every remaining alpha_cutout material to the WARNO-style separate BINARY _A:
+        # spec greys (>=76) turn opaque white, real cutout pixels stay transparent, and with
+        # alpha_cutout gone the chains classification/naming no longer hijacks the body bucket.
+        # rd_material gates WARNO out; 'chain'-named materials keep the crop path above.
+        cutout_mids = set()
+        for p in parts:
+            _mid = p.get("material")
+            if _mid is None:
+                continue
+            _mid = int(_mid)
+            if _mid in track_mids or _mid in named_mids or _mid in chain_mids:
+                continue
+            _nm = mname(_mid)
+            _mm = (maps_by_name or {}).get(_nm)
+            if isinstance(_mm, dict) and _mm.get("rd_material") and _mm.get("alpha_cutout"):
+                cutout_mids.add(_mid)
+        if not track_mids and not named_mids and not chain_mids and not cutout_mids:
+            return
+        track_full_uv.update(named_mids)
+        track_full_uv.update(cutout_mids)
 
-        def _make(combined_png, region, full=False):
+        import os as _os_tr
+        _tr_dbg = bool(_os_tr.environ.get("WARNO_TRACK_DEBUG"))
+
+        def _make(combined_png, region, full=False, name_base=None, write_rgb=True):
             # full=True: the WHOLE CombinedDAS (the complete tread strip, game-exact). Else a
             # TRUE 1:1 crop of the part's half of the atlas (256x256), not a blanked copy.
+            # `combined_png` is the PIXEL source (must be the original CombinedDAS so the real
+            # alpha channel is read); `name_base` names the outputs (the material's diffuse,
+            # e.g. Droite_D.png -> Droite_D.png + Droite_A.png). write_rgb=False keeps the
+            # existing resolver-made diffuse file untouched (redirected sources must never
+            # overwrite it — a wrong-atlas pick would corrupt the texture).
             p = Path(str(combined_png))
             im = Image.open(str(p)).convert("RGBA")
             W, H = im.size
+            if _tr_dbg:
+                print("TRACKDBG _make src=%s size=%dx%d region=%s full=%s alpha_ext=%s" % (
+                    p.name, W, H, region, full, im.split()[3].getextrema()), flush=True)
             if full:
                 crop = im
             else:
@@ -5130,18 +5227,17 @@ def _split_track_chains_textures(model, material_name_by_id, maps_by_name):
             rgb = Image.merge("RGB", (r, g, b))
             abin = a.point(lambda v: 255 if v >= 76 else 0).convert("L")  # binary cutout
             # WARNO-style clean texture names: "<base>_D.png" (diffuse) + "<base>_A.png"
-            # (alpha) — the source diffuse is already "<base>_D.png" (e.g. Droite_D.png).
-            # (was the verbose "<stem>_tracks_full[_alpha].png".)
-            _base = p.stem[:-2] if p.stem.lower().endswith("_d") else p.stem
-            rgb_p = p.with_name(_base + "_D.png"); rgb.save(str(rgb_p))
-            # If the source atlas alpha for this region is FULLY OPAQUE, the binary mask is a
-            # useless blank-WHITE PNG (e.g. the leopard tread strip alpha = all 255). Wiring it
-            # into BSDF Alpha then renders the belt WHITE/washed in Material-Preview/Solid on
-            # some GPUs (user: "track alpha texture is completely white"). A solid belt needs no
-            # cutout -> emit no alpha file; the caller renders it opaque.
+            out_ref = Path(str(name_base)) if name_base else p
+            _base = out_ref.stem[:-2] if out_ref.stem.lower().endswith("_d") else out_ref.stem
+            rgb_p = out_ref.with_name(_base + "_D.png")
+            if write_rgb or not rgb_p.exists():
+                rgb.save(str(rgb_p))
+            # A genuinely fully-opaque region has no cutout -> no alpha file (a blank-white mask
+            # wired into BSDF Alpha washes the belt white on some GPUs). With the pixel source
+            # fixed to the ORIGINAL CombinedDAS this now only triggers on true solid belts.
             if abin.getextrema()[0] >= 255:
                 return rgb_p, None
-            al_p = p.with_name(_base + "_A.png"); abin.save(str(al_p))
+            al_p = out_ref.with_name(_base + "_A.png"); abin.save(str(al_p))
             return rgb_p, al_p
 
         cache = {}
@@ -5149,15 +5245,47 @@ def _split_track_chains_textures(model, material_name_by_id, maps_by_name):
         def _apply(mid, region):
             nm = (material_name_by_id or {}).get(int(mid))
             m = (maps_by_name or {}).get(nm) if nm else None
+            if _tr_dbg:
+                print("TRACKDBG _apply mid=%s nm=%s maps=%s diffuse=%s" % (
+                    mid, nm, sorted(m.keys()) if isinstance(m, dict) else None,
+                    (m or {}).get("diffuse") if isinstance(m, dict) else None), flush=True)
             if not isinstance(m, dict):
                 return
             comb = m.get("diffuse")
             if not comb:
                 return
+            # IDEMPOTENCY / RESOLVER-NAMING FIX: the resolver names the track diffuse
+            # '<Material>_D.png' and saves it RGB-only, so reading IT back shows a fully-opaque
+            # alpha and the cutout '_A' is never generated (Leopard/Otomatic/M109G tracks came
+            # out solid). The true alpha lives in the original CombinedDAS atlas extracted into
+            # the same folder — use THAT as the pixel source, but ONLY when it can be matched
+            # UNAMBIGUOUSLY: units can carry several CombinedDAS atlases (VCC-1 TUA has two) and
+            # picking the wrong one would generate a wrong alpha. Match by image size; on
+            # ambiguity keep the diffuse itself (-> no _A, safe no-op).
+            name_base = Path(str(comb))
+            src = name_base
+            if src.stem.lower().endswith("_d"):
+                try:
+                    cands = [
+                        x for x in sorted(src.parent.iterdir())
+                        if x.suffix.lower() == ".png" and "combdas" in x.name.lower()
+                    ]
+                except Exception:
+                    cands = []
+                if len(cands) == 1:
+                    src = cands[0]
+                elif len(cands) > 1:
+                    try:
+                        want = Image.open(str(name_base)).size
+                        sized = [x for x in cands if Image.open(str(x)).size == want]
+                        if len(sized) == 1:
+                            src = sized[0]
+                    except Exception:
+                        pass
             full = (region == "tracks" and int(mid) in track_full_uv)
-            key = (str(comb), region, full)
+            key = (str(src), str(name_base), region, full)
             if key not in cache:
-                cache[key] = _make(comb, region, full)
+                cache[key] = _make(src, region, full, name_base=name_base, write_rgb=(str(src) == str(name_base)))
             rgb_p, al_p = cache[key]
             for k in ("alpha_cutout", "spec_alpha", "track_repeat", "force_opaque", "uv_crop"):
                 m.pop(k, None)
@@ -5181,6 +5309,10 @@ def _split_track_chains_textures(model, material_name_by_id, maps_by_name):
                 m["uv_crop"] = (0.5, 1.0) if region == "tracks" else (0.0, 0.5)
 
         for mid in track_mids:
+            _apply(mid, "tracks")
+        for mid in named_mids:
+            _apply(mid, "tracks")
+        for mid in cutout_mids:
             _apply(mid, "tracks")
         for mid in chain_mids:
             _apply(mid, "chains")
@@ -6083,6 +6215,485 @@ def _subbucket_from_faces(b: dict, face_indices, name: str, *, is_hull: bool) ->
     return nb
 
 
+def _peel_track_islands_from_wheels(buckets: List[dict]) -> List[dict]:
+    """Reduced-LOD only (caller-gated): the decimated LOD weights merge the track BELT into a
+    wheel/chassis bucket, so the belt shows up welded to a wheel. Split each such bucket into
+    connected components and peel out the BELT-SHAPED island(s) — long along the hull X, flat in Z,
+    sitting off-centre on a Y-side — into their own 'Chenille_Droite/Gauche' bucket. The compact
+    remainder stays the wheel/hull. Wheels (dx ~= dz) and tall rods never match the belt test, so
+    they are never falsely peeled. Full (high) model is never passed here."""
+    hull_dx = 1.0e-3
+    for b in buckets:
+        verts = b.get("vertices") or []
+        if verts:
+            xs = [float(v[0]) for v in verts]
+            hull_dx = max(hull_dx, max(xs) - min(xs))
+    out: List[dict] = []
+    n_peeled = 0
+    for b in buckets:
+        gname = _norm_low(str(b.get("group_name", "")))
+        verts = b.get("vertices") or []
+        faces = b.get("faces") or []
+        if not (gname.startswith("roue") or gname in ("chassis", "mainbody")) or len(faces) < 8 or not verts:
+            out.append(b)
+            continue
+        comps = _chassis_face_components(len(verts), faces)
+        if len(comps) <= 1:
+            out.append(b)
+            continue
+
+        def _ext(comp):
+            vs = set()
+            for fi in comp:
+                f = faces[int(fi)]
+                vs.update((int(f[0]), int(f[1]), int(f[2])))
+            xs = [float(verts[v][0]) for v in vs]
+            ys = [float(verts[v][1]) for v in vs]
+            zs = [float(verts[v][2]) for v in vs]
+            return (max(xs) - min(xs), max(zs) - min(zs), sum(ys) / len(ys), len(vs))
+
+        belt = []
+        keep = []
+        for comp in comps:
+            dx, dz, cy, nv = _ext(comp)
+            # a track belt is LONG along the hull (>=45% of hull length), FLAT (>=4x longer than tall,
+            # so a round wheel where dx~=dz never matches), and off-centre on a Y side (not a central
+            # roof panel). nv>=4 skips slivers.
+            if nv >= 4 and dx >= 0.45 * hull_dx and dx >= 4.0 * max(dz, 1.0e-3) and abs(cy) >= 0.5:
+                belt.append((comp, cy))
+            else:
+                keep.append(comp)
+        if not belt:
+            out.append(b)
+            continue
+        if keep:
+            out.append(_subbucket_from_faces(b, [fi for comp in keep for fi in comp], str(b.get("group_name", "")), is_hull=True))
+        for comp, cy in belt:
+            side = "Droite" if cy >= 0.0 else "Gauche"  # match _split_track_by_side (cy>=0 -> right)
+            out.append(_subbucket_from_faces(b, comp, f"Chenille_{side}", is_hull=False))
+            n_peeled += 1
+    if n_peeled:
+        try:
+            print(f"[warno] LOD track peel: {n_peeled} belt island(s) split off wheel/chassis buckets", flush=True)
+        except Exception:
+            pass
+    return out
+
+
+def _rename_lod_parts_by_geometry(collection, is_reduced_lod: bool) -> int:
+    """Reduced-LOD only (caller-gated). On a LOD the decimated per-vertex weights make the dominant-
+    bone bucket vote assign RANDOM names (a wheel ends up 'Canon_02', the gun barrel 'Roue_G1'). The
+    geometry itself is correct, so re-name each part by WHAT IT GEOMETRICALLY IS, matching the known
+    tank layout: the big footprint = Chassis, the tall box = Tourelle, the front elevated long bar =
+    Canon, the long side belts = Chenille (already named by the peel), and every part sitting on the
+    wheel row = Roue_<side><N> numbered front->back per side. Full (high) model never reaches here."""
+    if not is_reduced_lod:
+        return 0
+    objs = [o for o in (getattr(collection, "all_objects", []) or [])
+            if getattr(o, "type", "") == "MESH" and o.data is not None and len(o.data.vertices)]
+    if len(objs) < 3:
+        return 0
+    info = []
+    for o in objs:
+        ps = [o.matrix_world @ v.co for v in o.data.vertices]
+        xs = [p.x for p in ps]; ys = [p.y for p in ps]; zs = [p.z for p in ps]
+        n = len(ps)
+        info.append({
+            "o": o, "low": _norm_low(getattr(o, "name", "")),
+            "cx": sum(xs) / n, "cy": sum(ys) / n, "cz": sum(zs) / n,
+            "dx": max(xs) - min(xs), "dy": max(ys) - min(ys), "dz": max(zs) - min(zs),
+            "ztop": max(zs),
+        })
+    used = set()
+    rename = {}
+
+    def take(it, name):
+        rename[it["o"]] = name
+        used.add(it["o"])
+
+    # 1. Chassis = the largest footprint hull part.
+    cand = [it for it in info if it["o"] not in used and it["dx"] > 4.0 and it["dy"] > 2.0]
+    if cand:
+        take(max(cand, key=lambda it: it["dx"] * it["dy"]), "Chassis")
+    # 2. Tourelle_01 = the COMPACT tall box that rises above the hull (top above 1.6 m, wide in Y but
+    # not hull-long in X, so a long upper-hull slab is not mistaken for the turret).
+    cand = [it for it in info if it["o"] not in used and it["ztop"] > 1.6 and 1.0 < it["dx"] < 3.5 and it["dy"] > 1.0]
+    if cand:
+        take(max(cand, key=lambda it: it["dx"] * it["dy"]), "Tourelle_01")
+    # 3. Canon_01 = the front-most elevated long bar (the gun): long in X, slim, up at turret height.
+    cand = [it for it in info if it["o"] not in used and it["dx"] > 2.0 and it["ztop"] > 1.4 and it["dy"] < 1.2]
+    if cand:
+        take(max(cand, key=lambda it: it["cx"]), "Canon_01")
+    # 4. Track belts = long, off-centre on a Y side, flat (catches BOTH the peeled Chenille and a whole
+    # bucket that is itself a single belt, e.g. a 6 m island the vote called 'Roue_D1'). Side by world
+    # Y to match the high layout (Droite = -Y = right). Numbering left to Blender's auto-suffix.
+    for it in info:
+        if it["o"] not in used and it["dx"] > 4.0 and abs(it["cy"]) > 0.8 and it["dz"] < 1.5:
+            take(it, "Chenille_Droite" if it["cy"] < 0.0 else "Chenille_Gauche")
+    # 5. Wheels = everything sitting on the wheel row (low, off-centre on a Y side, not a full belt and
+    # not an FX marker). Number front->back (descending X) within each side.
+    wheels = [it for it in info if it["o"] not in used
+              and it["cz"] < 1.0 and abs(it["cy"]) > 1.0 and it["dx"] < 4.0 and "fx" not in it["low"]]
+    right = sorted([it for it in wheels if it["cy"] < 0.0], key=lambda it: -it["cx"])
+    left = sorted([it for it in wheels if it["cy"] >= 0.0], key=lambda it: -it["cx"])
+    for idx, it in enumerate(right, 1):
+        take(it, f"Roue_D{idx}")
+    for idx, it in enumerate(left, 1):
+        take(it, f"Roue_G{idx}")
+    # 6. Anything still unclassified (big merged slabs the LOD decode left, stray bits) gets a neutral
+    # 'Part_NN' so it never keeps a misleading random name AND never blocks a real target name (which
+    # would otherwise force a '.001' suffix on the part that wanted it).
+    for idx, it in enumerate(sorted([it for it in info if it["o"] not in used], key=lambda it: -it["cx"]), 1):
+        take(it, f"Part_{idx:02d}")
+    changed = {o: nm for o, nm in rename.items() if _norm_low(getattr(o, "name", "")) != _norm_low(nm)}
+    # Two-pass apply: park every changing part on a unique temp name first, so renaming A -> 'Roue_D2'
+    # cannot collide with a B that still holds 'Roue_D2' (which Blender would suffix '.001').
+    for _i, o in enumerate(changed):
+        try:
+            o.name = f"__lodrn_{_i}"
+        except Exception:
+            pass
+    cnt = 0
+    for o, nm in changed.items():
+        try:
+            o.name = nm
+            cnt += 1
+        except Exception:
+            pass
+    if cnt:
+        try:
+            print(f"[warno] LOD geometry rename: {cnt} part(s) re-named by shape/position", flush=True)
+        except Exception:
+            pass
+    return cnt
+
+
+def _resolve_high_asset_for_lod(settings, lod_asset: str, lod_stem: str):
+    """Given a reduced-LOD asset path, find the FULL (high) model asset for the same unit, so the LOD
+    can be imported as the high model + decimated (clean parts/bones/parents/empties instead of the
+    LOD's welded, rig-less geometry). Returns the high asset path, or None if not found.
+    LOD '<dir>/ikv_91_mid/ikv_91_mid.ase2ndfbin' (or '<dir>/lods/ikv_91_low.ase2ndfbin') -> the asset
+    whose basename is the de-suffixed stem ('ikv_91') and which is itself NOT a LOD."""
+    high_stem = re.sub(r"_(mid|low|lod\d+)$", "", lod_stem)
+    if not high_stem or high_stem == lod_stem:
+        return None
+    try:
+        index_data, _src, _rt, _spk = _ensure_asset_index_sync(settings, force_rebuild=False)
+        assets = list(index_data.get("assets", []) or [])
+    except Exception:
+        assets = []
+    lod_lp = lod_asset.lower().replace("\\", "/")
+    cands = []
+    for a in assets:
+        al = str(a).lower().replace("\\", "/")
+        base = al.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        if base != high_stem:
+            continue
+        if "/lods/" in al or re.search(r"_(mid|low|lod\d+)$", base):
+            continue  # skip other LODs -- we want the full model
+        cands.append(str(a))
+    if not cands:
+        return None
+
+    def _common_prefix_len(a):
+        al = a.lower().replace("\\", "/")
+        n = 0
+        for x, y in zip(al, lod_lp):
+            if x != y:
+                break
+            n += 1
+        return n
+
+    cands.sort(key=lambda a: -_common_prefix_len(a))  # same nation/dir wins
+    return cands[0]
+
+
+def _regroup_lod_islands(collection, is_reduced_lod: bool, model_is_rd: bool = False) -> int:
+    """Reduced-LOD only (caller-gated). On a LOD the decimated weights group geometry by the wrong
+    bone, so each imported OBJECT is a SOUP of disconnected islands from DIFFERENT logical parts
+    (a turret object that also holds a rear wheel + flat track tread). Re-resolve from scratch:
+    split every object into connected-component islands, classify each by GEOMETRY (track / wheel /
+    gun / turret / hull), then re-MERGE islands into the correct final objects (all tread on -Y ->
+    Chenille_Droite, wheels clustered along X per side -> Roue_<D/G><N>, gun pieces -> Canon_01,
+    turret pieces -> Tourelle_01, hull -> Chassis, the rest -> Part_NN). Pure bmesh, world-baked.
+    Full (high) model never reaches here. Aborts (no-op) if nothing classifies, never empties the scene."""
+    if not is_reduced_lod:
+        return 0
+    import bmesh
+    import os
+    from collections import defaultdict
+    objs = [o for o in list(getattr(collection, "all_objects", []) or [])
+            if getattr(o, "type", "") == "MESH" and o.data is not None and len(o.data.vertices)]
+    if len(objs) < 1:
+        return 0  # a heavily-decimated LOD can be ONE fully-welded object -> still worth re-resolving
+    # Split every object into connected-component islands (union-find on edges), world bbox per island.
+    # (Unit scale S is computed AFTER islanding, from BODY islands only, so a long gun barrel / antenna
+    # cannot inflate it and skew every S-relative threshold.)
+    islands = []  # {obj, faces(set), cx,cy,cz, dx,dy,dz, ztop, nv}
+    for o in objs:
+        me = o.data
+        mw = o.matrix_world
+        bm = bmesh.new()
+        bm.from_mesh(me)
+        bm.verts.ensure_lookup_table()
+        par = list(range(len(bm.verts)))
+
+        def _find(x):
+            while par[x] != x:
+                par[x] = par[par[x]]
+                x = par[x]
+            return x
+
+        for e in bm.edges:
+            a, b = _find(e.verts[0].index), _find(e.verts[1].index)
+            if a != b:
+                par[a] = b
+        face_comp = defaultdict(list)
+        for p in me.polygons:
+            face_comp[_find(p.vertices[0])].append(p.index)
+        world = [mw @ v.co for v in me.vertices]
+        bm.free()
+        for fids in face_comp.values():
+            vids = set()
+            for fi in fids:
+                vids.update(me.polygons[fi].vertices)
+            if len(vids) < 4:
+                continue
+            xs = [world[i].x for i in vids]; ys = [world[i].y for i in vids]; zs = [world[i].z for i in vids]
+            islands.append({"obj": o, "faces": set(fids),
+                            "cx": sum(xs) / len(xs), "cy": sum(ys) / len(ys), "cz": sum(zs) / len(zs),
+                            "dx": max(xs) - min(xs), "dy": max(ys) - min(ys), "dz": max(zs) - min(zs),
+                            "ztop": max(zs), "nv": len(vids)})
+    if not islands:
+        return 0
+    # Robust unit scale = X/Y extent over BODY islands only -- exclude thin-long bits (gun barrels,
+    # antennas) whose reach would inflate the scale and loosen the turret/hull size gates. Fall back
+    # to all islands if everything reads as thin.
+    body = [it for it in islands if not (it["dy"] < 0.5 and it["dz"] < 0.5 and it["dx"] > 1.5)]
+    if not body:
+        body = islands
+    hull_dx = max(max(it["cx"] + it["dx"] / 2.0 for it in body) - min(it["cx"] - it["dx"] / 2.0 for it in body), 1.0e-3)
+    hull_dy = max(max(it["cy"] + it["dy"] / 2.0 for it in body) - min(it["cy"] - it["dy"] / 2.0 for it in body), 1.0e-3)
+    S = hull_dx
+    # Classify each island (ordered, first match wins). Thresholds are fractions of S where it matters.
+    for it in islands:
+        dx, dy, dz, cy, cz, ztop, nv = it["dx"], it["dy"], it["dz"], it["cy"], it["cz"], it["ztop"], it["nv"]
+        horiz = max(dx, dy, 1.0e-3)
+        round_xz = min(dx, dz) / max(dx, dz, 1.0e-3)
+        if (dy <= 1.0 and dz <= 1.4 and dx >= 0.40 * S and dx >= 2.5 * max(dy, dz)
+                and abs(cy) >= 0.5 and cz <= 0.30 * S):
+            # A long LOW side BAND -- narrow in Y (not the full hull width) and not too tall: a flat
+            # tread (ikv), a thin skirt (leopard) or a thicker side belt (leclerc). A wide flat hull
+            # plate has dy ~ hull width so it is excluded. Whether this band is a real track or a
+            # wheeled vehicle's side panel is decided from the wheel layout (looks_tracked) below.
+            it["cls"] = "track"
+        elif (cz < 1.1 and abs(cy) >= 0.9 and round_xz >= 0.4 and max(dx, dz) < 1.5
+              and dy <= dx and nv >= 6 and dz > 0.1):
+            it["cls"] = "wheel"  # cap 1.5: wheeled-vehicle road wheels (~1.2 m) are bigger than tank's (~0.7)
+        elif abs(cy) < 0.6 and dx >= 1.3 and dy < 0.6 and dz < 0.6 and ztop > 1.4:
+            it["cls"] = "gun"
+        elif (ztop > 1.6 or cz > 1.5) and abs(cy) < 1.2 and dx < 0.55 * hull_dx:
+            it["cls"] = "turret"  # COMPACT elevated box; a hull-long upper deck stays HULL, not turret
+        elif dx > 0.40 * hull_dx and dy > 0.40 * hull_dy and cz <= 0.25 * S:
+            it["cls"] = "hull"
+        else:
+            it["cls"] = "leftover"
+    if os.environ.get("WARNO_LOD_DEBUG"):
+        try:
+            print(f"[loddbg] S={S:.2f} hull_dy={hull_dy:.2f} n_islands={len(islands)}", flush=True)
+            for it in sorted(islands, key=lambda x: -x["cx"]):
+                print("[loddbg] %-8s c=(%+.1f,%+.1f,%+.1f) d=[%.1f,%.1f,%.1f] nv=%d"
+                      % (it["cls"], it["cx"], it["cy"], it["cz"], it["dx"], it["dy"], it["dz"], it["nv"]), flush=True)
+        except Exception:
+            pass
+    if not any(it["cls"] in ("track", "wheel", "gun", "turret") for it in islands):
+        try:
+            print("[warno] LOD regroup: no classifiable parts, left as-is", flush=True)
+        except Exception:
+            pass
+        return 0
+    # Wheel clustering FIRST: per side, greedy 1-D agglomerate along X (wheel halves at the same X
+    # merge, adjacent road wheels ~0.8 m apart stay separate). Number front->back (descending X). The
+    # cluster COUNT per side also feeds the tracked/wheeled decision below.
+    wheel_n = {"D": 0, "G": 0}
+    for side, is_right in (("D", True), ("G", False)):
+        ws = sorted([it for it in islands if it["cls"] == "wheel" and (it["cy"] < 0.0) == is_right],
+                    key=lambda it: -it["cx"])
+        clusters = []
+        for it in ws:
+            placed = False
+            for cl in clusters:
+                mcx = sum(c["cx"] for c in cl) / len(cl)
+                mcz = sum(c["cz"] for c in cl) / len(cl)
+                ext = max([c["cx"] for c in cl] + [it["cx"]]) - min([c["cx"] for c in cl] + [it["cx"]])
+                if abs(it["cx"] - mcx) <= 0.5 and ext < 0.9 and abs(it["cz"] - mcz) <= 0.4:
+                    cl.append(it)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([it])
+        wheel_n[side] = len(clusters)
+        for n, cl in enumerate(clusters, 1):
+            for it in cl:
+                it["group"] = f"Roue_{side}{n}"
+    # Tracked vs wheeled. A 'track'-classified band is a REAL belt only if the unit is tracked. Signals:
+    #   - many road wheels per side (>=5): tanks/IFVs have 5-9, wheeled APCs have 2-4.
+    #   - OR a flat tread ribbon exists (thin in BOTH y and z, ikv style); a wheeled vehicle's side
+    #     panel is thin in one axis but TALL in the other (max(dy,dz) large) so it never qualifies.
+    # If wheeled, demote the side bands to hull so they merge into Chassis instead of a false Chenille.
+    looks_tracked = (bool(model_is_rd) or max(wheel_n["D"], wheel_n["G"]) >= 5
+                     or any(it["cls"] == "track" and max(it["dy"], it["dz"]) <= 0.6 for it in islands))
+    if not looks_tracked:
+        for it in islands:
+            if it["cls"] == "track":
+                it["cls"] = "hull"
+    # Tracks -> Chenille by side (high-model convention cy<0 -> Droite). looks_tracked already demoted
+    # wheeled side panels to hull, so any track island that survives here is a real belt segment --
+    # one per side is enough (the leclerc skirt is a single island per side).
+    for it in islands:
+        if it["cls"] == "track":
+            it["group"] = "Chenille_Droite" if it["cy"] < 0.0 else "Chenille_Gauche"
+    for it in islands:
+        if it.get("group"):
+            continue
+        if it["cls"] == "gun":
+            it["group"] = "Canon_01"
+        elif it["cls"] == "turret":
+            it["group"] = "Tourelle_01"
+        elif it["cls"] == "hull":
+            it["group"] = "Chassis"
+    # Leftover DETAIL islands (small bits the classifier didn't place) -> MERGE into the NEAREST
+    # already-classified part by centroid (a fender -> Chassis, a hub cap -> that wheel) instead of
+    # one 'Part_NN' each, which would over-fragment the outliner into dozens of stray objects.
+    classified = [it for it in islands if it.get("group")]
+    chen_sides = {str(it.get("group", "")) for it in islands if str(it.get("group", "")).startswith("Chenille")}
+    for it in islands:
+        if it.get("group"):
+            continue
+        # A flat OR long low side bit is a piece of tread -> route to that side's belt, NOT the
+        # nearest wheel (else tread leftovers fuse onto wheels and turn them into long tabs).
+        if it["cz"] < 1.0 and abs(it["cy"]) > 0.8 and (it["dz"] < 0.2 or it["dx"] > 1.5):
+            side = "Chenille_Droite" if it["cy"] < 0.0 else "Chenille_Gauche"
+            if side in chen_sides:
+                it["group"] = side
+                continue
+        # Merge into the nearest classified part by centroid -- but a LONG band (dx>1.5) is never a
+        # wheel detail, so keep it off the Roue groups (else it fuses onto a wheel as a 2.5 m tab).
+        long_band = it["dx"] > 1.5
+        best = None
+        bestd = 1.0e18
+        for c in classified:
+            if long_band and str(c.get("group", "")).startswith("Roue"):
+                continue
+            d = (it["cx"] - c["cx"]) ** 2 + (it["cy"] - c["cy"]) ** 2 + (it["cz"] - c["cz"]) ** 2
+            if d < bestd:
+                bestd = d
+                best = c
+        if best is None:  # nothing but wheels nearby -> fall back to any classified part
+            for c in classified:
+                d = (it["cx"] - c["cx"]) ** 2 + (it["cy"] - c["cy"]) ** 2 + (it["cz"] - c["cz"]) ** 2
+                if d < bestd:
+                    bestd = d
+                    best = c
+        it["group"] = best["group"] if best else "Part_01"
+    groups = defaultdict(list)
+    for it in islands:
+        groups[it["group"]].append(it)
+    # Build each group as a NEW merged object (world-baked bmesh) under a temp name; delete the
+    # originals only AFTER every group built; then assign canonical names (park-rename, no '.001').
+    built = []
+    gi = 0
+    for name, its in groups.items():
+        if not its:
+            continue
+        dest_mats = []
+        mat_remap = {}
+        for it in its:
+            src = it["obj"]
+            for li, m in enumerate(src.data.materials):
+                key = (id(src), li)
+                if key in mat_remap:
+                    continue
+                didx = next((i for i, dm in enumerate(dest_mats) if dm is m), None)
+                if didx is None:
+                    dest_mats.append(m)
+                    didx = len(dest_mats) - 1
+                mat_remap[key] = didx
+        by_src = defaultdict(set)
+        for it in its:
+            by_src[it["obj"]].update(it["faces"])
+        dbm = bmesh.new()
+        dst_uv = dbm.loops.layers.uv.new("UVMap")
+        for src, fset in by_src.items():
+            sbm = bmesh.new()
+            sbm.from_mesh(src.data)
+            sbm.verts.ensure_lookup_table()
+            sbm.faces.ensure_lookup_table()
+            s_uv = sbm.loops.layers.uv.active
+            mw = src.matrix_world
+            vmap = {}
+            for f in sbm.faces:
+                if f.index not in fset:
+                    continue
+                nverts = []
+                for v in f.verts:
+                    nv = vmap.get(v.index)
+                    if nv is None:
+                        nv = dbm.verts.new(mw @ v.co)  # WORLD-bake the source matrix (centroid origins)
+                        vmap[v.index] = nv
+                    nverts.append(nv)
+                try:
+                    nf = dbm.faces.new(nverts)
+                except ValueError:
+                    continue
+                nf.material_index = mat_remap.get((id(src), f.material_index), 0)
+                if s_uv is not None:
+                    for sl, dl in zip(f.loops, nf.loops):
+                        dl[dst_uv].uv = sl[s_uv].uv.copy()
+            sbm.free()
+        dmesh = bpy.data.meshes.new(name)
+        dbm.to_mesh(dmesh)
+        dbm.free()
+        if not len(dmesh.vertices):
+            try:
+                bpy.data.meshes.remove(dmesh)
+            except Exception:
+                pass
+            continue
+        for m in dest_mats:
+            dmesh.materials.append(m)
+        dmesh.update()
+        obj = bpy.data.objects.new(f"__lodrg_{gi}", dmesh)
+        gi += 1
+        collection.objects.link(obj)
+        vn = len(dmesh.vertices)
+        _set_object_origin_world(obj, Vector((sum(v.co.x for v in dmesh.vertices) / vn,
+                                              sum(v.co.y for v in dmesh.vertices) / vn,
+                                              sum(v.co.z for v in dmesh.vertices) / vn)))
+        if name.lower().startswith("chenille"):
+            obj["warno_is_track_mesh"] = True
+        built.append((obj, name))
+    if not built:
+        return 0
+    for o in objs:
+        try:
+            bpy.data.objects.remove(o, do_unlink=True)
+        except Exception:
+            pass
+    cnt = 0
+    for obj, name in built:
+        try:
+            obj.name = name
+            cnt += 1
+        except Exception:
+            pass
+    try:
+        print(f"[warno] LOD regroup: {len(islands)} islands -> {cnt} parts ({sorted(set(n for _, n in built))[:8]})", flush=True)
+    except Exception:
+        pass
+    return cnt
+
+
 def _peel_chassis_welded_subparts(
     buckets: List[dict],
     *,
@@ -6097,6 +6708,11 @@ def _peel_chassis_welded_subparts(
     of the hull (boxes, fenders, lights, the bolts) is NEVER shattered into junk objects (an
     earlier all-islands peel produced 64 fragments). Caller gates on model_is_rd -> WARNO
     untouched."""
+    # DISABLED (user request): antennas / masts must stay WELDED to the part they adjoin, NOT be
+    # split into separate 'Antenna_NN' objects. Returning the buckets unchanged keeps every welded
+    # sub-part (antennas, bed posts, rails, fittings) inside its Chassis/MainBody. The missile-
+    # launcher split (_split_rd_launcher) is a separate post-import pass and still runs.
+    return list(buckets)
     result: List[dict] = []
     for b in buckets:
         gname = _norm_low(str(b.get("group_name", "")))
@@ -6121,7 +6737,7 @@ def _peel_chassis_welded_subparts(
             ys = [float(verts[v][1]) for v in vs]
             zs = [float(verts[v][2]) for v in vs]
             return (max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs),
-                    (sum(xs) / len(xs), sum(ys) / len(ys), sum(zs) / len(zs)))
+                    (sum(xs) / len(xs), sum(ys) / len(ys), sum(zs) / len(zs)), max(zs))
 
         keep: set = set(comps[0])  # largest component is always the hull
         # Unit scale = bbox diagonal of the WHOLE chassis bucket (not just the largest
@@ -6137,19 +6753,29 @@ def _peel_chassis_welded_subparts(
             + (max(ally) - min(ally)) ** 2
             + (max(allz) - min(allz)) ** 2
         ) ** 0.5, 1.0e-3) if verts else 1.0
+        z_top = max(allz) if allz else 1.0
+        z_bot = min(allz) if allz else 0.0
         subs: List[List[int]] = []
         for c in comps[1:]:
             ntri = len(c)
             if len(subs) >= max_subparts or ntri < int(min_tris) or ntri > int(total * max_ratio):
                 keep.update(c)
                 continue
-            dx, dy, dz, _cen = _comp_extent(c)
+            dx, dy, dz, _cen, comp_top = _comp_extent(c)  # comp_top = TRUE bbox max-z (not mean+dz/2)
             tall_thin = dz >= 2.5 * max(dx, dy, 1.0e-6)
             tall_abs = dz >= 0.10 * hull_diag
-            if tall_thin and tall_abs:  # tall + thin + tall-relative-to-unit -> antenna/mast ONLY
+            # a genuine antenna/mast is a THIN rod: its horizontal footprint is small in ABSOLUTE
+            # terms. A stood-up ammo box / stowage bin / sensor slab is tall but WIDE -> excluded so
+            # it is never mislabeled 'Antenna' (the user's boxy-piece complaint).
+            rod_thin = max(dx, dy) <= max(0.35, 0.05 * hull_diag)
+            # a real mast STICKS UP near the vehicle top; a bed-frame STAKE POST / side rail sits low
+            # (its top is well below the unit top). NASAMS bed posts (top ~2.2 on a ~3.5 m unit) are
+            # NOT peeled; a whip antenna on the cab roof is. Excludes the user's false bed-post antennas.
+            sticks_up = comp_top >= (z_top - 0.25 * max(z_top - z_bot, 1.0e-3))
+            if tall_thin and tall_abs and rod_thin and sticks_up:  # thin rod near the unit top -> mast
                 subs.append(c)
             else:
-                keep.update(c)  # boxes / hatches / fenders / slivers stay welded (no junk objects)
+                keep.update(c)  # boxes / posts / fenders / slivers stay welded (no junk objects)
         if not subs:
             result.append(b)
             continue
@@ -6446,19 +7072,34 @@ def _collect_mesh_buckets(
         # WARNO geometry never sets this flag, so WARNO bucketing is unchanged.
         is_chenille = bool(part.get("vertices", {}).get("chenille"))
 
+        _ch_maps = (material_maps_by_name or {}).get(mat_name) or {}
+        # WELDED-BELT class (VCC-1 TUA / M113 family): the track part decodes WITHOUT the
+        # chenille flag (plain TexCoord0_2wn mesh, mat named 'Droite'/'Gauche'/'Chenille*').
+        # Its decoded geometry+UV are game-exact (verified by a raw-decode render), but the
+        # bone split used to weld it into the hull, where merge/weld collapsed coincident
+        # strip-seam verts that carry DIFFERENT UVs -> scrambled tread + alpha holes. Route
+        # it through the SAME per-side chenille branch instead (own Chenille_* object, no
+        # weld: warno_is_track_mesh skips merge-by-distance). Gates: rd_material (WARNO
+        # never sets it -> WARNO untouched) + model has NO real chenille part (M107's
+        # second 'Droite' material on a chenille-rigged unit keeps its current path).
+        is_named_track = (
+            (not is_chenille) and (not model_is_rd)
+            and bool(_ch_maps.get("rd_material"))
+            and bool(re.match(r"^(chenille|droite|gauche)", str(mat_name or ""), re.IGNORECASE))
+        )
+
         # RD ball-chains ("цепури"): a NON-chenille part whose material is a cutout
         # CombinedDAS (the ball-chain belt shares the track's atlas). Peel it into its OWN
         # "Chains" object — like the track's "Chenille" object — so its UV + alpha cutout
         # never conflict with the merged MainBody. Identify it by the material maps
         # (alpha_cutout / uv_crop are RD-only keys, set only for CombinedDAS cutouts), not
         # by the unreliable material name. WARNO never sets these keys, so it's unaffected.
-        _ch_maps = (material_maps_by_name or {}).get(mat_name) or {}
-        is_chains = (not is_chenille) and bool(
+        is_chains = (not is_chenille) and (not is_named_track) and bool(
             _ch_maps.get("alpha_cutout") or _ch_maps.get("uv_crop")
         )
 
         group_payloads: List[Dict[str, Any]] = []
-        if is_chenille:
+        if is_chenille or is_named_track:
             # RD track is ONE mesh spanning BOTH belts. Split it into the left
             # (Chenille_Gauche, -Y) and right (Chenille_Droite, +Y) belt so each is a
             # separate object + per-side material, mirroring WARNO. Pure geometry (RD
@@ -6474,6 +7115,7 @@ def _collect_mesh_buckets(
                         "group_name_sanitized": _side_label,
                         "group_bone_index": _side_bone,
                         "tris": list(_side_tris),
+                        "named_track": bool(is_named_track),
                     })
             if not group_payloads:
                 group_payloads = [{
@@ -6481,6 +7123,7 @@ def _collect_mesh_buckets(
                     "group_name_sanitized": "Chenille",
                     "group_bone_index": int(default_root_bone_index),
                     "tris": _all_tris(indices),
+                    "named_track": bool(is_named_track),
                 }]
         elif is_chains:
             group_payloads = [{
@@ -6621,14 +7264,21 @@ def _collect_mesh_buckets(
             # builder sets its origin to the part's centroid (RD has no bone pivots).
             if "origin" in group:
                 bucket["warno_rd_origin"] = True
+            # WELDED-BELT class marker: lets the post-import wheel repair know these
+            # Chenille_* objects came from a name-routed (non-chenille-flag) track part.
+            if group.get("named_track"):
+                bucket["warno_named_track"] = True
             # RD wheels: their skeleton roue_* bone pivots routinely resolve to the world
             # origin (the wheel mesh carries its own world position), which would leave the
             # wheel pivot at (0,0,0). Flag them so the object builder gives each a
             # geometric-centroid origin (the wheel centre). The armature pass runs AFTER but
             # skips objects carrying this centroid (so it isn't clobbered back to 0,0,0).
             # Body/turret/gun keep their resolved bone-pivot origin; tracks (chenille) keep
-            # the native track-deform setup untouched. RD-only; WARNO never reaches this.
-            if model_is_rd:
+            # the native track-deform setup untouched. Gate on the PRESET (is_rd_asset) too, not
+            # just model_is_rd: TRACKLESS RD wheeled vehicles (NASAMS, Rooikat, VM90P, BTR-152)
+            # have model_is_rd=False, so without this their Roue_* pivots stayed at world origin
+            # (a wheel would spin about the vehicle centre, not its axle). WARNO never sets either.
+            if model_is_rd or is_rd_asset:
                 _gn_low_origin = _norm_low(str(group_name or ""))
                 if _gn_low_origin.startswith("roue"):
                     bucket["warno_rd_origin"] = True
@@ -6702,7 +7352,11 @@ def _collect_mesh_buckets(
                     # quads that render as HOLES (the real cause of the leopard hull holes,
                     # proven by ON/OFF frozen-camera renders). WARNO keeps the merge ->
                     # byte-identical. RD keeps all triangles (watertight, verified).
-                    merge_quads=(not bool(model_is_rd)),
+                    # Gate on the PRESET (is_rd_asset), NOT just model_is_rd: model_is_rd is the
+                    # chenille/track flag, so TRACKLESS RD units (wheeled vehicles + boats:
+                    # NASAMS, Rooikat, VM90P, BTR-152, LCM-8, Monitors, ...) had model_is_rd=False
+                    # -> quad-merge ran -> the same leopard holes. The preset signal covers them.
+                    merge_quads=(not (bool(model_is_rd) or bool(is_rd_asset))),
                 )
             except Exception:
                 cleanup_payload = {}
@@ -6883,6 +7537,13 @@ def _apply_rd_material_nodes(
     force_opaque = bool(maps.get("force_opaque")) or track_repeat
     normal = maps.get("normal")
 
+    # Italian Nation-Pack glass (canopy/windscreen): the window texture is a SEPARATE 'vitre_*' diffuse
+    # that carries the see-through shape in its OWN alpha channel -- it is not a CombinedDA spec/glass
+    # mask, so `_rd_alpha_is_glass_mask` never tags it and the part imports fully OPAQUE. Force-treat
+    # any material or diffuse named 'vitre' as glass (alpha -> BSDF Alpha, BLEND), which also gives
+    # WARNO the alpha map it needs. (WARNO units never name a texture 'vitre' -> safe.)
+    is_vitre = ("vitre" in mat.name.lower()) or ("vitre" in str(base or "").lower())
+
     base_node = None
     if base is not None:
         base_node = _texture_node(nodes, base, -560, 200, non_color=False)
@@ -6896,7 +7557,26 @@ def _apply_rd_material_nodes(
                     pass
             links.new(base_node.outputs["Color"], bsdf.inputs["Base Color"])
 
-    if alpha_tex is not None:
+    if is_vitre and base_node is not None and "Alpha" in base_node.outputs:
+        # Glass: the diffuse's own alpha is the window/canopy mask -> BSDF Alpha, BLEND so it renders
+        # see-through (semi-transparent), and the alpha travels into the export for WARNO.
+        links.new(base_node.outputs["Alpha"], bsdf.inputs["Alpha"])
+        for attr, val in (("blend_method", "BLEND"), ("shadow_method", "CLIP")):
+            if hasattr(mat, attr):
+                try:
+                    setattr(mat, attr, val)
+                except Exception:
+                    pass
+        if hasattr(mat, "surface_render_method"):
+            try:
+                mat.surface_render_method = "BLENDED"
+            except Exception:
+                pass
+        try:
+            bsdf.inputs["Roughness"].default_value = 0.1
+        except Exception:
+            pass
+    elif alpha_tex is not None:
         # WARNO-style SEPARATE alpha map: a clean binary (0/255) cutout texture wired
         # straight into BSDF Alpha — no GreaterThan/threshold node needed in the shader.
         # Used by the split track/chains textures (_split_track_chains_textures).
@@ -8754,7 +9434,10 @@ def _finalize_glass_materials() -> int:
         if mat is None:
             continue
         bare = _norm_low(_warno_strip_namespace(str(getattr(mat, "name", ""))))
-        if not glass_rx.match(bare):
+        # RD glass carries a generic name (Standard_2) but is flagged at resolve time; match the
+        # marker too so it gets the same Vitre rename + transparency. WARNO never sets the flag.
+        is_rd_glass = bool(mat.get("warno_rd_glass"))
+        if not glass_rx.match(bare) and not is_rd_glass:
             continue
         try:
             mat.use_nodes = True
@@ -8763,7 +9446,26 @@ def _finalize_glass_materials() -> int:
             bsdf = None
         if bsdf is not None:
             ai = bsdf.inputs.get("Alpha")
-            if ai is not None and not ai.is_linked and float(ai.default_value) >= 0.99:
+            _gap = mat.get("warno_rd_glass_alpha")
+            if _gap and ai is not None and not ai.is_linked:
+                # RD: drive Alpha from a real TEXTURE FILE (<mat>_A.png) so the WARNO cooker keeps the
+                # glass transparency on re-export — it reads alpha from a texture, not a flat value.
+                try:
+                    _aimg = bpy.data.images.load(str(_gap), check_existing=True)
+                    try:
+                        _aimg.colorspace_settings.name = "Non-Color"
+                    except Exception:
+                        pass
+                    _atex = mat.node_tree.nodes.new("ShaderNodeTexImage")
+                    _atex.image = _aimg
+                    try:
+                        _atex.location = (bsdf.location.x - 360.0, bsdf.location.y - 340.0)
+                    except Exception:
+                        pass
+                    mat.node_tree.links.new(_atex.outputs["Color"], ai)
+                except Exception:
+                    pass
+            elif ai is not None and not ai.is_linked and float(ai.default_value) >= 0.99:
                 ai.default_value = 0.2  # see-through tinted glass
             ri = bsdf.inputs.get("Roughness")
             if ri is not None and not ri.is_linked:
@@ -8987,7 +9689,7 @@ def _set_object_origin_world(obj: bpy.types.Object, world_point: Vector) -> None
     obj.matrix_world.translation = world_point
 
 
-def _fix_outlier_wheels(imported_objects: Sequence[bpy.types.Object], _fix_collection=None) -> int:
+def _fix_outlier_wheels(imported_objects: Sequence[bpy.types.Object], _fix_collection=None, rd_extra: bool = False) -> int:
     """Snap any wheel that sits far from its own Roue_Elev_<side><n> elevator empty back onto it.
     A wheel can be flung to the wrong side by a duplicate/bogus bone (Leopard_1V Roue_D1) or a
     whole-side source mirror defect (m48a5_mid: 7 of 9 "D" wheels on the +Y/left side). The
@@ -9005,6 +9707,20 @@ def _fix_outlier_wheels(imported_objects: Sequence[bpy.types.Object], _fix_colle
     except Exception:
         pass
     def _ctr(o: bpy.types.Object) -> Vector:
+        # Use the VERTEX CENTROID, not bound_box: an earlier mirror/mesh-edit stage can leave
+        # o.bound_box STALE for the centerline-decoded front wheels (Otomatic Roue_D11/D13),
+        # so its midpoint is skewed ~0.9 m off the real wheel bulk. Snapping the stale bbox onto
+        # the elevator then DRAGS the visible wheel OFF (D11 -> Y=-0.43, D13 -> (-4.9,-2.3)).
+        # The vertex mean is always fresh and tracks the wheel mass, so a wheel already on its
+        # row reads dist≈0 (no snap) and a genuinely flung wheel still reads far (snapped).
+        me = getattr(o, "data", None)
+        vs = getattr(me, "vertices", None) if me is not None else None
+        if vs and len(vs):
+            mw = o.matrix_world
+            acc = Vector((0.0, 0.0, 0.0))
+            for v in vs:
+                acc = acc + (mw @ v.co)
+            return acc / len(vs)
         wb = [o.matrix_world @ Vector(c) for c in o.bound_box]
         return Vector((sum(p.x for p in wb) / 8.0, sum(p.y for p in wb) / 8.0, sum(p.z for p in wb) / 8.0))
     wheels: Dict[Tuple[str, int], bpy.types.Object] = {}
@@ -9034,6 +9750,8 @@ def _fix_outlier_wheels(imported_objects: Sequence[bpy.types.Object], _fix_colle
         elev = elevs.get((side, num))
         if elev is None:
             continue
+        if elev.length < 0.5 and _ctr(o).length > 1.0:
+            continue  # FALLEN elevator (collapsed to origin, VCC-1 TUA) -> never snap to it
         emed = elev_med.get(side)
         if emed is not None and abs(elev.y - emed) > 1.0:
             continue  # elevator itself is an outlier -> don't trust it as a target
@@ -9048,6 +9766,80 @@ def _fix_outlier_wheels(imported_objects: Sequence[bpy.types.Object], _fix_colle
             snapped.add((side, num))
         except Exception:
             continue
+    if rd_extra:
+        # X/Z-SNAP (RD/SD2 only): a wheel can decode with a PER-AXIS offset well under the 1.0 m
+        # PRIMARY radius yet clearly wrong on screen (Leopard 1A2: rollers D11/G11 sit 0.42 m ABOVE
+        # their elevators — floating over the track; sprockets D13/G13 sit 0.56 m FORWARD of theirs
+        # — jammed onto the last road wheel while the rear track curve runs empty). Snap X and Z
+        # onto the (trusted) elevator when either axis deviates; Y is left to the Y-ROW stage
+        # below (elevators carry a small systematic Y offset, so full-snap would drag wheels
+        # outboard — the Otomatic lesson).
+        for (side, num), o in list(wheels.items()):
+            elev = elevs.get((side, num))
+            if elev is None:
+                continue
+            c = _ctr(o)
+            if elev.length < 0.5 and c.length > 1.0:
+                continue  # FALLEN elevator (collapsed to origin) -> no per-axis snap either
+            emed = elev_med.get(side)
+            if emed is not None and abs(elev.y - emed) > 1.0:
+                continue  # fallen/untrusted elevator
+            dx = elev.x - c.x
+            dz = elev.z - c.z
+            if abs(dx) <= 0.35 and abs(dz) <= 0.25:
+                continue
+            try:
+                mw = o.matrix_world.copy()
+                mw.translation = mw.translation + Vector((dx, 0.0, dz))
+                o.matrix_world = mw
+                fixed += 1
+            except Exception:
+                continue
+        # TWIN-MIRROR (RD/SD2 only): a wheel whose position disagrees with its healthy opposite
+        # twin (Otomatic Roue_D13 sprocket decodes 0.5 m rear+outboard of the belt while Roue_G13
+        # sits engaged; the elevator snap misses it because the offset is under 1.0 m). The twin
+        # sitting closer to its OWN elevator is trusted; the outlier moves to its exact Y-mirror.
+        for (side, num), o in list(wheels.items()):
+            tkey = ("g" if side == "d" else "d", num)
+            twin = wheels.get(tkey)
+            if twin is None:
+                continue
+            c = _ctr(o)
+            tc = _ctr(twin)
+            mirror_t = Vector((tc.x, -tc.y, tc.z))
+            if (c - mirror_t).length <= 0.25:
+                continue
+            d_self = (c - elevs[(side, num)]).length if (side, num) in elevs else float("inf")
+            d_twin = (tc - elevs[tkey]).length if tkey in elevs else float("inf")
+            if not (d_self > d_twin + 0.1):
+                continue  # can't tell which twin is the outlier -> leave both
+            try:
+                mw = o.matrix_world.copy()
+                mw.translation = mw.translation + (mirror_t - c)
+                o.matrix_world = mw
+                fixed += 1
+                snapped.add((side, num))
+            except Exception:
+                continue
+        # Y-ROW NORMALIZE (RD/SD2 only): a wheel snapped onto its ELEVATOR sits at the elevator's
+        # slightly-outboard Y (Otomatic +-1.53) while the belt + every other wheel runs at +-1.31,
+        # so the disc pokes half out of the track. Pull any wheel whose |Y| deviates > 0.12 from
+        # the unit's wheel-row median back onto the row (X/Z untouched).
+        row_ys = [abs(_ctr(o).y) for o in wheels.values()]
+        if len(row_ys) >= 4:
+            row = statistics.median(row_ys)
+            for (side, num), o in list(wheels.items()):
+                c = _ctr(o)
+                if abs(abs(c.y) - row) <= 0.12:
+                    continue
+                ty = row if c.y >= 0.0 else -row
+                try:
+                    mw = o.matrix_world.copy()
+                    mw.translation = mw.translation + Vector((0.0, ty - c.y, 0.0))
+                    o.matrix_world = mw
+                    fixed += 1
+                except Exception:
+                    continue
     # FALLBACK: opposite-side mirror for wheels that have no usable elevator.
     medians: Dict[str, float] = {}
     for side in ("d", "g"):
@@ -9078,6 +9870,1583 @@ def _fix_outlier_wheels(imported_objects: Sequence[bpy.types.Object], _fix_colle
             fixed += 1
         except Exception:
             continue
+    return fixed
+
+
+def _declutter_rd_wheel_islands(imported_objects: Sequence[bpy.types.Object], _fix_collection=None, is_rd_asset: bool = False) -> int:
+    """RD/SD2 only. Some units (Otomatic + most Italian tracked hulls) decode a few road wheels as
+    SCRAMBLED conglomerates: one Roue_<side><n> mesh object carries its real disc PLUS one or more
+    DUPLICATE/garbage discs several metres away (mirror copies / mis-split triangles). The object
+    CENTROID averages out near the track line, so a centroid snap can't see it, but the stray discs
+    render as 'flying wheels' next to the tank. A clean road wheel is a SINGLE compact island; a
+    scrambled one has multiple islands spread > 1 m apart. For each multi-island wheel, keep the
+    island nearest its elevator + every island within 0.6 m of that one (the disc's two faces + rim)
+    and DELETE the rest. Single-island wheels (every normal unit) are never touched -> safe."""
+    if not is_rd_asset:
+        return 0
+    import bmesh as _bm
+    elev_pool = list(getattr(_fix_collection, "all_objects", []) or []) if _fix_collection is not None else list(imported_objects)
+    elevs: Dict[Tuple[str, int], Vector] = {}
+    for o in elev_pool:
+        me = re.fullmatch(r"roue_elev_([dg])(\d+)", _norm_low(getattr(o, "name", "")))
+        if me:
+            elevs[(me.group(1), int(me.group(2)))] = o.matrix_world.translation.copy()
+    # WELDED-BELT class (VCC-1 TUA / M113 family, marked by the named-track bucket routing):
+    # its sprocket/idler END wheels decode as STACKS OF THIN ROUND PLATES (drum faces
+    # 0.45x0.45x0.03-0.09 + hub rings) — round in the two major dims, arbitrarily thin in
+    # the third. The 3-dim compactness disc rule below reads those as slivers and deleted
+    # the REAL end wheels (leaving the 8-vert "stub" that got mis-diagnosed in v7b).
+    named_track_cls = any(
+        getattr(x, "type", "") == "MESH" and bool(x.get("warno_named_track"))
+        for x in elev_pool
+    )
+    cleaned = 0
+    to_delete: List[Any] = []
+    for o in list(imported_objects):
+        if getattr(o, "type", "") != "MESH" or o.data is None or not len(o.data.vertices):
+            continue
+        m = re.fullmatch(r"roue_([dg])(\d+)", _norm_low(getattr(o, "name", "")))
+        if not m:
+            continue
+        elev = elevs.get((m.group(1), int(m.group(2))))
+        if elev is None:
+            continue
+        mw = o.matrix_world
+        bm = _bm.new()
+        try:
+            bm.from_mesh(o.data)
+            # connected components (islands)
+            seen: set = set()
+            comps: List[List[Any]] = []
+            for v in bm.verts:
+                if v.index in seen:
+                    continue
+                stack = [v]; comp = []
+                while stack:
+                    x = stack.pop()
+                    if x.index in seen:
+                        continue
+                    seen.add(x.index); comp.append(x)
+                    for e in x.link_edges:
+                        ov = e.other_vert(x)
+                        if ov.index not in seen:
+                            stack.append(ov)
+                comps.append(comp)
+            # First pass: measure every island (centroid, sorted dims, whether it is a ROUND FLAT
+            # plate — round in the two major dims, arbitrarily thin in the third: a drum face / hub
+            # ring of a sprocket/idler stack).
+            geom = []  # (centroid, dd, maxd, mind, nverts, round_flat)
+            for comp in comps:
+                mn = Vector((1e18, 1e18, 1e18)); mx = Vector((-1e18, -1e18, -1e18))
+                c = Vector((0.0, 0.0, 0.0))
+                for v in comp:
+                    w = mw @ v.co
+                    c = c + w
+                    for k in range(3):
+                        if w[k] < mn[k]: mn[k] = w[k]
+                        if w[k] > mx[k]: mx[k] = w[k]
+                c = c / len(comp)
+                dd = sorted([mx.x - mn.x, mx.y - mn.y, mx.z - mn.z], reverse=True)
+                maxd = dd[0]; mind = max(dd[2], 0.02)
+                round_flat = ((0.10 <= maxd <= 1.15)
+                              and (maxd / max(dd[1], 0.02) <= 1.35)
+                              and len(comp) >= 12)
+                geom.append((c, dd, maxd, mind, len(comp), round_flat))
+            # A SPROCKET/IDLER END WHEEL (VCC-1 / M113 family — both the TUA whose belt is a
+            # named-track AND the base Camillino whose belt is a real chenille part) decodes as a
+            # STACK of >=2 CO-AXIAL round-flat plates (drum faces + hub rings). Detect that per
+            # WHEEL by geometry so the flat-plate rule fires for it regardless of how the belt was
+            # routed — a normal road wheel is ONE compact disc, never a co-axial plate stack, so it
+            # is unaffected. (named_track_cls stays as an OR for the fallen-elevator TUA case.)
+            wheel_is_drum_stack = False
+            rf_idx = [i for i in range(len(geom)) if geom[i][5]]
+            if len(rf_idx) >= 2:
+                for _a in range(len(rf_idx)):
+                    coax = 1
+                    ca = geom[rf_idx[_a]][0]
+                    da = geom[rf_idx[_a]][1][0]
+                    for _b in range(len(rf_idx)):
+                        if _b == _a:
+                            continue
+                        cb = geom[rf_idx[_b]][0]
+                        # co-axial = centroids within a plate radius in the two major dims
+                        if (abs(ca.x - cb.x) <= 0.5 * da and abs(ca.y - cb.y) <= 0.5 * da
+                                and abs(ca.z - cb.z) <= 0.5 * da):
+                            coax += 1
+                    if coax >= 2:
+                        wheel_is_drum_stack = True
+                        break
+            allow_flat = named_track_cls or wheel_is_drum_stack
+            # per-island: world centroid, whether it is DISC-like (a real road wheel is a compact
+            # disc ~0.1-1.0 m; a spike/sliver or an oversized merged blob is not), and nverts.
+            infos = []  # (centroid, is_disc, nverts)
+            for (c, dd, maxd, mind, nv, round_flat) in geom:
+                is_disc = (0.10 <= maxd <= 1.15) and (maxd / mind <= 4.5) and nv >= 6
+                if not is_disc and allow_flat and round_flat:
+                    # a drum face / hub ring of the sprocket-idler stack — keep it.
+                    is_disc = True
+                infos.append((c, is_disc, nv))
+            disc_idx = [i for i in range(len(comps)) if infos[i][1]]
+            # a FALLEN elevator (collapsed to the world origin — VCC-1 TUA: ALL of them) is no
+            # reference: judging by it deleted 14 perfectly good bone-split wheels. Trust the
+            # elevator only when it stands away from the origin; otherwise any real disc keeps
+            # the wheel and the largest disc anchors the keep-cluster (spikes still die).
+            elev_ok = elev.length >= 0.5
+            if elev_ok:
+                valid = [i for i in disc_idx if (infos[i][0] - elev).length <= 1.2]
+            else:
+                valid = disc_idx
+            import os as _os_dcl
+            if _os_dcl.environ.get("WARNO_DECL_DEBUG"):
+                print("DECLDBG %s elev=(%.2f,%.2f,%.2f) elev_ok=%s ncomp=%d valid=%d cents=%s" % (
+                    o.name, elev.x, elev.y, elev.z, elev_ok, len(comps), len(valid),
+                    [[round(c.x, 2), round(c.y, 2), round(c.z, 2), d] for c, d, _n in infos[:5]]), flush=True)
+            if not valid:
+                # no real disc: every island is a spike / oversized blob / stray. On the VCC-1 family
+                # the real road wheels are welded into the Chassis, so the standalone 'Roue_*' here is
+                # pure garbage -> drop the whole object so nothing sticks out (was: black rear spikes).
+                bm.free()
+                to_delete.append(o)
+                cleaned += 1
+                continue
+            if elev_ok:
+                ni = min(valid, key=lambda i: (infos[i][0] - elev).length)
+            else:
+                ni = max(valid, key=lambda i: infos[i][2])
+            base = infos[ni][0]
+            # keep the disc-like islands clustered on the real wheel; delete spikes + far duplicates
+            keep = set(i for i in range(len(comps)) if infos[i][1] and (infos[i][0] - base).length <= 0.6)
+            keep.add(ni)
+            if len(keep) >= len(comps):
+                bm.free()
+                continue  # every island is the clean wheel -> no-op
+            del_verts = [v for i, comp in enumerate(comps) if i not in keep for v in comp]
+            if del_verts:
+                _bm.ops.delete(bm, geom=del_verts, context="VERTS")
+                bm.to_mesh(o.data)
+                o.data.update()
+                cleaned += 1
+        except Exception:
+            pass
+        finally:
+            try:
+                bm.free()
+            except Exception:
+                pass
+    if to_delete:
+        # drop the dead refs from the caller's list FIRST (while still live), then remove the
+        # objects, so the downstream passes that iterate imported_objects never touch a dead StructRNA.
+        dead = set(id(x) for x in to_delete)
+        try:
+            if isinstance(imported_objects, list):
+                imported_objects[:] = [x for x in imported_objects if id(x) not in dead]
+        except Exception:
+            pass
+        for o in to_delete:
+            try:
+                bpy.data.objects.remove(o, do_unlink=True)
+            except Exception:
+                pass
+    return cleaned
+
+
+def _reclaim_chassis_wheels_no_elev(collection, imported_objects, is_rd_asset: bool = False) -> int:
+    """RD/SD2 only. WHEELED vehicles (FIROS_30/25, iveco_acm80, ...) whose wheel geometry carries
+    PALETTE-LOCAL bone indices weld ALL their road wheels into the Chassis, and — unlike tracked
+    hulls — they have NO Roue_Elev_* elevator rig at all (the skeleton's wheel nodes are the
+    non-standard Roue_02/Roue_Droite_01/... that decode as empty placeholders or tiny garbage). So
+    `_reclaim_chassis_wheel_discs` (which needs elevators) can't touch them. Recover the wheels by
+    pure geometry: a truck wheel welded in the hull is a ROUND CYLINDER (equal two major dims,
+    tire-thick) sitting OUT on the axle (|Y|>0.5) and — decisively — it comes as a ±Y MIRROR PAIR
+    (a spare tyre / cooling fan is single, so it is excluded). Cluster the paired wheels into axles
+    by X, name them Roue_D<n>/Roue_G<n> (D=-Y right, G=+Y left, front→rear), pull each into its own
+    object (centroid origin, parented to the Chassis, UV/material/weights/armature-mod preserved),
+    then drop the garbage Roue_* placeholders. Self-gating: units whose wheels are already separate
+    (Fiat/AR-76) have NO mirror-paired wheel island in the hull -> no-op. WARNO never reaches this."""
+    if not is_rd_asset:
+        return 0
+    import bmesh as _bm
+    import statistics as _st
+    # NO view_layer.update() here. This pass runs BETWEEN _reclaim_chassis_wheel_discs and the
+    # declutter, and the declutter DEPENDS on the PRE-FLUSH matrices (the armature build's bone-pull
+    # parenting is still pending). A flush here — even when this pass then returns early via the
+    # elevator gate — makes the declutter read post-pull coords and delete the wrong islands
+    # (M107: its D1 road wheel was destroyed purely by this flush). The Chassis carries an explicit
+    # matrix, so islands + new parentless wheels read correctly without a flush.
+    objs = list(getattr(collection, "all_objects", []) or [])
+    # units WITH a real elevator rig are the tracked class handled by _reclaim_chassis_wheel_discs
+    n_elev = sum(1 for o in objs if getattr(o, "type", "") == "EMPTY"
+                 and re.fullmatch(r"roue_elev_[dg]\d+", _norm_low(getattr(o, "name", ""))))
+    if n_elev >= 4:
+        return 0
+    chassis_list = [o for o in objs if getattr(o, "type", "") == "MESH"
+                    and _norm_low(getattr(o, "name", "")) == "chassis"
+                    and o.data is not None and len(o.data.polygons) >= 50]
+    if not chassis_list:
+        return 0
+    import os as _os_rn
+    _rn_dbg = bool(_os_rn.environ.get("WARNO_RECLAIM_DEBUG"))
+    reclaimed = 0
+    existing_names = set(_norm_low(getattr(o, "name", "")) for o in objs)
+    for ch in chassis_list:
+        me = ch.data
+        mw = ch.matrix_world
+        bm = _bm.new()
+        bm.from_mesh(me)
+        bm.verts.ensure_lookup_table()
+        parent = list(range(len(bm.verts)))
+
+        def _find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for e in bm.edges:
+            ra, rb = _find(e.verts[0].index), _find(e.verts[1].index)
+            if ra != rb:
+                parent[ra] = rb
+        stats: Dict[int, list] = {}
+        for v in bm.verts:
+            r = _find(v.index)
+            w = mw @ v.co
+            st = stats.get(r)
+            if st is None:
+                stats[r] = [Vector(w), Vector(w), Vector(w), 1]
+            else:
+                for k in range(3):
+                    if w[k] < st[0][k]:
+                        st[0][k] = w[k]
+                    if w[k] > st[1][k]:
+                        st[1][k] = w[k]
+                st[2] = st[2] + w
+                st[3] += 1
+        # candidate wheel islands: round cylinder, tire-thick, out on the axle
+        cands: List[Tuple[int, Vector, list]] = []
+        for r, (mn, mx, sm, cnt) in stats.items():
+            if cnt < 100:
+                continue
+            c = sm / cnt
+            dd = sorted([mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]], reverse=True)
+            if not (0.40 <= dd[0] <= 1.60):
+                continue
+            if dd[0] / max(dd[1], 1e-3) > 1.20:  # round in the two major dims
+                continue
+            th = dd[2] / max(dd[0], 1e-3)
+            if not (0.15 <= th <= 0.70):  # a tyre, not a thin plate or a box
+                continue
+            if abs(c.y) < 0.5:  # a wheel sits OUT on the axle, not on the centerline
+                continue
+            cands.append((r, c, dd))
+        # keep only ±Y MIRROR-PAIRED candidates (excludes a single spare tyre / fan)
+        paired: List[Tuple[int, Vector, list]] = []
+        for i, (r, c, dd) in enumerate(cands):
+            for j, (r2, c2, dd2) in enumerate(cands):
+                if i == j:
+                    continue
+                if (c.y * c2.y < 0 and abs(c.x - c2.x) <= 0.35
+                        and abs(abs(c.y) - abs(c2.y)) <= 0.35 and abs(c.z - c2.z) <= 0.30):
+                    paired.append((r, c, dd))
+                    break
+        if len(paired) < 2:
+            bm.free()
+            continue
+        # the wheels sit on ONE Z-row (the axle height); drop any paired detail off that row
+        zrow = _st.median([c.z for _r, c, _dd in paired])
+        wheels = [(r, c, dd) for (r, c, dd) in paired if abs(c.z - zrow) <= 0.40]
+        if len(wheels) < 2:
+            bm.free()
+            continue
+        # axles = X clusters (front +X -> rear)
+        xs_sorted = sorted((c.x for _r, c, _dd in wheels), reverse=True)
+        axes: List[float] = []
+        for x in xs_sorted:
+            if axes and abs(axes[-1] - x) <= 0.45:
+                continue
+            axes.append(x)
+
+        def _ordinal(cx: float) -> int:
+            best, bd = 1, 1e9
+            for i, ax in enumerate(axes):
+                d = abs(cx - ax)
+                if d < bd:
+                    bd, best = d, i + 1
+            return best
+
+        assign: Dict[int, str] = {}
+        for r, c, dd in wheels:
+            side = "D" if c.y < 0 else "G"
+            nm = "Roue_%s%d" % (side, _ordinal(c.x))
+            # avoid clobbering an existing real wheel of that name
+            if _norm_low(nm) in existing_names and _norm_low(nm) not in assign.values():
+                continue
+            assign[r] = nm
+        if _rn_dbg:
+            print("RECLAIM_NOELEV %s axes=%s wheels=%d assign=%s" % (
+                ch.name, [round(a, 2) for a in axes], len(wheels),
+                {k: v for k, v in list(assign.items())[:8]}), flush=True)
+        if not assign:
+            bm.free()
+            continue
+        bm.faces.ensure_lookup_table()
+        src_uv = bm.loops.layers.uv.active
+        src_def = bm.verts.layers.deform.active
+        remove_faces: List[Any] = []
+        made_names: List[str] = []
+        for root, name in assign.items():
+            faces = [f for f in bm.faces if _find(f.verts[0].index) in (root,)]
+            if not faces:
+                continue
+            if bpy.data.objects.get(name) is not None:
+                continue
+            nbm = _bm.new()
+            dst_uv = nbm.loops.layers.uv.new(src_uv.name) if src_uv else None
+            dst_def = nbm.verts.layers.deform.new() if src_def else None
+            vmap: Dict[int, Any] = {}
+            for f in faces:
+                nv_list = []
+                for v in f.verts:
+                    nv = vmap.get(v.index)
+                    if nv is None:
+                        nv = nbm.verts.new(v.co)
+                        if dst_def is not None:
+                            for gi, wgt in v[src_def].items():
+                                nv[dst_def][gi] = wgt
+                        vmap[v.index] = nv
+                    nv_list.append(nv)
+                try:
+                    nf = nbm.faces.new(nv_list)
+                except ValueError:
+                    continue
+                nf.material_index = f.material_index
+                if dst_uv is not None:
+                    for sl, dl in zip(f.loops, nf.loops):
+                        dl[dst_uv].uv = sl[src_uv].uv.copy()
+            nmesh = bpy.data.meshes.new(name)
+            nbm.to_mesh(nmesh)
+            nbm.free()
+            for mslot in me.materials:
+                nmesh.materials.append(mslot)
+            nmesh.update()
+            nobj = bpy.data.objects.new(name, nmesh)
+            for vg in ch.vertex_groups:
+                nobj.vertex_groups.new(name=vg.name)
+            linked = False
+            for coll in ch.users_collection:
+                try:
+                    coll.objects.link(nobj)
+                    linked = True
+                    break
+                except Exception:
+                    continue
+            if not linked:
+                collection.objects.link(nobj)
+            nobj.matrix_world = mw.copy()
+            for md in ch.modifiers:
+                if md.type in ("ARMATURE", "NODES"):
+                    try:
+                        nm2 = nobj.modifiers.new(md.name, md.type)
+                        if md.type == "ARMATURE":
+                            nm2.object = md.object
+                            nm2.use_vertex_groups = md.use_vertex_groups
+                        elif getattr(md, "node_group", None) is not None:
+                            nm2.node_group = md.node_group
+                    except Exception:
+                        pass
+            cN = Vector((0.0, 0.0, 0.0))
+            for v in nmesh.vertices:
+                cN = cN + (mw @ v.co)
+            cN = cN / max(1, len(nmesh.vertices))
+            try:
+                _set_object_origin_world(nobj, cN)
+            except Exception:
+                pass
+            try:
+                keep = nobj.matrix_world.copy()
+                nobj.parent = ch
+                nobj.matrix_world = keep
+            except Exception:
+                pass
+            try:
+                if isinstance(imported_objects, list):
+                    imported_objects.append(nobj)
+            except Exception:
+                pass
+            existing_names.add(_norm_low(name))
+            remove_faces.extend(faces)
+            made_names.append(name)
+            reclaimed += 1
+        if remove_faces:
+            _bm.ops.delete(bm, geom=remove_faces, context="FACES")
+            bm.to_mesh(me)
+            me.update()
+        bm.free()
+        # drop the garbage Roue_* placeholders (empty nodes / tiny stray meshes) that the
+        # non-standard skeleton left behind, now that real wheels exist.
+        if made_names:
+            garbage = []
+            for o in list(objs):
+                nl = _norm_low(getattr(o, "name", ""))
+                if not re.match(r"roue", nl):
+                    continue
+                if nl in set(_norm_low(n) for n in made_names):
+                    continue
+                if getattr(o, "type", "") == "EMPTY":
+                    garbage.append(o)
+                elif getattr(o, "type", "") == "MESH" and (o.data is None or len(o.data.vertices) < 80):
+                    garbage.append(o)
+            dead = set(id(x) for x in garbage)
+            try:
+                if isinstance(imported_objects, list):
+                    imported_objects[:] = [x for x in imported_objects if id(x) not in dead]
+            except Exception:
+                pass
+            for o in garbage:
+                try:
+                    bpy.data.objects.remove(o, do_unlink=True)
+                except Exception:
+                    pass
+    return reclaimed
+
+
+def _reclaim_chassis_wheel_discs(collection, imported_objects, is_rd_asset: bool = False) -> int:
+    """RD/SD2 only. Some mesh parts carry PALETTE-LOCAL bone indices that decode to bogus global
+    bones (Otomatic 'OF40_OTOMATIC_2' part: the REAL D6/D7/D9/G10 road wheels weight to
+    chassis/fx_stress_*/remorque_* with weight 1.0), so those wheels weld into the Chassis object
+    — they neither rotate nor follow their station, and the donor-fill pass overlays an instanced
+    copy on top (double wheels). The welded discs are recoverable by pure geometry: a Chassis
+    island that IS a wheel (round in its two major dims, wheel-sized, solid — not a thin bracket
+    sheet) sitting EXACTLY on a resolved Roue_Elev_* station (same axle X/Z, only slightly in/out
+    in Y) is that station's real wheel. Pull it out into its own Roue_<S><n> object (consuming a
+    fallen EMPTY placeholder holding the name), origin at its own centroid, parented to the
+    elevator — i.e. indistinguishable from a healthy bone-split wheel. If the station already
+    carries a live wheel mesh, the island is a static duplicate -> delete it from the hull.
+    Elevators collapsed to the origin (VCC-1 family) are ignored, so that class is untouched;
+    WARNO never reaches this (preset-gated)."""
+    if not is_rd_asset:
+        return 0
+    import bmesh as _bm
+    import statistics as _st
+    # NO view_layer.update() here: the bone-pull parenting from the armature build is still
+    # PENDING at this point and the declutter pass (which runs right after) depends on seeing
+    # the pre-flush matrices — flushing here made it read post-pull coords and keep the wrong
+    # islands (Otomatic D3/D5/D11 rollers were deleted in favour of their mirror garbage).
+    # Elevator empties and the Chassis read correctly without a flush (both carry explicitly
+    # assigned matrices); the new wheel objects are created parentless with explicit matrices,
+    # and the final reseat pass (post-flush) hangs them on their elevators.
+    objs = list(getattr(collection, "all_objects", []) or [])
+    elevs: Dict[Tuple[str, int], Vector] = {}
+    elev_obj_by_key: Dict[Tuple[str, int], Any] = {}
+    for o in objs:
+        if getattr(o, "type", "") != "EMPTY":
+            continue
+        m = re.fullmatch(r"roue_elev_([dg])(\d+)", _norm_low(getattr(o, "name", "")))
+        if m:
+            p = o.matrix_world.translation.copy()
+            if p.length >= 0.5:  # a fallen elevator is no station reference
+                key = (m.group(1), int(m.group(2)))
+                elevs[key] = p
+                elev_obj_by_key[key] = o
+    if len(elevs) < 4:
+        return 0
+    row_y = _st.median([abs(p.y) for p in elevs.values()])
+    if row_y < 0.4:
+        return 0
+    # station occupancy: a live wheel MESH already sitting on its station means a chassis copy
+    # there is a static DUPLICATE (delete), not a missing wheel (extract).
+    occupied: set = set()
+    for o in objs:
+        m = re.fullmatch(r"roue_([dg])(\d+)", _norm_low(getattr(o, "name", "")))
+        if not m or getattr(o, "type", "") != "MESH" or o.data is None or len(o.data.vertices) < 6:
+            continue
+        key = (m.group(1), int(m.group(2)))
+        elev = elevs.get(key)
+        if elev is None:
+            continue
+        mw0 = o.matrix_world
+        c0 = Vector((0.0, 0.0, 0.0))
+        for v in o.data.vertices:
+            c0 = c0 + (mw0 @ v.co)
+        c0 = c0 / len(o.data.vertices)
+        if (c0 - elev).length <= 0.6:
+            occupied.add(key)
+    import os as _os_rc
+    _rc_dbg = bool(_os_rc.environ.get("WARNO_RECLAIM_DEBUG"))
+    reclaimed = 0
+    for ch in [o for o in objs if getattr(o, "type", "") == "MESH"
+               and _norm_low(getattr(o, "name", "")) in ("chassis", "mainbody")
+               and o.data is not None and len(o.data.polygons) >= 50]:
+        me = ch.data
+        mw = ch.matrix_world
+        bm = _bm.new()
+        bm.from_mesh(me)
+        bm.verts.ensure_lookup_table()
+        parent = list(range(len(bm.verts)))
+
+        def _find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for e in bm.edges:
+            ra, rb = _find(e.verts[0].index), _find(e.verts[1].index)
+            if ra != rb:
+                parent[ra] = rb
+        stats: Dict[int, list] = {}
+        for v in bm.verts:
+            r = _find(v.index)
+            w = mw @ v.co
+            st = stats.get(r)
+            if st is None:
+                stats[r] = [Vector(w), Vector(w), Vector(w), 1]
+            else:
+                for k in range(3):
+                    if w[k] < st[0][k]:
+                        st[0][k] = w[k]
+                    if w[k] > st[1][k]:
+                        st[1][k] = w[k]
+                st[2] = st[2] + w
+                st[3] += 1
+        take: Dict[Tuple[str, int], set] = {}
+        kill: set = set()
+        for r, (mn, mx, sm, cnt) in stats.items():
+            if cnt < 8:
+                continue
+            c = sm / cnt
+            dd = sorted([mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]], reverse=True)
+            if not (0.14 <= dd[0] <= 1.2):
+                continue
+            if dd[0] / max(dd[1], 1e-3) > 1.30:
+                continue  # not round in the two major dims
+            if dd[2] < 0.28 * dd[0]:
+                continue  # thin sheet (bracket / skirt plate), not a solid wheel or hub cap
+            best_key, best_d = None, 1.0e9
+            for key, ep in elevs.items():
+                d = (c - ep).length
+                if d < best_d:
+                    best_d, best_key = d, key
+            if best_key is None:
+                continue
+            ep = elevs[best_key]
+            if best_d > 0.30 or abs(c.x - ep.x) > 0.15 or abs(c.z - ep.z) > 0.15:
+                continue  # not sitting on the axle of any station
+            if abs(abs(c.y) - row_y) > 0.45 or (c.y >= 0.0) != (ep.y >= 0.0):
+                continue
+            if _rc_dbg:
+                print("RECLAIMDBG %s ISL ctr=(%.2f,%.2f,%.2f) dd=(%.2f,%.2f,%.2f) nv=%d -> %s d=%.2f occ=%s" % (
+                    ch.name, c.x, c.y, c.z, dd[0], dd[1], dd[2], cnt,
+                    "Roue_%s%d" % (best_key[0].upper(), best_key[1]), best_d, best_key in occupied), flush=True)
+            if best_key in occupied:
+                kill.add(r)
+            else:
+                take.setdefault(best_key, set()).add(r)
+        if not take and not kill:
+            bm.free()
+            continue
+        bm.faces.ensure_lookup_table()
+        src_uv = bm.loops.layers.uv.active
+        src_def = bm.verts.layers.deform.active
+        remove_faces: List[Any] = []
+        for key in sorted(take.keys()):
+            roots = take[key]
+            faces = [f for f in bm.faces if _find(f.verts[0].index) in roots]
+            if not faces:
+                continue
+            name = "Roue_%s%d" % (key[0].upper(), int(key[1]))
+            holder = bpy.data.objects.get(name)
+            if holder is not None:
+                is_placeholder = (getattr(holder, "type", "") == "EMPTY"
+                                  or getattr(holder, "data", None) is None
+                                  or len(holder.data.vertices) == 0)
+                if is_placeholder:
+                    try:
+                        bpy.data.objects.remove(holder, do_unlink=True)  # consume the fallen placeholder
+                    except Exception:
+                        continue
+                else:
+                    continue  # live mesh holds the name but sits off-station -> leave welded (rare)
+            nbm = _bm.new()
+            dst_uv = nbm.loops.layers.uv.new(src_uv.name) if src_uv else None
+            dst_def = nbm.verts.layers.deform.new() if src_def else None
+            vmap: Dict[int, Any] = {}
+            for f in faces:
+                nv_list = []
+                for v in f.verts:
+                    nv = vmap.get(v.index)
+                    if nv is None:
+                        nv = nbm.verts.new(v.co)
+                        if dst_def is not None:
+                            for gi, wgt in v[src_def].items():
+                                nv[dst_def][gi] = wgt
+                        vmap[v.index] = nv
+                    nv_list.append(nv)
+                try:
+                    nf = nbm.faces.new(nv_list)
+                except ValueError:
+                    continue
+                nf.material_index = f.material_index
+                if dst_uv is not None:
+                    for sl, dl in zip(f.loops, nf.loops):
+                        dl[dst_uv].uv = sl[src_uv].uv.copy()
+            nmesh = bpy.data.meshes.new(name)
+            nbm.to_mesh(nmesh)
+            nbm.free()
+            for mslot in me.materials:
+                nmesh.materials.append(mslot)
+            nmesh.update()
+            nobj = bpy.data.objects.new(name, nmesh)
+            for vg in ch.vertex_groups:
+                nobj.vertex_groups.new(name=vg.name)
+            linked = False
+            for coll in ch.users_collection:
+                try:
+                    coll.objects.link(nobj)
+                    linked = True
+                    break
+                except Exception:
+                    continue
+            if not linked:
+                collection.objects.link(nobj)
+            nobj.matrix_world = mw.copy()
+            for md in ch.modifiers:
+                if md.type in ("ARMATURE", "NODES"):
+                    try:
+                        nm2 = nobj.modifiers.new(md.name, md.type)
+                        if md.type == "ARMATURE":
+                            nm2.object = md.object
+                            nm2.use_vertex_groups = md.use_vertex_groups
+                        elif getattr(md, "node_group", None) is not None:
+                            nm2.node_group = md.node_group
+                    except Exception:
+                        pass
+            # origin = the wheel's own centroid, computed purely from the assigned matrix (mw) —
+            # never read nobj.matrix_world of a fresh object pre-flush. Parenting to the elevator
+            # is DEFERRED to the reseat pass (post-flush), so the declutter that runs next still
+            # reads this object's explicit parentless matrix correctly.
+            cN = Vector((0.0, 0.0, 0.0))
+            for v in nmesh.vertices:
+                cN = cN + (mw @ v.co)
+            cN = cN / max(1, len(nmesh.vertices))
+            try:
+                _set_object_origin_world(nobj, cN)
+            except Exception:
+                pass
+            try:
+                if isinstance(imported_objects, list):
+                    imported_objects.append(nobj)
+            except Exception:
+                pass
+            remove_faces.extend(faces)
+            occupied.add(key)
+            reclaimed += 1
+        if kill:
+            kfaces = [f for f in bm.faces if _find(f.verts[0].index) in kill]
+            if kfaces:
+                remove_faces.extend(kfaces)
+                reclaimed += 1
+        if remove_faces:
+            _bm.ops.delete(bm, geom=remove_faces, context="FACES")
+            bm.to_mesh(me)
+            me.update()
+        bm.free()
+    return reclaimed
+
+
+def _reseat_rd_wheel_origins(collection, is_rd_asset: bool = False) -> int:
+    """RD/SD2 only. A wheel's origin is computed from its bucket centroid BEFORE the later passes
+    edit the mesh: the declutter deletes stray mirror discs (Otomatic Roue_D1/D3/D5/D11/D13 keep a
+    centroid blended with geometry that no longer exists), and the skeleton rebind renames a
+    bogus-bone object into its Roue_* station (Otomatic remorque_1 -> Roue_G12, arriving with a
+    rear-hull origin AND still parented to the Chassis). Re-seat every wheel: origin -> its own
+    vertex centroid (the geometry itself never moves), parent -> its Roue_Elev_* elevator when
+    that elevator is resolved (fallen elevators are skipped, so the VCC-1 class keeps its state).
+    Clean wheels read |origin-centroid| ~ 0 and already hang on their elevator -> no-op."""
+    if not is_rd_asset:
+        return 0
+    try:
+        bpy.context.view_layer.update()
+    except Exception:
+        pass
+    objs = list(getattr(collection, "all_objects", []) or [])
+    elev_by_key: Dict[Tuple[str, int], Any] = {}
+    for o in objs:
+        if getattr(o, "type", "") != "EMPTY":
+            continue
+        m = re.fullmatch(r"roue_elev_([dg])(\d+)", _norm_low(getattr(o, "name", "")))
+        if m:
+            elev_by_key[(m.group(1), int(m.group(2)))] = o
+    fixed = 0
+    for o in objs:
+        m = re.fullmatch(r"roue_([dg])(\d+)", _norm_low(getattr(o, "name", "")))
+        if not m or getattr(o, "type", "") != "MESH" or o.data is None or not len(o.data.vertices):
+            continue
+        mw = o.matrix_world
+        c = Vector((0.0, 0.0, 0.0))
+        for v in o.data.vertices:
+            c = c + (mw @ v.co)
+        c = c / len(o.data.vertices)
+        moved = False
+        if (mw.translation - c).length > 0.12:
+            try:
+                if o.data.users > 1:
+                    o.data = o.data.copy()  # never shift a SHARED (instanced) wheel datablock
+                _set_object_origin_world(o, c)
+                moved = True
+            except Exception:
+                pass
+        elev = elev_by_key.get((m.group(1), int(m.group(2))))
+        if elev is not None and o.parent is not elev:
+            ep = elev.matrix_world.translation
+            if ep.length >= 0.5 and (ep - c).length <= 1.0:
+                try:
+                    keep = o.matrix_world.copy()
+                    o.parent = elev
+                    o.matrix_world = keep
+                    moved = True
+                except Exception:
+                    pass
+        if moved:
+            fixed += 1
+    return fixed
+
+
+def _fill_empty_rd_wheels(imported_objects, collection, is_rd_asset: bool = False) -> int:
+    """RD/SD2 only. The RD mesh stream stores ONE wheel mesh per wheel variant and INSTANCES it
+    across bone positions, so several Roue_<side><n> nodes decode with NO geometry — the importer
+    leaves an EMPTY placeholder at the correct spot (Otomatic: Roue_G2/G4/G6/G7/G9/G10 + D6/D7/D9
+    -> those wheels are simply missing in-game). Replace each placeholder with a real INSTANCE of
+    a donor wheel: prefer the opposite-side twin (same ordinal), else the nearest wheel in the
+    same Z-row. The donor's mesh datablock is SHARED (true instancing, no extra geometry cost);
+    an opposite-side donor is rotated 180 deg about Z so its outboard hub face points outboard
+    (no negative scale -> normals stay correct). The new mesh keeps the placeholder's name,
+    parent (its Roue_Elev_*) and world position, so the export finally carries every road wheel."""
+    if not is_rd_asset:
+        return 0
+    try:
+        bpy.context.view_layer.update()
+    except Exception:
+        pass
+    objs = list(getattr(collection, "all_objects", []) or [])
+    rx = re.compile(r"^roue_([dg])(\d+)$")
+    elev_rx = re.compile(r"^roue_elev_([dg])(\d+)$")
+    donors: Dict[Tuple[str, int], bpy.types.Object] = {}
+    holes: Dict[Tuple[str, int], bpy.types.Object] = {}
+    elevs: Dict[Tuple[str, int], Vector] = {}
+    for o in objs:
+        low = _norm_low(getattr(o, "name", ""))
+        me = elev_rx.fullmatch(low)
+        if me:
+            elevs[(me.group(1), int(me.group(2)))] = o.matrix_world.translation.copy()
+            continue
+        m = rx.fullmatch(low)
+        if not m:
+            continue
+        key = (m.group(1), int(m.group(2)))
+        if o.type == "MESH" and o.data is not None and len(o.data.vertices) >= 6:
+            donors[key] = o
+        elif o.type == "EMPTY" or (o.type == "MESH" and (o.data is None or len(o.data.vertices) == 0)):
+            holes[key] = o
+    if not donors or not holes:
+        return 0
+
+    def _ctr_w(o):
+        me = getattr(o, "data", None)
+        vs = getattr(me, "vertices", None) if me is not None else None
+        if vs and len(vs):
+            mw = o.matrix_world
+            acc = Vector((0.0, 0.0, 0.0))
+            for v in vs:
+                acc = acc + (mw @ v.co)
+            return acc / len(vs)
+        return o.matrix_world.translation.copy()
+
+    def _maxdim_w(o):
+        mn = [1e18] * 3
+        mx = [-1e18] * 3
+        mw = o.matrix_world
+        for v in o.data.vertices:
+            w = mw @ v.co
+            for k in range(3):
+                if w[k] < mn[k]:
+                    mn[k] = w[k]
+                if w[k] > mx[k]:
+                    mx[k] = w[k]
+        return max(mx[k] - mn[k] for k in range(3))
+
+    # compact donors only — never instance a still-scrambled conglomerate
+    good = {k: o for k, o in donors.items() if _maxdim_w(o) <= 1.2}
+    if not good:
+        return 0
+    # occupancy map: a REAL wheel mesh may already sit at a station under a WRONG name (Otomatic
+    # G12 decodes as a non-Roue-named mesh; the later rebind pass renames it). Double-filling that
+    # station makes a duplicate AND breaks the rebind (it then consumes the elevator empty — the
+    # instance's parent — dropping the instance to the origin). Collect every compact wheel-sized
+    # mesh centroid; a hole whose station is already occupied is skipped.
+    occupied: List[Vector] = []
+    for o in objs:
+        if o.type != "MESH" or o.data is None:
+            continue
+        nv = len(o.data.vertices)
+        if nv < 6 or nv > 2500:
+            continue
+        if _maxdim_w(o) > 1.2:
+            continue
+        occupied.append(_ctr_w(o))
+    # the unit's wheel row (median |Y| of the real wheels) — the sanity yardstick for every
+    # fill target, so a FALLEN placeholder/elevator pair (both at the origin) can never pass.
+    import statistics as _st_fw
+    row_y = _st_fw.median([abs(_ctr_w(o).y) for o in good.values()])
+    if row_y < 0.4:
+        return 0  # degenerate wheel row -> don't trust any fill target
+    filled = 0
+    import os as _os_fw
+    _fw_dbg = bool(_os_fw.environ.get("WARNO_FILL_DEBUG"))
+    for key, ph in list(holes.items()):
+        side, num = key
+        target = ph.matrix_world.translation.copy()
+        # only fill at a TRUSTED station. Primary: the placeholder itself sits near its own
+        # elevator AND on the wheel row. Fallback (M60A1: placeholder FELL to the origin but the
+        # elevator still marks the station): use the elevator, Y snapped onto the wheel row.
+        # Anything else (both fallen, elevator missing, off-row) is left for the rebind pass.
+        elev = elevs.get(key)
+        if _fw_dbg:
+            print("FILLDBG %s%d ph_type=%s target=(%.2f,%.2f,%.2f) elev=%s dist=%s" % (
+                side.upper(), num, ph.type,
+                target.x, target.y, target.z,
+                ("(%.2f,%.2f,%.2f)" % (elev.x, elev.y, elev.z)) if elev else "None",
+                ("%.2f" % (target - elev).length) if elev else "-"), flush=True)
+        if elev is None:
+            continue
+        ph_ok = (target - elev).length <= 0.6 and abs(abs(target.y) - row_y) <= 0.3
+        if not ph_ok:
+            elev_ok = abs(abs(elev.y) - row_y) <= 0.35 and elev.length > 0.8
+            if not elev_ok:
+                continue
+            target = Vector((elev.x, (row_y if elev.y >= 0.0 else -row_y), elev.z))
+        if any((c - target).length <= 0.45 for c in occupied):
+            if _fw_dbg:
+                print("FILLDBG %s%d SKIP: station already occupied by a real wheel mesh" % (side.upper(), num), flush=True)
+            continue
+        donor = good.get(("g" if side == "d" else "d", num))
+        mirrored = donor is not None
+        if donor is None:
+            # nearest donor in the same Z-row (either side): road wheels vs top rollers differ in Z
+            cands = []
+            for k2, o2 in good.items():
+                c2 = _ctr_w(o2)
+                if abs(c2.z - target.z) <= 0.15:
+                    cands.append((abs(c2.x - target.x), k2[0] != side, k2, o2))
+            if not cands:
+                continue
+            cands.sort(key=lambda t: (t[0], t[1]))
+            donor = cands[0][3]
+            mirrored = cands[0][1]
+        dctr = _ctr_w(donor)
+        name = str(ph.name)
+        parent = ph.parent
+        try:
+            bpy.data.objects.remove(ph, do_unlink=True)
+        except Exception:
+            continue
+        new = bpy.data.objects.new(name, donor.data)  # shared datablock = instance
+        linked = False
+        for coll in list(getattr(donor, "users_collection", []) or []):
+            try:
+                coll.objects.link(new)
+                linked = True
+                break
+            except Exception:
+                continue
+        if not linked:
+            try:
+                collection.objects.link(new)
+            except Exception:
+                bpy.data.objects.remove(new, do_unlink=True)
+                continue
+        new.matrix_world = donor.matrix_world.copy()
+        if mirrored:
+            rot = Matrix.Translation(dctr) @ Matrix.Rotation(math.pi, 4, "Z") @ Matrix.Translation(-dctr)
+            new.matrix_world = rot @ new.matrix_world
+        c_now = _ctr_w(new)
+        mw = new.matrix_world.copy()
+        mw.translation = mw.translation + (target - c_now)
+        new.matrix_world = mw
+        # keep the donor's shading (the named auto-smooth NODES modifier is per-object)
+        for md in donor.modifiers:
+            try:
+                nm = new.modifiers.new(md.name, md.type)
+                if md.type == "NODES" and getattr(md, "node_group", None) is not None:
+                    nm.node_group = md.node_group
+            except Exception:
+                pass
+        if parent is not None:
+            keep = new.matrix_world.copy()
+            try:
+                new.parent = parent
+                new.matrix_world = keep
+            except Exception:
+                pass
+        try:
+            if isinstance(imported_objects, list):
+                imported_objects.append(new)
+        except Exception:
+            pass
+        try:
+            occupied.append(Vector(target))
+        except Exception:
+            pass
+        filled += 1
+    # TWIN-SYNTH: an ordinal with real geometry on ONE side and NO usable node on the other
+    # (C-13/60: Roue_D8 exists, Roue_G8 was never emitted / its placeholder fell -> a visible
+    # gap in the left row). Instance the twin at its exact Y-mirror, provided the station is free.
+    have: Dict[Tuple[str, int], bpy.types.Object] = {}
+    for o in list(getattr(collection, "all_objects", []) or []):
+        m = rx.fullmatch(_norm_low(getattr(o, "name", "")))
+        if m and o.type == "MESH" and o.data is not None and len(o.data.vertices) >= 6:
+            have[(m.group(1), int(m.group(2)))] = o
+    for (side, num), donor in list(have.items()):
+        tkey = ("g" if side == "d" else "d", num)
+        if tkey in have:
+            continue
+        if _fw_dbg:
+            try:
+                _dc = _ctr_w(donor)
+                print("SYNTHDBG %s%d->%s%d donor_ctr=(%.2f,%.2f,%.2f) maxdim=%.2f row_y=%.2f in_holes=%s" % (
+                    side.upper(), num, tkey[0].upper(), num, _dc.x, _dc.y, _dc.z,
+                    _maxdim_w(donor), row_y, tkey in holes), flush=True)
+            except Exception:
+                pass
+        ph2 = holes.get(tkey)
+        if ph2 is not None:
+            # an UNFILLED (fallen) placeholder may still hold the twin's name. Check it is alive
+            # (a FILLED hole's placeholder is a dead ref -> that station is handled). It is only
+            # CONSUMED further down, after every check passes — removing it early would rob the
+            # later rebind pass of its anchor (the Otomatic G12 real wheel is renamed through it).
+            try:
+                _ = ph2.name
+            except Exception:
+                continue  # placeholder was consumed by the fill -> station handled
+        try:
+            if _maxdim_w(donor) > 1.2:
+                continue
+        except Exception:
+            continue
+        dctr = _ctr_w(donor)
+        if abs(abs(dctr.y) - row_y) > 0.35:
+            continue  # donor itself off the wheel row -> don't mirror it
+        target = Vector((dctr.x, -dctr.y, dctr.z))
+        if any((c - target).length <= 0.45 for c in occupied):
+            continue  # a real wheel (possibly mis-named, rebind renames it later) sits here
+        if ph2 is not None:
+            try:
+                bpy.data.objects.remove(ph2, do_unlink=True)
+            except Exception:
+                continue
+        name = "Roue_%s%d" % (tkey[0].upper(), int(num))
+        if bpy.data.objects.get(name) is not None:
+            continue
+        new = bpy.data.objects.new(name, donor.data)
+        linked = False
+        for coll in list(getattr(donor, "users_collection", []) or []):
+            try:
+                coll.objects.link(new)
+                linked = True
+                break
+            except Exception:
+                continue
+        if not linked:
+            try:
+                collection.objects.link(new)
+            except Exception:
+                try:
+                    bpy.data.objects.remove(new, do_unlink=True)
+                except Exception:
+                    pass
+                continue
+        new.matrix_world = donor.matrix_world.copy()
+        rot = Matrix.Translation(dctr) @ Matrix.Rotation(math.pi, 4, "Z") @ Matrix.Translation(-dctr)
+        new.matrix_world = rot @ new.matrix_world
+        c_now = _ctr_w(new)
+        mw = new.matrix_world.copy()
+        mw.translation = mw.translation + (target - c_now)
+        new.matrix_world = mw
+        for md in donor.modifiers:
+            try:
+                nm = new.modifiers.new(md.name, md.type)
+                if md.type == "NODES" and getattr(md, "node_group", None) is not None:
+                    nm.node_group = md.node_group
+            except Exception:
+                pass
+        # parent to the matching-side elevator if it exists; else to the donor's grandparent
+        # (usually the Chassis) — NEVER to the opposite-side elevator.
+        parent = bpy.data.objects.get("Roue_Elev_%s%d" % (tkey[0].upper(), int(num)))
+        if parent is None:
+            parent = getattr(getattr(donor, "parent", None), "parent", None)
+        if parent is not None:
+            keep = new.matrix_world.copy()
+            try:
+                new.parent = parent
+                new.matrix_world = keep
+            except Exception:
+                pass
+        try:
+            if isinstance(imported_objects, list):
+                imported_objects.append(new)
+        except Exception:
+            pass
+        occupied.append(target)
+        filled += 1
+    return filled
+
+
+def _rename_elevator_named_wheels(collection, is_rd_asset: bool = False) -> int:
+    """RD/SD2 only. The bone split can hand a road wheel's faces to the ELEVATOR bone, so the
+    wheel MESH imports named 'Roue_Elev_<s><n>' while the real 'Roue_<s><n>' name is held by a
+    fallen EMPTY placeholder at the origin (C-13/60 G8). The rebind pass skips it (the name
+    already starts with 'roue_'), every wheel pass then treats the mesh as an ELEVATOR position
+    and the station reads as a gap. Rename such meshes to their wheel name, consuming the fallen
+    placeholder. Runs BEFORE the declutter/snap/fill wheel passes."""
+    if not is_rd_asset:
+        return 0
+    n = 0
+    for o in list(getattr(collection, "all_objects", []) or []):
+        # each item guarded: removing a holder that appears LATER in this same snapshot leaves a
+        # dead StructRNA whose attribute access raises — skip it instead of aborting the pass.
+        try:
+            if getattr(o, "type", "") != "MESH" or o.data is None or len(o.data.vertices) < 6:
+                continue
+            m = re.fullmatch(r"roue_elev_([dg])(\d+)", _norm_low(getattr(o, "name", "")))
+            if not m:
+                continue
+            wheel_name = "Roue_%s%d" % (m.group(1).upper(), int(m.group(2)))
+            holder = bpy.data.objects.get(wheel_name)
+            if holder is not None:
+                if holder.type == "MESH" and holder.data is not None and len(holder.data.vertices) >= 6:
+                    continue  # a real wheel already owns the name -> leave both alone
+                bpy.data.objects.remove(holder, do_unlink=True)
+            o.name = wheel_name
+            n += 1
+        except Exception:
+            continue
+    return n
+
+
+def _fix_fx_named_hull(collection, is_rd_asset: bool = False) -> int:
+    """RD/SD2 only. On odd source rigs (VCC-1 TUA) the HULL's skin weights hang on an FX node
+    (fx_stress_02), so the hull MESH imports named 'Fx_*' while 'Chassis' ends up an EMPTY.
+    FX anchors never carry geometry — rename the substantial Fx_* MESH to Chassis, consuming
+    the Chassis empty (its children re-parented onto the mesh, world transforms kept)."""
+    if not is_rd_asset:
+        return 0
+    n = 0
+    for o in list(getattr(collection, "all_objects", []) or []):
+        try:
+            if o.type != "MESH" or o.data is None or len(o.data.vertices) < 300:
+                continue
+            if not _norm_low(getattr(o, "name", "")).startswith("fx_"):
+                continue
+            has_chassis_mesh = any(
+                x.type == "MESH" and x.data is not None and len(x.data.vertices) >= 6
+                and _norm_low(getattr(x, "name", "")) == "chassis"
+                for x in (getattr(collection, "all_objects", []) or [])
+            )
+            if has_chassis_mesh:
+                continue
+            holder = bpy.data.objects.get("Chassis")
+            if holder is not None and holder.type == "EMPTY":
+                if o.parent == holder:
+                    keep = o.matrix_world.copy()
+                    o.parent = holder.parent
+                    o.matrix_world = keep
+                for ch in list(holder.children):
+                    keep = ch.matrix_world.copy()
+                    ch.parent = o
+                    ch.matrix_world = keep
+                bpy.data.objects.remove(holder, do_unlink=True)
+            if bpy.data.objects.get("Chassis") is None:
+                o.name = "Chassis"
+                n += 1
+        except Exception:
+            continue
+    return n
+
+
+def _align_wheel_row_to_belt(collection, is_rd_asset: bool = False) -> float:
+    """RD/SD2 only. On some units (ITA Leopard 1A2) the resolved wheel STATIONS (elevators + the
+    wheels snapped/filled onto them) come out shifted ~1 m along X relative to the TRACK BELT —
+    the raw wheel decode is scrambled, so the station reconstruction has no absolute X reference.
+    The belt geometry is reliable (raw decoded, spans the hull), so align the whole wheel group:
+    delta = belt X-centre − road-row X-centre; if |delta| > 0.3 shift every Roue_* wheel and
+    Roue_Elev_* empty by delta (uniform, both sides — parent/child double-shift is compensated by
+    measuring each wheel's actual movement). Aligned units (Otomatic: row −1.10 vs belt −1.09)
+    are a no-op. Returns the applied delta (0.0 = untouched)."""
+    if not is_rd_asset:
+        return 0.0
+    try:
+        bpy.context.view_layer.update()
+    except Exception:
+        pass
+    objs = list(getattr(collection, "all_objects", []) or [])
+    belt_pts: List[Tuple[float, float]] = []  # (x, z)
+    for o in objs:
+        if o.type == "MESH" and o.data is not None and _norm_low(o.name).startswith("chenille_"):
+            mw = o.matrix_world
+            for v in o.data.vertices:
+                w = mw @ v.co
+                belt_pts.append((w.x, w.z))
+    if not belt_pts:
+        return 0.0
+    # centre on the BOTTOM RUN (ground contact), not the whole loop: front/rear curves are often
+    # ASYMMETRIC (M109 family: big raised front sprocket -> loop centre sits forward of the road
+    # wheels legitimately). The bottom run is where the road wheels ride.
+    belt_zmin = min(p[1] for p in belt_pts)
+    bottom_xs = [p[0] for p in belt_pts if p[1] <= belt_zmin + 0.12]
+    if len(bottom_xs) >= 20:
+        belt_cx = (min(bottom_xs) + max(bottom_xs)) / 2.0
+    else:
+        belt_cx = (min(p[0] for p in belt_pts) + max(p[0] for p in belt_pts)) / 2.0
+
+    def _ctr_x(o):
+        mw = o.matrix_world
+        acc = 0.0
+        for v in o.data.vertices:
+            acc += (mw @ v.co).x
+        return acc / max(1, len(o.data.vertices))
+
+    def _ctr_z(o):
+        mw = o.matrix_world
+        acc = 0.0
+        for v in o.data.vertices:
+            acc += (mw @ v.co).z
+        return acc / max(1, len(o.data.vertices))
+
+    wheels = [o for o in objs
+              if o.type == "MESH" and o.data is not None and len(o.data.vertices) >= 6
+              and re.fullmatch(r"roue_[dg]\d+", _norm_low(o.name))]
+    if len(wheels) < 6:
+        return 0.0
+    # road row = the lowest-Z cluster (most numerous; idler/sprocket/rollers sit higher)
+    zs = sorted(_ctr_z(o) for o in wheels)
+    zlow = zs[0]
+    row = [o for o in wheels if _ctr_z(o) <= zlow + 0.2]
+    if len(row) < 4:
+        return 0.0
+    rxs = [_ctr_x(o) for o in row]
+    row_cx = (min(rxs) + max(rxs)) / 2.0
+    delta = belt_cx - row_cx
+    if abs(delta) < 0.3:
+        return 0.0
+    # shift the elevator empties first (their wheel children follow), then top up each wheel
+    # to EXACTLY delta (covers wheels parented to Chassis or unparented).
+    before = {o.name: _ctr_x(o) for o in wheels}
+    for o in objs:
+        if o.type == "EMPTY" and re.fullmatch(r"roue_elev_[dg]\d+", _norm_low(o.name)):
+            try:
+                mw = o.matrix_world.copy()
+                mw.translation = mw.translation + Vector((delta, 0.0, 0.0))
+                o.matrix_world = mw
+            except Exception:
+                pass
+    try:
+        bpy.context.view_layer.update()
+    except Exception:
+        pass
+    for o in wheels:
+        try:
+            moved = _ctr_x(o) - before[o.name]
+            rest = delta - moved
+            if abs(rest) > 0.01:
+                mw = o.matrix_world.copy()
+                mw.translation = mw.translation + Vector((rest, 0.0, 0.0))
+                o.matrix_world = mw
+        except Exception:
+            pass
+    # carry the WHEEL-HELPER ARMATURES along: their bones sit at the same stations, and leaving
+    # them behind renders the bone cones offset rearward of the wheels. Pose == rest, so moving
+    # the armature OBJECT never deforms the belts it drives — it only relocates the rest bones.
+    for o in objs:
+        if getattr(o, "type", "") != "ARMATURE" or o.data is None:
+            continue
+        low = _norm_low(getattr(o, "name", ""))
+        is_wheel_arm = bool(re.fullmatch(r"armature_[dg]\d+", low))
+        if not is_wheel_arm:
+            try:
+                bn = [str(b.name).lower() for b in o.data.bones]
+                is_wheel_arm = bool(bn) and sum(1 for b in bn if b.startswith("roue")) >= max(1, len(bn) // 2)
+            except Exception:
+                is_wheel_arm = False
+        if not is_wheel_arm:
+            continue
+        try:
+            mw = o.matrix_world.copy()
+            mw.translation = mw.translation + Vector((delta, 0.0, 0.0))
+            o.matrix_world = mw
+        except Exception:
+            pass
+    return float(delta)
+
+
+def _swap_in_real_lod_geometry(imported_objects, collection, lod_parts, settings=None, lod_mat_by_mid=None):
+    """Reduced-LOD strategy v2: the HIGH model was imported (full rig / empties / bones / names /
+    parents / materials / fixes), and `lod_parts` carries the REAL decoded geometry of the game's
+    own _mid/_low asset (verts already rotated+dev-scaled into the same world space, tris, uvs,
+    chenille flags). Replace each high part object's MESH DATA with the LOD geometry that spatially
+    belongs to it, so the result is the true game LOD mesh wearing the high model's structure:
+      * every LOD island is assigned to the nearest high part (per-part KDTree of world verts);
+      * a chenille LOD part is split left/right and goes straight onto Chenille_Gauche/Droite;
+      * the new mesh keeps the part's material slots + UV layer name; vertex-group weights are
+        transferred nearest-vertex from the old mesh so rigged parts (track belts) stay deformed;
+      * parts that receive no LOD geometry keep their high mesh (tiny fittings — negligible tris);
+      * `lod_mat_by_mid` maps a LOD material id -> a ready bpy Material built from the LOD's OWN
+        texture (a _mid/_low references its own atlas with matching UVs); a swapped object gets
+        the majority-fragment LOD material so its UVs sample the right texture.
+    Returns (swapped_part_count, lod_triangle_count, swapped_object_names).
+    On (0, _, _) the caller falls back to decimate."""
+    from mathutils import kdtree as _kdt
+    lod_mat_by_mid = lod_mat_by_mid or {}
+    objs = [o for o in (getattr(collection, "all_objects", []) or [])
+            if getattr(o, "type", "") == "MESH" and o.data is not None and len(o.data.vertices) > 0]
+    if not objs or not lod_parts:
+        return (0, 0, set())
+    try:
+        bpy.context.view_layer.update()
+    except Exception:
+        pass
+    part_kd = []
+    for o in objs:
+        mw = o.matrix_world
+        vs = o.data.vertices
+        step = max(1, len(vs) // 400)
+        pts = [mw @ vs[i].co for i in range(0, len(vs), step)]
+        kd = _kdt.KDTree(len(pts))
+        for i, p in enumerate(pts):
+            kd.insert(p, i)
+        kd.balance()
+        part_kd.append((o, kd))
+    belts = {"left": None, "right": None}
+    for o in objs:
+        nl = _norm_low(getattr(o, "name", ""))
+        if nl.startswith("chenille_gauche") and belts["left"] is None:
+            belts["left"] = o
+        elif nl.startswith("chenille_droite") and belts["right"] is None:
+            belts["right"] = o
+
+    frags: Dict[Any, List[Tuple[List, List, List, int]]] = {}
+
+    def _add_frag(obj, verts, uvs, tris, mid=-1):
+        used = sorted({i for t in tris for i in t})
+        remap = {vi: k for k, vi in enumerate(used)}
+        fverts = [verts[i] for i in used]
+        fuvs = [uvs[i] for i in used]
+        ftris = [(remap[a], remap[b], remap[c]) for (a, b, c) in tris]
+        frags.setdefault(obj, []).append((fverts, fuvs, ftris, int(mid)))
+
+    def _nearest_obj(sample_pts):
+        best = None
+        best_d = 1e30
+        for o, kd in part_kd:
+            tot = 0.0
+            for p in sample_pts:
+                hit = kd.find(p)
+                tot += (hit[2] if hit and hit[2] is not None else 1e6)
+            d = tot / max(1, len(sample_pts))
+            if d < best_d:
+                best_d = d
+                best = o
+        return best
+
+    for part in lod_parts:
+        verts = part.get("verts") or []
+        uvs = part.get("uv") or []
+        tris = [tuple(map(int, t)) for t in (part.get("tris") or []) if len(t) == 3]
+        pmid = int(part.get("mid", -1))
+        if not verts or not tris:
+            continue
+        if part.get("chenille") and (belts["left"] is not None or belts["right"] is not None):
+            try:
+                sides = _split_track_by_side(tris, verts)
+            except Exception:
+                sides = {}
+            handled = False
+            for k in ("left", "right"):
+                st = sides.get(k) or []
+                if st and belts[k] is not None:
+                    _add_frag(belts[k], verts, uvs, [tuple(map(int, t)) for t in st], pmid)
+                    handled = True
+            if handled:
+                continue
+        # connected-component islands over shared vertices
+        parent = list(range(len(verts)))
+
+        def _find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for (a, b, c) in tris:
+            ra, rb, rc = _find(a), _find(b), _find(c)
+            if rb != ra:
+                parent[rb] = ra
+            if rc != ra:
+                parent[rc] = ra
+        by_root: Dict[int, List[int]] = {}
+        for ti, t in enumerate(tris):
+            by_root.setdefault(_find(t[0]), []).append(ti)
+        for tlist in by_root.values():
+            island_tris = [tris[ti] for ti in tlist]
+            vset = sorted({i for t in island_tris for i in t})
+            step = max(1, len(vset) // 24)
+            samples = [Vector(verts[vset[i]]) for i in range(0, len(vset), step)]
+            target = _nearest_obj(samples)
+            if target is None:
+                continue
+            _add_frag(target, verts, uvs, island_tris, pmid)
+
+    swapped = 0
+    total_tris = 0
+    swapped_names: set = set()
+    for obj, flist in frags.items():
+        verts_all: List[Tuple[float, float, float]] = []
+        uvs_all: List[Tuple[float, float]] = []
+        tris_all: List[Tuple[int, int, int]] = []
+        mid_tris: Dict[int, int] = {}
+        for (fv, fu, ft, fmid) in flist:
+            off = len(verts_all)
+            verts_all.extend(fv)
+            uvs_all.extend(fu)
+            tris_all.extend([(a + off, b + off, c + off) for (a, b, c) in ft])
+            mid_tris[fmid] = mid_tris.get(fmid, 0) + len(ft)
+        if len(tris_all) < 2:
+            continue
+        old = obj.data
+        mwi = obj.matrix_world.inverted()
+        # capture the old mesh's weights (world-space nearest-vertex transfer source)
+        wtransfer = None
+        if obj.vertex_groups and len(old.vertices):
+            kd = _kdt.KDTree(len(old.vertices))
+            mw = obj.matrix_world
+            oldw = []
+            for i, v in enumerate(old.vertices):
+                kd.insert(mw @ v.co, i)
+                oldw.append([(int(g.group), float(g.weight)) for g in v.groups])
+            kd.balance()
+            wtransfer = (kd, oldw)
+        me = bpy.data.meshes.new(str(old.name) + "_lod")
+        me.from_pydata([tuple(mwi @ Vector(p)) for p in verts_all], [], [tuple(t) for t in tris_all])
+        try:
+            me.validate(verbose=False)
+        except Exception:
+            pass
+        try:
+            uvname = old.uv_layers[0].name if len(old.uv_layers) else "UVMap"
+        except Exception:
+            uvname = "UVMap"
+        try:
+            uvl = me.uv_layers.new(name=uvname)
+            for li, lp in enumerate(me.loops):
+                uvl.data[li].uv = uvs_all[lp.vertex_index]
+        except Exception:
+            pass
+        # the LOD's own material (its UVs sample the LOD's own texture/atlas); fall back to
+        # the high part's materials when no LOD material was resolved for the majority mid.
+        lod_mat = None
+        if mid_tris and lod_mat_by_mid:
+            best_mid = max(mid_tris.items(), key=lambda kv: kv[1])[0]
+            lod_mat = lod_mat_by_mid.get(int(best_mid))
+        try:
+            if lod_mat is not None:
+                me.materials.append(lod_mat)
+            else:
+                for m in old.materials:
+                    me.materials.append(m)
+        except Exception:
+            pass
+        try:
+            for p in me.polygons:
+                p.use_smooth = True
+        except Exception:
+            pass
+        obj.data = me
+        if wtransfer is not None:
+            kd, oldw = wtransfer
+            mw = obj.matrix_world
+            groups = obj.vertex_groups
+            gmax = len(groups)
+            for i, v in enumerate(me.vertices):
+                hit = kd.find(mw @ v.co)
+                if not hit or hit[1] is None:
+                    continue
+                for (gi, w) in oldw[int(hit[1])]:
+                    if 0 <= gi < gmax and w > 0.0:
+                        try:
+                            groups[gi].add([i], w, "REPLACE")
+                        except Exception:
+                            pass
+        try:
+            if old.users == 0:
+                bpy.data.meshes.remove(old)
+        except Exception:
+            pass
+        swapped += 1
+        total_tris += len(tris_all)
+        swapped_names.add(str(obj.name))
+    return (swapped, total_tris, swapped_names)
+
+
+def _fix_rd_glass_vitre(collection, is_rd_asset: bool = False) -> int:
+    """RD/SD2 only. WARNO glass convention for the 'vitre' (window/canopy) material:
+      * Base Color  = the unit's MAIN BODY diffuse (e.g. UH1H_D), NOT the vitre texture.
+      * Alpha       = the vitre texture used as a SEPARATE alpha map -- a Non-Color image whose
+                      filename ends in '_A', its COLOR output wired into BSDF Alpha (BLEND).
+    The decoder gives the vitre material its own 'vitre_D' diffuse (so a naive setup puts the glass
+    texture in Base Color, which is wrong + gives WARNO no alpha map). Here we repoint Base Color at
+    the body diffuse, duplicate the vitre texture to a sibling '*_A.png', set it Non-Color, and wire
+    its Color -> Alpha. WARNO then imports the glass with the alpha map it needs. WARNO units never
+    name a texture 'vitre' -> nothing else is touched."""
+    if not is_rd_asset:
+        return 0
+    import os as _os, shutil as _shutil
+    objs = [o for o in (getattr(collection, "all_objects", []) or []) if getattr(o, "type", "") == "MESH" and o.data]
+    glass_rx = re.compile(r"(vitre|verre|glass)", re.IGNORECASE)
+
+    def _bsdf(m):
+        if not m or not getattr(m, "use_nodes", False) or m.node_tree is None:
+            return None
+        return next((n for n in m.node_tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+
+    def _bc_img(m):
+        b = _bsdf(m)
+        if b is None:
+            return None
+        bc = b.inputs.get("Base Color")
+        if bc is None or not bc.links:
+            return None
+        src = bc.links[0].from_node
+        return src.image if getattr(src, "type", "") == "TEX_IMAGE" else None
+
+    def _is_glass(m):
+        if m is None:
+            return False
+        if m.get("warno_rd_glass"):
+            return True
+        if glass_rx.search(getattr(m, "name", "") or ""):
+            return True
+        if getattr(m, "use_nodes", False) and m.node_tree is not None:
+            for n in m.node_tree.nodes:
+                if n.type == "TEX_IMAGE" and getattr(n, "image", None) and glass_rx.search(n.image.name or ""):
+                    return True
+        return False
+
+    # main body diffuse = base-color image of the LARGEST non-glass mesh material
+    body_img = None
+    best = -1
+    for o in objs:
+        nv = len(o.data.vertices)
+        for sl in o.material_slots:
+            m = sl.material
+            if m is None or _is_glass(m):
+                continue
+            img = _bc_img(m)
+            if img is None:
+                continue
+            if nv > best:
+                best = nv
+                body_img = img
+
+    # every glass material assigned to an exported mesh (those that reach the FBX)
+    gmats = []
+    for o in objs:
+        for sl in o.material_slots:
+            m = sl.material
+            if m is not None and _is_glass(m) and m not in gmats:
+                gmats.append(m)
+
+    fixed = 0
+    retired: list = []
+    for m in gmats:
+        nt = m.node_tree
+        nodes = nt.nodes
+        links = nt.links
+        # the glass texture = an image node whose name carries a glass keyword (prefer base color)
+        vimg = _bc_img(m)
+        if vimg is None or not glass_rx.search(vimg.name or ""):
+            vimg = next((n.image for n in nodes if n.type == "TEX_IMAGE" and n.image and glass_rx.search(n.image.name or "")), vimg)
+        if vimg is None:
+            vimg = next((n.image for n in nodes if n.type == "TEX_IMAGE" and n.image), None)
+        if vimg is None:
+            continue
+        # alpha map = a Non-Color sibling '*_A.png' duplicated from the glass texture
+        a_img = vimg
+        try:
+            src = bpy.path.abspath(vimg.filepath)
+            if src and _os.path.isfile(src):
+                d = _os.path.dirname(src)
+                stem, ext = _os.path.splitext(_os.path.basename(src))
+                low = stem.lower()
+                if low.endswith("_d"):
+                    astem = stem[:-2] + "_A"
+                elif low.endswith("_a"):
+                    astem = stem
+                else:
+                    astem = stem + "_A"
+                dst = _os.path.join(d, astem + ext)
+                if not _os.path.exists(dst):
+                    _shutil.copy2(src, dst)
+                a_img = bpy.data.images.load(dst, check_existing=True)
+        except Exception:
+            a_img = vimg
+        try:
+            a_img.colorspace_settings.name = "Non-Color"
+        except Exception:
+            pass
+
+        nodes.clear()
+        out = nodes.new("ShaderNodeOutputMaterial"); out.location = (560, 40)
+        bsdf = nodes.new("ShaderNodeBsdfPrincipled"); bsdf.location = (240, 40)
+        links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+        # Glass Base Color = a faint NEUTRAL tint, NOT the body diffuse. Wiring the hull texture
+        # (e.g. Chassis_D) into the glass made the vehicle's own body UV-unwrap show THROUGH the
+        # windshield (GAZ-69: the hull texture/unwrap was visible behind the glass). Real glass is a
+        # near-clear neutral pane; the vitre_A alpha below still drives transparency, so WARNO gets
+        # the exact cutout map it needs — only the visible tint changes, from "hull crap" to "glass".
+        try:
+            bsdf.inputs["Base Color"].default_value = (0.62, 0.70, 0.78, 1.0)
+        except Exception:
+            pass
+        an = nodes.new("ShaderNodeTexImage"); an.location = (-560, -140); an.image = a_img
+        try:
+            an.image.colorspace_settings.name = "Non-Color"
+        except Exception:
+            pass
+        links.new(an.outputs["Color"], bsdf.inputs["Alpha"])
+        for attr, val in (("blend_method", "BLEND"), ("shadow_method", "CLIP")):
+            if hasattr(m, attr):
+                try:
+                    setattr(m, attr, val)
+                except Exception:
+                    pass
+        if hasattr(m, "surface_render_method"):
+            try:
+                m.surface_render_method = "BLENDED"
+            except Exception:
+                pass
+        try:
+            bsdf.inputs["Roughness"].default_value = 0.1
+        except Exception:
+            pass
+        if a_img is not vimg:
+            retired.append(vimg)
+        fixed += 1
+
+    # drop the now-unused 'vitre_D' diffuse datablocks so they don't clutter the exported folder
+    for vimg in retired:
+        try:
+            if getattr(vimg, "users", 1) == 0:
+                bpy.data.images.remove(vimg)
+        except Exception:
+            pass
     return fixed
 
 
@@ -9172,6 +11541,607 @@ def _align_coaxial_rotors(collection) -> int:
     return cnt
 
 
+def _rename_rd_wheels_to_skeleton(collection, is_rd_asset: bool) -> int:
+    """RD wheeled units (e.g. NASAMS) often carry the wheel geometry under a NON-wheel bone
+    (aa_1_1 / canon_01 / axe_canon_01) so the wheel MESH is mis-named, while the SKELETON carries
+    the real 'Roue_*' bone at the EXACT wheel position. Bind each wheel-shaped mesh that is NOT
+    already 'Roue_*' to the nearest unused 'Roue_*' skeleton empty by position and adopt its real
+    name; the redundant empty is consumed so the wheel ends up a single mesh named 'Roue_*' like
+    every other RD wheeled unit. RD/SD2 only -> WARNO untouched."""
+    if not is_rd_asset:
+        return 0
+    objs = list(getattr(collection, "all_objects", []) or [])
+    roue_rx = re.compile(r"^roue_", re.IGNORECASE)
+    # Capture each anchor's NAME + POSITION up front (and keep the obj ref + a 'used' flag). NEVER
+    # read a live empty's .name in the match loop — once we remove an empty its StructRNA is dead.
+    anchors = []  # [{name, pos, obj, used}]
+    taken = set()  # anchor names already occupied by a correctly-named wheel mesh
+    for o in objs:
+        low = _norm_low(getattr(o, "name", ""))
+        if getattr(o, "type", "") == "EMPTY" and roue_rx.match(low):
+            anchors.append({"name": o.name, "pos": o.matrix_world.translation.copy(), "obj": o, "used": False})
+        elif getattr(o, "type", "") == "MESH" and roue_rx.match(low):
+            taken.add(low)
+    if not anchors:
+        return 0
+    # iterate a SNAPSHOT of mesh objects only — we delete empties below, and re-touching a deleted
+    # object in the loop would raise 'StructRNA removed'. Meshes are never deleted here.
+    mesh_objs = [o for o in objs if getattr(o, "type", "") == "MESH"]
+    cnt = 0
+    for o in mesh_objs:
+        if o.data is None or not len(o.data.vertices):
+            continue
+        low = _norm_low(getattr(o, "name", ""))
+        if (roue_rx.match(low) or "chenille" in low or "chain" in low
+                or low.startswith("chassis") or low.startswith("mainbody")):
+            continue
+        ps = [o.matrix_world @ v.co for v in o.data.vertices]
+        cen = Vector((0.0, 0.0, 0.0))
+        for p in ps:
+            cen += p
+        cen /= len(ps)
+        d = [max(p[i] for p in ps) - min(p[i] for p in ps) for i in range(3)]
+        if max(d) > 3.0:  # body / launcher / large part: not a single wheel
+            continue
+        best = None
+        bestd = 0.5
+        for a in anchors:
+            if a["used"] or _norm_low(a["name"]) in taken:
+                continue
+            dist = (cen - a["pos"]).length
+            if dist < bestd:
+                bestd = dist
+                best = a
+        if best is None:
+            continue
+        best["used"] = True
+        target = best["name"]
+        try:
+            bpy.data.objects.remove(best["obj"], do_unlink=True)  # free the name + drop redundant empty
+        except Exception:
+            pass
+        try:
+            o.name = target
+            cnt += 1
+        except Exception:
+            pass
+    return cnt
+
+
+def _split_rd_launcher(collection, is_rd_asset: bool) -> int:
+    """RD SAM/AA units weld the missile LAUNCHER into the Chassis (it shares the chassis bone AND
+    the body material, and the body is a cloud of disconnected islands). Separate the launcher
+    geometry into its own 'Launcher' object by clustering the Chassis connected-component islands
+    whose centroid sits near the launcher BONES (aa_*/lanceur/rampe/missile/kokon). Conservative:
+    needs >=3 launcher bones; only islands within 1.3 m of one are taken; no-op otherwise. RD/SD2
+    only -> WARNO untouched. UVs, materials, weights and the armature modifier are preserved."""
+    if not is_rd_asset:
+        return 0
+    import bmesh
+    from collections import defaultdict
+    objs = list(getattr(collection, "all_objects", []) or [])
+    # NOTE: 'lance_' is DELIBERATELY excluded -> it matches smoke dischargers ('lance_fumigene_*')
+    # which ship in banks of 3-8 on most tanks; 'lanceur' (real launcher) is kept. '^aa_' is generic
+    # (AA-fire markers exist on gun tanks too) so it CANNOT stand alone -> the substantial+elevated
+    # guards below are what actually keep this from carving a bogus launcher on a non-SAM unit.
+    launch_rx = re.compile(r"(^aa_|lanceur|rampe|missile|kokon|launcher)", re.IGNORECASE)
+    anchors = [o.matrix_world.translation.copy() for o in objs
+               if getattr(o, "type", "") == "EMPTY" and launch_rx.search(_norm_low(getattr(o, "name", "")))]
+    if len(anchors) < 3:
+        return 0
+    chassis = next((o for o in objs if getattr(o, "type", "") == "MESH"
+                    and _norm_low(getattr(o, "name", "")) in ("chassis", "mainbody")), None)
+    if chassis is None or chassis.data is None or len(chassis.data.polygons) < 50:
+        return 0
+    me = chassis.data
+    mw = chassis.matrix_world
+    # union-find connected components by shared vertices (keep the bmesh alive for the split)
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    bm.verts.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    parent = list(range(len(bm.verts)))
+
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for e in bm.edges:
+        ra, rb = _find(e.verts[0].index), _find(e.verts[1].index)
+        if ra != rb:
+            parent[ra] = rb
+    csum = defaultdict(lambda: Vector((0.0, 0.0, 0.0)))
+    ccnt = defaultdict(int)
+    zmin, zmax = 1.0e9, -1.0e9
+    for v in bm.verts:
+        c = _find(v.index)
+        w = mw @ v.co
+        csum[c] = csum[c] + w
+        ccnt[c] += 1
+        if w.z < zmin:
+            zmin = w.z
+        if w.z > zmax:
+            zmax = w.z
+    launcher_comps = set(c for c in ccnt
+                         if any((csum[c] / ccnt[c] - a).length <= 1.3 for a in anchors))
+    if not launcher_comps:
+        bm.free()
+        return 0
+    launcher_faces = [f for f in bm.faces if _find(f.verts[0].index) in launcher_comps]
+    nlf, ntot = len(launcher_faces), len(bm.faces)
+    # A REAL launcher is a SUBSTANTIAL, ELEVATED chunk of the body — not a few low hull-detail
+    # islands that happen to sit near a stray aa_*/ramp marker (the over-broad-regex regression), and
+    # not (almost) the whole body. These three gates are what protect non-SAM gun/AA tanks whose
+    # aa_N_M fire markers or smoke mounts land near welded hull geometry from being mis-carved.
+    lz = sum(csum[c].z for c in launcher_comps) / max(1, sum(ccnt[c] for c in launcher_comps))
+    if (nlf < max(150, int(0.05 * ntot)) or nlf > int(0.55 * ntot)
+            or lz < (zmin + zmax) / 2.0):
+        bm.free()
+        return 0  # too small / too large / sits low -> not a clean elevated launcher, leave welded
+    # --- build the Launcher mesh in pure bmesh (bpy.ops.mesh.separate is unreliable headless and
+    # silently kept only one island). Copy UVs, per-face material index, and vertex-group weights. ---
+    src_uv = bm.loops.layers.uv.active
+    src_def = bm.verts.layers.deform.active
+    lbm = bmesh.new()
+    dst_uv = lbm.loops.layers.uv.new(src_uv.name) if src_uv else None
+    dst_def = lbm.verts.layers.deform.new() if src_def else None
+    vmap = {}
+    for f in launcher_faces:
+        nverts = []
+        for v in f.verts:
+            nv = vmap.get(v.index)
+            if nv is None:
+                nv = lbm.verts.new(v.co)
+                if dst_def is not None:
+                    for gi, w in v[src_def].items():
+                        nv[dst_def][gi] = w
+                vmap[v.index] = nv
+            nverts.append(nv)
+        try:
+            nf = lbm.faces.new(nverts)
+        except ValueError:
+            continue  # duplicate face -> skip
+        nf.material_index = f.material_index
+        if dst_uv is not None:
+            for sloop, dloop in zip(f.loops, nf.loops):
+                dloop[dst_uv].uv = sloop[src_uv].uv.copy()
+    lmesh = bpy.data.meshes.new("Launcher")
+    lbm.to_mesh(lmesh)
+    lbm.free()
+    for m in me.materials:
+        lmesh.materials.append(m)
+    lmesh.update()
+    lobj = bpy.data.objects.new("Launcher", lmesh)
+    # vertex groups must be recreated in the SAME index order so the copied weights stay valid
+    for vg in chassis.vertex_groups:
+        lobj.vertex_groups.new(name=vg.name)
+    linked = False
+    for coll in chassis.users_collection:
+        coll.objects.link(lobj)
+        linked = True
+    if not linked:
+        collection.objects.link(lobj)
+    lobj.parent = chassis
+    lobj.matrix_world = mw.copy()
+    # copy the armature modifier(s) so the launcher still deforms with the rig
+    for mod in chassis.modifiers:
+        if mod.type == "ARMATURE":
+            nm = lobj.modifiers.new(name=mod.name, type="ARMATURE")
+            nm.object = mod.object
+            try:
+                nm.use_vertex_groups = mod.use_vertex_groups
+                nm.use_bone_envelopes = mod.use_bone_envelopes
+            except Exception:
+                pass
+    # remove the launcher faces (and their now-orphan verts) from the chassis
+    bmesh.ops.delete(bm, geom=launcher_faces, context="FACES")
+    bm.to_mesh(me)
+    bm.free()
+    me.update()
+    try:
+        import os as _os
+        if _os.environ.get("WARNO_LAUNCHDBG"):
+            print("LAUNCHDBG anchors=%d launcher_comps=%d launcher_faces=%d launcher_verts=%d chassis_verts=%d"
+                  % (len(anchors), len(launcher_comps), len(launcher_faces), len(lmesh.vertices), len(me.vertices)),
+                  flush=True)
+    except Exception:
+        pass
+    return 1
+
+
+def _split_rd_radar_from_chassis(collection, is_rd_asset: bool) -> int:
+    """RD/SD2 only. A radar whose bone is the plain single-token 'radar' classifies to Chassis
+    (and the preserved-raw-name promotion needs >=2 name tokens, so it skips it too) -> the
+    SEARCH RADAR of AA units welds into the hull: it neither turns with the turret nor spins on
+    its mast (Otomatic: the 2.2 m bar on the turret mast; its tracking DISH has its own
+    'radar_01' bone and separates fine). The skeleton still carries the truth: a 'Radar*' EMPTY
+    stands exactly on the radar's rotation axis, parented under its turret. Move every
+    Chassis/MainBody island whose centroid sits within 0.9 m of a radar empty (and not below the
+    mast top) into its own mesh object parented to that empty, origin ON the empty (= the spin
+    axis). UVs, materials, weights and the armature modifier are preserved. Units without radar
+    bones: no-op; WARNO never reaches this (preset-gated)."""
+    if not is_rd_asset:
+        return 0
+    import bmesh as _bm
+    from collections import defaultdict as _dd
+    try:
+        bpy.context.view_layer.update()
+    except Exception:
+        pass
+    objs = list(getattr(collection, "all_objects", []) or [])
+    anchors: List[Tuple[str, Any, Vector]] = []
+    for o in objs:
+        if getattr(o, "type", "") != "EMPTY":
+            continue
+        low = _norm_low(getattr(o, "name", ""))
+        if re.fullmatch(r"radar(?:[_\.\d].*)?", low):
+            anchors.append((str(o.name), o, o.matrix_world.translation.copy()))
+    if not anchors:
+        return 0
+    moved = 0
+    for ch in [o for o in objs if getattr(o, "type", "") == "MESH"
+               and _norm_low(getattr(o, "name", "")) in ("chassis", "mainbody")
+               and o.data is not None and len(o.data.polygons) >= 50]:
+        me = ch.data
+        mw = ch.matrix_world
+        bm = _bm.new()
+        bm.from_mesh(me)
+        bm.verts.ensure_lookup_table()
+        parent = list(range(len(bm.verts)))
+
+        def _find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for e in bm.edges:
+            ra, rb = _find(e.verts[0].index), _find(e.verts[1].index)
+            if ra != rb:
+                parent[ra] = rb
+        csum = _dd(lambda: Vector((0.0, 0.0, 0.0)))
+        ccnt = _dd(int)
+        for v in bm.verts:
+            r = _find(v.index)
+            csum[r] = csum[r] + (mw @ v.co)
+            ccnt[r] += 1
+        # island -> nearest radar anchor (must sit ON the mast: close AND not below the anchor zone)
+        roots_by_anchor: Dict[int, set] = _dd(set)
+        for r in ccnt:
+            c = csum[r] / ccnt[r]
+            best_i, best_d = -1, 1.0e9
+            for i, (_nm, _obj, ap) in enumerate(anchors):
+                d = (c - ap).length
+                if d < best_d:
+                    best_d, best_i = d, i
+            if best_i < 0 or best_d > 0.9:
+                continue
+            if c.z < anchors[best_i][2].z - 0.8:
+                continue  # below the mast head -> hull detail, not the radar
+            roots_by_anchor[best_i].add(r)
+        if not roots_by_anchor:
+            bm.free()
+            continue
+        bm.faces.ensure_lookup_table()
+        src_uv = bm.loops.layers.uv.active
+        src_def = bm.verts.layers.deform.active
+        remove_faces: List[Any] = []
+        for ai in sorted(roots_by_anchor.keys()):
+            roots = roots_by_anchor[ai]
+            faces = [f for f in bm.faces if _find(f.verts[0].index) in roots]
+            if not faces:
+                continue
+            # first free Radar_NN object name (the dish usually owns Radar_01 already)
+            name = ""
+            for nn in range(1, 100):
+                cand = "Radar_%02d" % nn
+                if bpy.data.objects.get(cand) is None:
+                    name = cand
+                    break
+            if not name:
+                continue
+            nbm = _bm.new()
+            dst_uv = nbm.loops.layers.uv.new(src_uv.name) if src_uv else None
+            dst_def = nbm.verts.layers.deform.new() if src_def else None
+            vmap: Dict[int, Any] = {}
+            for f in faces:
+                nv_list = []
+                for v in f.verts:
+                    nv = vmap.get(v.index)
+                    if nv is None:
+                        nv = nbm.verts.new(v.co)
+                        if dst_def is not None:
+                            for gi, wgt in v[src_def].items():
+                                nv[dst_def][gi] = wgt
+                        vmap[v.index] = nv
+                    nv_list.append(nv)
+                try:
+                    nf = nbm.faces.new(nv_list)
+                except ValueError:
+                    continue
+                nf.material_index = f.material_index
+                if dst_uv is not None:
+                    for sl, dl in zip(f.loops, nf.loops):
+                        dl[dst_uv].uv = sl[src_uv].uv.copy()
+            nmesh = bpy.data.meshes.new(name)
+            nbm.to_mesh(nmesh)
+            nbm.free()
+            for mslot in me.materials:
+                nmesh.materials.append(mslot)
+            nmesh.update()
+            nobj = bpy.data.objects.new(name, nmesh)
+            for vg in ch.vertex_groups:
+                nobj.vertex_groups.new(name=vg.name)
+            linked = False
+            for coll in ch.users_collection:
+                try:
+                    coll.objects.link(nobj)
+                    linked = True
+                    break
+                except Exception:
+                    continue
+            if not linked:
+                collection.objects.link(nobj)
+            nobj.matrix_world = mw.copy()
+            for md in ch.modifiers:
+                if md.type in ("ARMATURE", "NODES"):
+                    try:
+                        nm2 = nobj.modifiers.new(md.name, md.type)
+                        if md.type == "ARMATURE":
+                            nm2.object = md.object
+                            nm2.use_vertex_groups = md.use_vertex_groups
+                        elif getattr(md, "node_group", None) is not None:
+                            nm2.node_group = md.node_group
+                    except Exception:
+                        pass
+            anchor_obj = anchors[ai][1]
+            try:
+                bpy.context.view_layer.update()
+            except Exception:
+                pass
+            try:
+                _set_object_origin_world(nobj, anchors[ai][2].copy())
+            except Exception:
+                pass
+            try:
+                keep = nobj.matrix_world.copy()
+                nobj.parent = anchor_obj
+                nobj.matrix_world = keep
+            except Exception:
+                pass
+            remove_faces.extend(faces)
+            moved += 1
+        if remove_faces:
+            _bm.ops.delete(bm, geom=remove_faces, context="FACES")
+            bm.to_mesh(me)
+            me.update()
+        bm.free()
+    return moved
+
+
+def _weld_rd_antennas_to_nearest_part(collection, is_rd_asset: bool) -> int:
+    """RD/SD2 only. The antenna peel is disabled (antennas stay welded), but a thin antenna/mast
+    island left inside the Chassis actually belongs to whatever part it is MOUNTED ON — on a tank
+    that is the TURRET, not the hull. For each tall-thin island in the Chassis, find the part whose
+    surface is nearest to the island's BASE; if a sibling part (Tourelle/Launcher/...) is closer to
+    the base than the chassis body is (and within 0.5 m), move that island into the sibling mesh,
+    carrying its UVs + material and re-weighting it to the sibling's bone so it follows that part.
+    NASAMS whip stays on the cab (chassis is nearest); a Leopard antenna moves onto the turret."""
+    if not is_rd_asset:
+        return 0
+    import bmesh
+    from collections import defaultdict, Counter
+    objs = list(getattr(collection, "all_objects", []) or [])
+    chassis = next((o for o in objs if getattr(o, "type", "") == "MESH" and o.data is not None
+                    and _norm_low(getattr(o, "name", "")) in ("chassis", "mainbody")), None)
+    if chassis is None or chassis.data is None or len(chassis.data.polygons) < 20:
+        return 0
+
+    def _is_sibling(o):
+        if o is chassis or getattr(o, "type", "") != "MESH" or o.data is None or not len(o.data.vertices):
+            return False
+        low = _norm_low(getattr(o, "name", ""))
+        return not (low.startswith("roue") or "chenille" in low or "chain" in low)
+
+    siblings = [o for o in objs if _is_sibling(o)]
+    if not siblings:
+        return 0
+    me = chassis.data
+    mw = chassis.matrix_world
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    bm.verts.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    parent = list(range(len(bm.verts)))
+
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for e in bm.edges:
+        ra, rb = _find(e.verts[0].index), _find(e.verts[1].index)
+        if ra != rb:
+            parent[ra] = rb
+    world = {v.index: (mw @ v.co) for v in bm.verts}
+    comp = defaultdict(list)
+    for v in bm.verts:
+        comp[_find(v.index)].append(v.index)
+    allw = list(world.values())
+    xs = [p.x for p in allw]; ys = [p.y for p in allw]; zs = [p.z for p in allw]
+    hull = max(((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2 + (max(zs) - min(zs)) ** 2) ** 0.5, 1.0e-3)
+    ntot = len(bm.verts)
+    antenna = {}  # comp root -> base point (world)
+    for c, vis in comp.items():
+        if len(vis) < 6 or len(vis) > 0.06 * ntot:
+            continue
+        ws = [world[i] for i in vis]
+        cxs = [p.x for p in ws]; cys = [p.y for p in ws]; czs = [p.z for p in ws]
+        dx, dy, dz = max(cxs) - min(cxs), max(cys) - min(cys), max(czs) - min(czs)
+        if dz >= 2.5 * max(dx, dy, 1.0e-6) and dz >= 0.10 * hull and max(dx, dy) <= max(0.35, 0.05 * hull):
+            antenna[c] = Vector((sum(cxs) / len(cxs), sum(cys) / len(cys), min(czs)))
+    if not antenna:
+        bm.free()
+        return 0
+    body = [world[v.index] for v in bm.verts if _find(v.index) not in antenna]
+    sibw = {o.name: [o.matrix_world @ v.co for v in o.data.vertices] for o in siblings}
+    sib_by_name = {o.name: o for o in siblings}
+    assign = defaultdict(list)  # sibling obj -> [comp roots]
+    for c, base in antenna.items():
+        d_body = min((base - p).length for p in body) if body else 1.0e9
+        near = None
+        near_d = 1.0e9
+        for o in siblings:
+            dm = min((base - p).length for p in sibw[o.name])
+            if dm < near_d:
+                near_d = dm
+                near = o
+        # Weld onto a sibling ONLY if it is clearly the MOUNT: within touching range AND decisively
+        # closer to the antenna BASE than the chassis body is. A bed post merely near a neighbouring
+        # part (near_d ~= d_body) stays on the chassis; a turret-mounted mast (base ON the turret,
+        # hull well below) moves. The 0.15 m margin separates these.
+        best = near if (near is not None and near_d < 0.5 and near_d < d_body - 0.15) else None
+        if best is not None:
+            assign[best].append(c)
+        try:
+            import os as _os
+            if _os.environ.get("WARNO_ANTDBG"):
+                print("ANTDBG base=(%.2f,%.2f,%.2f) nv=%d d_body=%.2f near=%s@%.2f -> %s"
+                      % (base.x, base.y, base.z, len(comp[c]), d_body,
+                         near.name if near else "-", near_d, best.name if best else "STAY(chassis)"), flush=True)
+        except Exception:
+            pass
+    if not assign:
+        bm.free()
+        return 0
+    c_uv = bm.loops.layers.uv.active
+    moved_faces = []
+    moved = 0
+    for sib, comps in assign.items():
+        cset = set(comps)
+        faces = [f for f in bm.faces if _find(f.verts[0].index) in cset]
+        if not faces:
+            continue
+        mat_remap = {}
+        for ci, m in enumerate(me.materials):
+            if m is None:
+                mat_remap[ci] = 0
+                continue
+            sidx = next((si for si, sm in enumerate(sib.data.materials) if sm is m), None)
+            if sidx is None:
+                sib.data.materials.append(m)
+                sidx = len(sib.data.materials) - 1
+            mat_remap[ci] = sidx
+        gc = Counter()
+        for v in sib.data.vertices:
+            for g in v.groups:
+                gc[g.group] += g.weight
+        dom = gc.most_common(1)[0][0] if gc else None
+        sbm = bmesh.new()
+        sbm.from_mesh(sib.data)
+        s_uv = sbm.loops.layers.uv.active or (sbm.loops.layers.uv.new("UVMap") if c_uv else None)
+        s_def = sbm.verts.layers.deform.verify()
+        c2s = sib.matrix_world.inverted() @ mw
+        vmap = {}
+        for f in faces:
+            nv = []
+            for v in f.verts:
+                w = vmap.get(v.index)
+                if w is None:
+                    w = sbm.verts.new(c2s @ v.co)
+                    if dom is not None:
+                        w[s_def][dom] = 1.0
+                    vmap[v.index] = w
+                nv.append(w)
+            try:
+                nf = sbm.faces.new(nv)
+            except ValueError:
+                continue
+            nf.material_index = mat_remap.get(f.material_index, 0)
+            if c_uv and s_uv:
+                for sl, dl in zip(f.loops, nf.loops):
+                    dl[s_uv].uv = sl[c_uv].uv.copy()
+        sbm.to_mesh(sib.data)
+        sbm.free()
+        sib.data.update()
+        moved_faces.extend(faces)
+        moved += len(comps)
+    if moved_faces:
+        bmesh.ops.delete(bm, geom=moved_faces, context="FACES")
+        bm.to_mesh(me)
+        me.update()
+    bm.free()
+    return moved
+
+
+def _parent_track_armatures_to_chassis(collection) -> int:
+    """Both games. SDK convention (M1_Abrams): the '_1' track armature per side (idler+sprocket
+    carrier) is PARENTED to the Chassis so it rides the hull, while the '_2' road-wheel armature
+    stays unparented. The armatures are built during the import pass, but on Fx-named-hull units
+    (M125: the hull weights hang on fx_stress_01 so the mesh imports as 'Fx_Stress_01' and only
+    a later pass renames it to Chassis) the Chassis didn't exist yet -> the '_1' armatures were
+    left parentless. Runs AFTER every hull/rename pass: parent any 'Armature_<S>1' that lacks a
+    parent onto the Chassis (keep-world). No-op when already parented or no Chassis -> safe."""
+    objs = list(getattr(collection, "all_objects", []) or [])
+    chassis = next((o for o in objs if getattr(o, "type", "") == "MESH"
+                    and _norm_low(getattr(o, "name", "")) == "chassis"), None)
+    if chassis is None:
+        return 0
+    fixed = 0
+    for o in objs:
+        if getattr(o, "type", "") != "ARMATURE":
+            continue
+        if not re.fullmatch(r"armature_[dg]1", _norm_low(getattr(o, "name", ""))):
+            continue
+        if o.parent is not None:
+            continue
+        try:
+            wm = o.matrix_world.copy()
+            o.parent = chassis
+            o.parent_type = "OBJECT"
+            o.parent_bone = ""
+            o.matrix_parent_inverse = chassis.matrix_world.inverted()
+            o.matrix_world = wm
+            fixed += 1
+        except Exception:
+            continue
+    return fixed
+
+
+def _normalize_track_modifier_names(collection) -> int:
+    """Both games. The WARNO cooker matches a track's animation modifiers BY NAME: on the SDK
+    sample assets (M1_Abrams.blend) every Chenille_* mesh carries armature modifiers named
+    EXACTLY like their armature objects ('Armature_D1', 'Armature_D2', ...), never a plain
+    'Armature' — a mis-named modifier means NO track animation in-game. Several import paths
+    (the merged-belt split, older saves) left the default 'Armature' name, so rename every
+    ARMATURE modifier on a track mesh to its bound armature object's name. Purely a rename:
+    binding, weights and deform behaviour are untouched; properly-named modifiers are no-ops."""
+    fixed = 0
+    for o in list(getattr(collection, "all_objects", []) or []):
+        if getattr(o, "type", "") != "MESH":
+            continue
+        low = _norm_low(getattr(o, "name", ""))
+        if not (low.startswith("chenille") or bool(o.get("warno_is_track_mesh"))):
+            continue
+        for mod in list(o.modifiers):
+            if mod.type != "ARMATURE" or getattr(mod, "object", None) is None:
+                continue
+            want = str(mod.object.name)
+            if str(mod.name) == want:
+                continue
+            if any(m is not mod and str(m.name) == want for m in o.modifiers):
+                continue  # never create a '.001' collision
+            try:
+                mod.name = want
+                fixed += 1
+            except Exception:
+                pass
+    return fixed
+
+
 def _split_and_weight_merged_track(imported_objects, collection) -> int:
     """Normalize track belts so Gauche=LEFT, Droite=RIGHT always match the Roue_G/Roue_D wheels,
     each belt is weighted to its own side's wheels, bound to its side armature, and carries a
@@ -9185,7 +12155,7 @@ def _split_and_weight_merged_track(imported_objects, collection) -> int:
     import bmesh
     pool = list(getattr(collection, "all_objects", []) or []) if collection is not None else list(imported_objects)
     elevs: Dict[str, List[Tuple[str, Vector]]] = {"d": [], "g": []}
-    arms: Dict[str, Any] = {"d": None, "g": None}
+    arms: Dict[str, List[Any]] = {"d": [], "g": []}
     empties: Dict[str, Any] = {}
     for o in pool:
         nl = _norm_low(getattr(o, "name", ""))
@@ -9193,8 +12163,8 @@ def _split_and_weight_merged_track(imported_objects, collection) -> int:
         if me:
             elevs[me.group(1)].append((o.name, o.matrix_world.translation.copy()))
         ma = re.fullmatch(r"armature_([dg])\d", nl)
-        if ma and getattr(o, "type", "") == "ARMATURE" and arms[ma.group(1)] is None:
-            arms[ma.group(1)] = o
+        if ma and getattr(o, "type", "") == "ARMATURE":
+            arms[ma.group(1)].append(o)
         mt = re.fullmatch(r"chenille_(droite|gauche)(_\d+)?", nl)
         if mt and getattr(o, "type", "") == "EMPTY":
             empties[mt.group(1)] = o
@@ -9254,23 +12224,30 @@ def _split_and_weight_merged_track(imported_objects, collection) -> int:
             if grp is None:
                 grp = obj.vertex_groups.new(name=best[0]); vg[best[0]] = grp
             grp.add([v.index], 1.0, "REPLACE")
-        arm = arms.get(side)
-        if arm is not None:
-            # The side carrier may have been built with use_deform=False (a merged belt carrying
+        side_arms = sorted(arms.get(side) or [], key=lambda a: str(a.name).lower())
+        if side_arms:
+            # The side carriers may have been built with use_deform=False (a merged belt carrying
             # only one side's vgroups -> the other side's wheels were non-deform), which makes the
             # modifier silently do nothing. Force the bones this belt rides deforming.
-            arm_bones = getattr(getattr(arm, "data", None), "bones", None)
-            if arm_bones is not None:
-                for bname in vg.keys():
-                    b = arm_bones.get(bname)
-                    if b is not None:
-                        b.use_deform = True
-            # Bind EXACTLY this side's armature (replace a wrong/old one left from a swapped belt).
+            for arm in side_arms:
+                arm_bones = getattr(getattr(arm, "data", None), "bones", None)
+                if arm_bones is not None:
+                    for bname in vg.keys():
+                        b = arm_bones.get(bname)
+                        if b is not None:
+                            b.use_deform = True
+            # Bind EXACTLY this side's armatures — ONE modifier PER armature, each NAMED after
+            # its armature object. The WARNO cooker matches track-animation modifiers BY NAME
+            # (SDK M1_Abrams sample: Chenille_Droite_01 carries 'Armature_D1' [idler+sprocket]
+            # + 'Armature_D2' [road wheels] modifiers, never a plain 'Armature').
+            want_ids = {id(a) for a in side_arms}
             existing = [m for m in obj.modifiers if m.type == "ARMATURE"]
-            if not (len(existing) == 1 and existing[0].object is arm):
+            if not (len(existing) == len(side_arms)
+                    and all(m.object is not None and id(m.object) in want_ids for m in existing)):
                 for m in existing:
                     obj.modifiers.remove(m)
-                m = obj.modifiers.new(name="Armature", type="ARMATURE"); m.object = arm
+                for arm in side_arms:
+                    m = obj.modifiers.new(name=str(arm.name), type="ARMATURE"); m.object = arm
 
     def _ensure_side_material(half, want, other, base_asset):
         hd = getattr(half, "data", None)
@@ -9398,6 +12375,7 @@ def _build_helper_armature(
     bone_payload: dict[str, Any],
     collection: bpy.types.Collection,
     settings: WARNOImporterSettings | None = None,
+    reduced_lod: bool = False,
 ) -> bpy.types.Object | None:
     asset_hint = ""
     for obj in imported_objects:
@@ -13897,6 +16875,16 @@ def _build_helper_armature(
                 if not changed:
                     break
 
+    # NOTE (2026-07-13): a previous version pinned as_<n>_<n> launch anchors to their own
+    # off_mat point[0], to fix FIROS_30's anchors clustering at X=-0.813. That was WRONG and is
+    # removed. Proof (F-104S, headless bisect + marker render): the DETERMINISTIC raw-scene
+    # placement yields perfect SYMMETRIC pylon pairs under the wings/fuselage
+    # (as_1_1/as_1_2 = Y -3.38/+3.41 wingtips, as_1_3/as_1_4 = -1.93/+1.95 underwing,
+    # as_1_5/as_1_6 = -0.41/+0.42, as_1_7 = 0.00 centerline, all at z -0.2..-0.78 BELOW the jet),
+    # while the off_mat point[0] scattered them onto the nose/tail and into empty space off the
+    # airframe. off_mat blocks are hash-scattered across nodes (_off_mat_stream_target_index), so
+    # point[0] is NOT a node's own anchor in general. The deterministic raw-scene transform is the
+    # authority for these anchors; leave it alone.
     track_deform_nodes = {
         _norm_low(name)
         for side_names in track_vertex_groups_by_side.values()
@@ -14226,7 +17214,7 @@ def _build_helper_armature(
             # non-origin ancestor (antenna base on the hull) instead of dropping to (0,0,0).
             # WARNO empties resolve to real positions; also gate on the RD deterministic
             # scene path so the WARNO (weighted-positions) path is byte-for-byte untouched.
-            if use_deterministic_raw_scene and _armature_is_rd and (pos is None or float(pos.length) < 0.01):
+            if (use_deterministic_raw_scene and (_armature_is_rd or reduced_lod)) and (pos is None or float(pos.length) < 0.01):
                 _walk = int(bone_parent_by_index.get(int(bidx), -1))
                 _g = 0
                 while _walk >= 0 and _g < 256:
@@ -14438,6 +17426,35 @@ def _build_helper_armature(
             rear_idx, _rear_pos = min(rows, key=lambda item: (float(item[1].x), abs(float(item[1].z)), int(item[0])))
             track_edge_helper_indices.add(int(front_idx))
             track_edge_helper_indices.add(int(rear_idx))
+    # Carrier-less skeletons (all RD + WARNO loggim_sa/hafiz/olifant): split the synthesized
+    # side carrier the way the game's own rigs do (SDK M1_Abrams reference): Armature_<S>1 =
+    # the RAISED stations (idler + sprocket + return rollers — fixed to the hull, no suspension
+    # travel; the _1 armature is parented to the Chassis), Armature_<S>2 = the ROAD-ROW stations
+    # (the suspension wheels, unparented). Split by resolved station Z: the road row is the
+    # lowest Z cluster. Degenerate layouts (fallen positions, <3 road stations, nothing raised)
+    # keep the old single-carrier behaviour (everything in _1).
+    _fb_group_by_idx: Dict[int, str] = {}
+    _fb_rows: Dict[str, List[Tuple[int, Vector]]] = defaultdict(list)
+    for bidx2 in ordered_indices:
+        raw_low2 = _norm_low(str(display_name_by_index.get(int(bidx2), "") or ""))
+        m2 = wheel_pattern.match(raw_low2)
+        if not m2:
+            continue
+        pos2 = resolved_positions.get(int(bidx2))
+        if isinstance(pos2, Vector) and float(pos2.length) >= 0.05:
+            _fb_rows[str(m2.group(1)).lower()].append((int(bidx2), pos2.copy()))
+    for _side2, rows2 in _fb_rows.items():
+        if len(rows2) < 4:
+            continue
+        _zmin = min(float(p.z) for _i, p in rows2)
+        _road = [i for i, p in rows2 if float(p.z) <= _zmin + 0.15]
+        _raised = [i for i, p in rows2 if float(p.z) > _zmin + 0.15]
+        if len(_road) >= 3 and _raised:
+            for i in _road:
+                _fb_group_by_idx[int(i)] = "armature_%s2" % _side2
+            for i in _raised:
+                _fb_group_by_idx[int(i)] = "armature_%s1" % _side2
+
     wheel_missing_carrier = 0
     for bidx in ordered_indices:
         raw = str(display_name_by_index.get(int(bidx), "")).strip()
@@ -14455,10 +17472,10 @@ def _build_helper_armature(
         if not grp:
             # A1-B: the skeleton has Roue_Elev_<side> wheels but NO Armature_<side><n> carrier
             # bone (loggim_sa / hafiz / olifant), so no track armature was ever built. Synthesize
-            # a side carrier so the rig IS created — exactly what units that have carrier bones
-            # get for free. Only fires when the real carrier is genuinely absent.
+            # side carriers so the rig IS created — exactly what units that have carrier bones
+            # get for free, split ends-vs-road per the SDK convention when the layout allows.
             wheel_missing_carrier += 1
-            grp = "armature_%s1" % side
+            grp = _fb_group_by_idx.get(int(bidx)) or ("armature_%s1" % side)
         wheel_groups.setdefault(grp, []).append((int(bidx), bool(is_deform)))
 
     created_armatures: List[bpy.types.Object] = []
@@ -14490,8 +17507,27 @@ def _build_helper_armature(
         for bidx, is_deform in entries:
             braw = str(display_name_by_index.get(int(bidx), "")).strip()
             bname = _to_pretty_name(braw)[:63] if braw else f"Bone_{int(bidx):03d}"
+            pos = resolved_positions.get(int(bidx))
+            if pos is None and reduced_lod:
+                # Reduced LOD: this deform bone has no resolved position. Walk up to the nearest
+                # ancestor that DOES, so a wheel/track weighted to it is not dragged to world origin.
+                _w = int(bone_parent_by_index.get(int(bidx), -1))
+                _gg = 0
+                while _w >= 0 and _gg < 256:
+                    _a = resolved_positions.get(int(_w))
+                    if isinstance(_a, Vector) and float(_a.length) >= 0.01:
+                        pos = _a.copy()
+                        break
+                    _w = int(bone_parent_by_index.get(int(_w), -1))
+                    _gg += 1
+                if pos is None and bool(is_deform):
+                    # No resolved position anywhere up the chain -> do NOT create an origin-anchored
+                    # deform bone (it would drag the LOD part to 0,0,0). Skip it so the part keeps its
+                    # correct decoded geometry + its centroid origin from the object-build loop.
+                    continue
+            if pos is None:
+                pos = Vector((0.0, 0.0, 0.0))  # HIGH path: byte-identical to the old (0,0,0) default
             eb = arm_data.edit_bones.new(bname)
-            pos = resolved_positions.get(int(bidx), Vector((0.0, 0.0, 0.0)))
             eb.head = pos
             eb.tail = pos + Vector((0.0, 0.0, bone_len))
             eb.use_deform = bool(is_deform)
@@ -14527,6 +17563,19 @@ def _build_helper_armature(
         if child_raw.startswith("fx_fumee_chenille_"):
             continue
         parent = node_by_bone_index.get(int(parent_idx))
+        if reduced_lod and (parent is None or parent == child):
+            # Reduced LOD: the intended parent bone has no node -> walk up to the nearest ancestor
+            # that DOES (terminates at Chassis/root) so the part is still parented (keep-world, never
+            # moves geometry) instead of being left unparented at the scene root.
+            _w = int(bone_parent_by_index.get(int(parent_idx), -1))
+            _gg = 0
+            while _w >= 0 and _gg < 256:
+                _cand = node_by_bone_index.get(int(_w))
+                if _cand is not None and _cand != child:
+                    parent = _cand
+                    break
+                _w = int(bone_parent_by_index.get(int(_w), -1))
+                _gg += 1
         if parent is None or parent == child:
             continue
         _set_parent_keep_world(child, parent)
@@ -16551,6 +19600,44 @@ class WARNO_OT_ImportAsset(Operator):
             _toggle_import_console(settings, open_console=False, active=console_toggled)
             return {"CANCELLED"}
 
+        # Reduced-LOD detection (computed ONCE, early): stem ends '_mid'/'_low'/'_lodN', asset is in a
+        # '/lods/' folder, OR an explicit non-base LOD is picked in the UI. Reduced LODs carry FEWER
+        # bones + decimated per-vertex weights, so they take the LOD-ROBUST rig path below (geometric
+        # centroid origins so parts never get re-pivoted to a missing bone, + ancestor fallbacks for
+        # empties/parents) instead of the full-skeleton bone-pull. The base (high) model -> False, so
+        # its behaviour is byte-identical.
+        _lp = asset.lower().replace("\\", "/")
+        _ls = _lp.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        _lpick = str(getattr(settings, "selected_asset_lod", "") or "__base__").strip()
+        _is_reduced_lod = (bool(re.search(r"_(low|mid|lod\d+)$", _ls))
+                           or "/lods/" in _lp
+                           or _lpick not in ("", "__base__"))
+        # LOD STRATEGY: prefer importing the FULL (high) model and DECIMATING it, rather than salvaging
+        # the LOD's own welded, rig-less geometry. The high base gives correct parts + bones + parents +
+        # empties + names for free; the decimate modifier reduces quality to "LOD" level (user-tunable).
+        # Only if the high asset can't be resolved do we fall back to the LOD geometry + island regroup.
+        _lod_decimate_ratio = 0.0
+        _lod_source_asset = ""   # the REAL _mid/_low asset whose geometry replaces the high mesh
+        _lod_real_parts: List[dict] = []
+        if _is_reduced_lod:
+            _high_asset = _resolve_high_asset_for_lod(settings, asset, _ls)
+            if _high_asset:
+                _m = re.search(r"_(low|mid|lod\d+)$", _ls)
+                _lvl = (_m.group(1) if _m else (_lpick if _lpick not in ("", "__base__") else "mid")).lower()
+                if _lvl.startswith("lod"):
+                    _n = int(re.search(r"\d+", _lvl).group() or 1)
+                    _lod_decimate_ratio = max(0.12, 0.5 / max(1, _n))
+                else:
+                    _lod_decimate_ratio = {"low": 0.25, "mid": 0.5}.get(_lvl, 0.5)
+                _warno_log(settings, f"reduced LOD '{_ls}' -> import HIGH base '{Path(_high_asset).name}' + real LOD geometry swap (decimate ratio {_lod_decimate_ratio:.2f} as fallback)", stage="import")
+                _lod_source_asset = asset
+                asset = _high_asset
+                _lp = asset.lower().replace("\\", "/")
+                _ls = _lp.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+                _is_reduced_lod = False  # we now import the HIGH geometry -> run the full pipeline
+            else:
+                _warno_log(settings, "reduced LOD (no high base found) -> island regroup fallback; rig skipped", stage="import")
+
         try:
             extractor_mod = _extractor_module(settings)
         except Exception as exc:
@@ -16697,7 +19784,54 @@ class WARNO_OT_ImportAsset(Operator):
                         pass
 
                 model = spk.get_model_geometry(asset_real, progress_cb=_decode_progress)
-                material_ids = sorted({int(part["material"]) for part in model["parts"]})
+                # REAL LOD geometry: while the spk is open, also decode the originally-requested
+                # _mid/_low asset and convert it into the same world space (rotation + dev scale)
+                # the buckets use. The post-build swap puts this geometry onto the high parts.
+                if _lod_source_asset:
+                    try:
+                        _lh = spk.find_best_fat_entry_for_asset(_lod_source_asset)
+                        if _lh is not None:
+                            _lm = spk.get_model_geometry(_lh[0])
+                            for _p in _lm.get("parts", []):
+                                _pxyz = _p.get("vertices", {}).get("xyz", [])
+                                _puv = _p.get("vertices", {}).get("uv", [])
+                                _pn = len(_pxyz) // 3
+                                if _pn <= 0:
+                                    continue
+                                _rv: List[Tuple[float, float, float]] = []
+                                _ru: List[Tuple[float, float]] = []
+                                for _vi in range(_pn):
+                                    _rx, _ry, _rz = extractor_mod.apply_rotation(
+                                        float(_pxyz[_vi * 3 + 0]),
+                                        float(_pxyz[_vi * 3 + 1]),
+                                        float(_pxyz[_vi * 3 + 2]),
+                                        rot,
+                                    )
+                                    _rv.append(_warno_dev_scaled_xyz(float(_rx), float(_ry), float(_rz), scale=WARNO_DEV_SCALE))
+                                    if _vi * 2 + 1 < len(_puv):
+                                        _ru.append((float(_puv[_vi * 2 + 0]), 1.0 - float(_puv[_vi * 2 + 1])))
+                                    else:
+                                        _ru.append((0.0, 0.0))
+                                _lod_real_parts.append({
+                                    "verts": _rv,
+                                    "uv": _ru,
+                                    "tris": _all_tris(_p.get("indices", [])),
+                                    "chenille": bool(_p.get("vertices", {}).get("chenille")),
+                                    "mid": int(_p.get("material", -1)),
+                                })
+                            _warno_log(settings, f"real LOD geometry decoded: {len(_lod_real_parts)} part(s) from '{Path(_lod_source_asset).name}'", stage="import")
+                        else:
+                            _warno_log(settings, f"real LOD asset not in FAT: {_lod_source_asset} -> decimate fallback", level="WARNING", stage="import")
+                    except Exception as _exc:
+                        _lod_real_parts = []
+                        _warno_log(settings, f"real LOD decode failed ({_exc}) -> decimate fallback", level="WARNING", stage="import")
+                # include the REAL LOD asset's material ids so the role/name/texture resolution
+                # below also covers the LOD's OWN materials (a _mid/_low references its own
+                # texture — e.g. LEOPARD_1A2_LOW -> the shared LODS atlas — with matching UVs).
+                material_ids = sorted(
+                    {int(part["material"]) for part in model["parts"]}
+                    | {int(p.get("mid", -1)) for p in _lod_real_parts if int(p.get("mid", -1)) >= 0}
+                )
                 raw_spk_names = getattr(spk, "material_name_by_id", {}) or {}
                 raw_slot_names = getattr(spk, "material_texture_names_by_id", {}) or {}
                 material_role_by_id = _derive_material_roles_runtime(
@@ -16846,6 +19980,14 @@ class WARNO_OT_ImportAsset(Operator):
                     material_maps_by_name=material_maps_by_name,
                     is_rd_asset=str(getattr(settings, "game_preset", "") or "").upper() in ("WARGAME_RD", "STEEL_DIVISION_2"),
                 )
+                # Reduced LOD: the decimated weights weld the track belt into a wheel/chassis bucket.
+                # Peel the belt-shaped island(s) out into their own 'Chenille_*' bucket so the track is
+                # a separate object, not fused to a wheel. Full (high) model is untouched.
+                if _is_reduced_lod:
+                    try:
+                        buckets = _peel_track_islands_from_wheels(buckets)
+                    except Exception as _exc:
+                        _warno_log(settings, f"LOD track peel failed: {_exc}", level="WARNING", stage="import")
                 # Diagnostic: shows whether the RD track-split / body-whole path ran.
                 # If you see many "Part_NNN" groups here for an RD unit, the running
                 # code is stale (see the build-stamp line above) — restart Blender.
@@ -17070,6 +20212,14 @@ class WARNO_OT_ImportAsset(Operator):
                             mat["warno_rd_material"] = True
                         except Exception:
                             pass
+                    if maps.get("rd_glass"):
+                        try:
+                            mat["warno_rd_glass"] = True
+                            _gap = maps.get("glass_alpha")
+                            if _gap:
+                                mat["warno_rd_glass_alpha"] = str(_gap)
+                        except Exception:
+                            pass
                     material_cache[cache_key] = mat
                 mesh.materials.append(mat)
                 mat_slot_by_mid[mid] = len(mesh.materials) - 1
@@ -17091,12 +20241,16 @@ class WARNO_OT_ImportAsset(Operator):
             # RD ball-chains object: skip merge-by-distance too (collapsing verts would
             # destroy the cutout silhouette), same as the track mesh.
             obj["warno_is_chains_mesh"] = bool(_norm_low(obj_name) == "chains")
+            # WELDED-BELT class (name-routed track part, no chenille flag): marks the unit
+            # for the post-import degenerate-wheel repair (idler/sprocket stubs).
+            if bucket.get("warno_named_track"):
+                obj["warno_named_track"] = True
             collection.objects.link(obj)
             # RD auto-split parts have no bone pivots (RD bone names are unusable), so
             # give each its OWN origin = the part's geometric centroid (the wheel pivot
             # for wheels, the body/gun/turret centre otherwise). WARNO/non-RD buckets
             # never set warno_rd_origin and keep their bone-driven origins untouched.
-            if bool(bucket.get("warno_rd_origin")) and getattr(mesh, "vertices", None):
+            if (bool(bucket.get("warno_rd_origin")) or _is_reduced_lod) and getattr(mesh, "vertices", None):
                 try:
                     _vn = len(mesh.vertices)
                     if _vn > 0:
@@ -17253,21 +20407,77 @@ class WARNO_OT_ImportAsset(Operator):
             if getattr(_o, "type", "") == "MESH" and _o.data and len(_o.data.vertices) and _rotor_engine_rx.search(getattr(_o, "name", "")):
                 _prepull_world[_o.name] = [(_o.matrix_world @ _v.co).copy() for _v in _o.data.vertices]
 
-        if settings.auto_pull_bones:
+        # Reduced LODs SKIP the bone-pull rig: the LOD skeleton's bone positions/weights are too
+        # degraded — running the rig DISCONNECTS/floats secondary parts (worse than leaving them put).
+        # The LOD parts already sit at their correct decoded world position and each gets a geometric
+        # centroid origin (see the _is_reduced_lod branch in the object-build loop). High model untouched.
+        if settings.auto_pull_bones and not _is_reduced_lod:
             try:
-                hierarchy_root_obj = _build_helper_armature(imported_objects, bone_payload, collection, settings=settings)
+                hierarchy_root_obj = _build_helper_armature(imported_objects, bone_payload, collection, settings=settings, reduced_lod=_is_reduced_lod)
             except Exception as exc:
                 self.report({"WARNING"}, f"Hierarchy build failed: {exc}")
                 hierarchy_root_obj = None
+            # Declutter scrambled RD wheels: drop duplicate/garbage disc-islands that render as
+            # 'flying wheels' (Otomatic + Italian tracked hulls) BEFORE the centroid snap so the
+            # snap sees the real disc. No-op for single-island (normal) wheels.
+            try:
+                _is_rd_preset0 = (str(getattr(settings, "game_preset", "") or "").upper() in ("WARGAME_RD", "STEEL_DIVISION_2"))
+                _nren = _rename_elevator_named_wheels(collection, _is_rd_preset0)
+                if _nren:
+                    _warno_log(settings, f"wheel rename: {_nren} elevator-named wheel mesh(es) renamed to their Roue_* station", stage="import")
+            except Exception as _exc:
+                _warno_log(settings, f"wheel rename failed: {_exc}", level="WARNING", stage="import")
+            # Reclaim REAL wheels welded into the Chassis by palette-local bone indices (Otomatic
+            # D6/D7/D9/G10): pull each hull island that is a wheel sitting exactly on a resolved
+            # elevator station out into its own Roue_* object. Runs BEFORE the declutter/fill so
+            # the reclaimed wheel occupies its station (no donor overlay -> no double wheels).
+            try:
+                _nrc = _reclaim_chassis_wheel_discs(collection, imported_objects, _is_rd_preset0)
+                if _nrc:
+                    _warno_log(settings, f"wheel reclaim: {_nrc} welded wheel(s) pulled out of the Chassis onto their stations", stage="import")
+            except Exception as _exc:
+                _warno_log(settings, f"wheel reclaim failed: {_exc}", level="WARNING", stage="import")
+            # WHEELED units with no elevator rig (FIROS_30/25, iveco): pull the ±Y mirror-paired
+            # truck wheels welded into the Chassis out into their own Roue_D/G objects.
+            try:
+                _nrw = _reclaim_chassis_wheels_no_elev(collection, imported_objects, _is_rd_preset0)
+                if _nrw:
+                    _warno_log(settings, f"wheel reclaim (no-elev): {_nrw} truck wheel(s) pulled out of the Chassis", stage="import")
+            except Exception as _exc:
+                _warno_log(settings, f"wheel reclaim (no-elev) failed: {_exc}", level="WARNING", stage="import")
+            try:
+                _ndc = _declutter_rd_wheel_islands(imported_objects, collection, _is_rd_preset0)
+                if _ndc:
+                    _warno_log(settings, f"wheel declutter: {_ndc} scrambled wheel(s) cleaned of stray discs", stage="import")
+            except Exception as _exc:
+                _warno_log(settings, f"wheel declutter failed: {_exc}", level="WARNING", stage="import")
             # Snap any wheel flung to the wrong side by a duplicate/bogus bone (Leopard_1V
             # Roue_D1) back to the mirror of its opposite-side counterpart. No-op when all
-            # wheels are already on their rows.
+            # wheels are already on their rows. RD adds twin-mirror + Y-row normalization.
             try:
-                _nfix = _fix_outlier_wheels(imported_objects, collection)
+                _is_rd_wfx = (str(getattr(settings, "game_preset", "") or "").upper() in ("WARGAME_RD", "STEEL_DIVISION_2"))
+                _nfix = _fix_outlier_wheels(imported_objects, collection, rd_extra=_is_rd_wfx)
                 if _nfix:
                     _warno_log(settings, f"outlier wheel fix: {_nfix} wheel(s) snapped to mirror", stage="import")
             except Exception:
                 pass
+            # RD wheel instancing: the mesh stream carries ONE wheel per variant, so several
+            # Roue_* nodes have no geometry (empty placeholders = missing wheels in-game).
+            # Fill each placeholder with an instance of a donor wheel.
+            try:
+                _nfw = _fill_empty_rd_wheels(imported_objects, collection, _is_rd_wfx)
+                if _nfw:
+                    _warno_log(settings, f"wheel fill: {_nfw} missing wheel(s) instanced from donor wheels", stage="import")
+            except Exception as _exc:
+                _warno_log(settings, f"wheel fill failed: {_exc}", level="WARNING", stage="import")
+            # Align the whole wheel group to the track belt (ITA Leopard: stations reconstructed
+            # ~1 m rearward of the belt -> empty front curve + sprocket past the rear end).
+            try:
+                _wdelta = _align_wheel_row_to_belt(collection, _is_rd_wfx)
+                if _wdelta:
+                    _warno_log(settings, f"wheel row align: shifted {_wdelta:+.2f} m onto the belt centre", stage="import")
+            except Exception as _exc:
+                _warno_log(settings, f"wheel row align failed: {_exc}", level="WARNING", stage="import")
             # A2 + A1-A: split a merged WARNO track belt (both sides in Chenille_Droite) into
             # Droite/Gauche and weight each belt to its side wheels. No-op for single-side
             # (RD / already-split) tracks.
@@ -17277,6 +20487,15 @@ class WARNO_OT_ImportAsset(Operator):
                     _warno_log(settings, f"track split+weight: {_nsplit} merged belt(s) split into Droite/Gauche", stage="import")
             except Exception as _exc:
                 _warno_log(settings, f"track split+weight failed: {_exc}", level="WARNING", stage="import")
+            # WARNO-SDK convention (M1_Abrams sample): a track's armature modifiers are NAMED
+            # after their armature objects — the cooker matches them by name, a plain 'Armature'
+            # name means no track animation. Normalize AFTER every pass that binds belts.
+            try:
+                _ntm = _normalize_track_modifier_names(collection)
+                if _ntm:
+                    _warno_log(settings, f"track modifier rename: {_ntm} modifier(s) named after their armature", stage="import")
+            except Exception as _exc:
+                _warno_log(settings, f"track modifier rename failed: {_exc}", level="WARNING", stage="import")
 
         # Undo a BAD bone-pull: if the rig moved a rotor/engine part >0.4 m OR re-oriented it
         # (Ka-50: the Bloc_Moteur gearbox floats up AND tips 90 deg onto its side), restore its
@@ -17301,7 +20520,22 @@ class WARNO_OT_ImportAsset(Operator):
                 _cd = [max(p[i] for p in _cur) - min(p[i] for p in _cur) for i in range(3)]
                 _moved = (_pcen - _ccen).length > 0.4
                 _tipped = max(abs(_pd[i] - _cd[i]) for i in range(3)) > 0.4
-                if _moved or _tipped:
+                # A SMALL part (a tail-rotor hub ~0.2 m) can be tipped 90 deg by the rig with almost
+                # no centroid/bbox change, so the 0.4 m gates above miss it (A-109/AB-205 Bloc_Moteur_2
+                # got a raw -90 deg local basis from the horizontal tail-rotor shaft). Detect the
+                # re-orientation directly: subtract each part's own centroid translation, then measure
+                # the largest remaining per-vertex move — a pure translation cancels to ~0, a rotation
+                # does not. Rotor/engine parts must keep their DECODED static pose, so any real
+                # re-orientation is unwanted regardless of the part's size.
+                _reoriented = False
+                if not (_moved or _tipped):
+                    _rot_disp = 0.0
+                    for _i in range(_n):
+                        _d = ((_pw[_i] - _pcen) - (_cur[_i] - _ccen)).length
+                        if _d > _rot_disp:
+                            _rot_disp = _d
+                    _reoriented = _rot_disp > 0.08
+                if _moved or _tipped or _reoriented:
                     _mwi = _o.matrix_world.inverted()
                     for _i, _v in enumerate(_o.data.vertices):
                         _v.co = _mwi @ _pw[_i]
@@ -17327,6 +20561,94 @@ class WARNO_OT_ImportAsset(Operator):
                 _warno_log(settings, f"coaxial rotor align: {_ncox} disc(s) stacked on mast", stage="import")
         except Exception as _exc:
             _warno_log(settings, f"coaxial rotor align failed: {_exc}", level="WARNING", stage="import")
+        # RD wheeled units: rebind wheels mis-named after a non-wheel bone (NASAMS: aa_1_1/
+        # canon_01) to their real 'Roue_*' skeleton bone by position. RD/SD2 only.
+        try:
+            _is_rd_preset = (str(getattr(settings, "game_preset", "") or "").upper() in ("WARGAME_RD", "STEEL_DIVISION_2")
+                             and not _is_reduced_lod)
+            _nwh = _rename_rd_wheels_to_skeleton(collection, _is_rd_preset)
+            if _nwh:
+                _warno_log(settings, f"RD wheel rebind: {_nwh} wheel(s) renamed to their Roue_* skeleton bone", stage="import")
+            # the rebind can pick an ELEVATOR anchor when the wheel's own placeholder fell to the
+            # origin (C-13/60 G8) -> normalize such 'Roue_Elev_*'-named wheel MESHES to 'Roue_*'.
+            _nren2 = _rename_elevator_named_wheels(collection, _is_rd_preset)
+            if _nren2:
+                _warno_log(settings, f"wheel rename: {_nren2} elevator-named wheel mesh(es) renamed to their Roue_* station", stage="import")
+                # a just-renamed wheel may lack its opposite twin (M60A1 D4 without G4) — run the
+                # fill/twin-synth once more so the mirror instance is created. Occupancy checks
+                # make the re-run a no-op for every already-handled station.
+                _nfw2 = _fill_empty_rd_wheels(imported_objects, collection, _is_rd_preset)
+                if _nfw2:
+                    _warno_log(settings, f"wheel fill (post-rebind): {_nfw2} wheel(s) added", stage="import")
+            # hull mesh named after an FX node (weights hung on fx_stress_02 -> VCC-1 TUA):
+            # rename it to Chassis, consuming the Chassis EMPTY.
+            _nfx = _fix_fx_named_hull(collection, _is_rd_preset)
+            if _nfx:
+                _warno_log(settings, f"hull rename: Fx_*-named hull mesh renamed to Chassis", stage="import")
+            # SDK convention (M1_Abrams): the '_1' idler/sprocket armature per side is parented to
+            # the Chassis. On Fx-named-hull units the Chassis only exists now (after the rename
+            # above), so the '_1' armatures were left parentless at build time -> parent them now.
+            _ntac = _parent_track_armatures_to_chassis(collection)
+            if _ntac:
+                _warno_log(settings, f"track armature parent: {_ntac} '_1' armature(s) parented to Chassis", stage="import")
+            # WELDED-BELT class (VCC-1 TUA): the belts import as real Chenille_* objects via
+            # the named-track bucket routing, and the sprocket/idler END wheels survive the
+            # declutter via its class-gated flat-disc rule — nothing further to repair here.
+        except Exception as _exc:
+            _warno_log(settings, f"RD wheel rebind failed: {_exc}", level="WARNING", stage="import")
+        # Wheel origin/parent hygiene: after every wheel pass (declutter deleted stray islands,
+        # rebind renamed bogus-bone objects), re-seat each Roue_* origin onto its own centroid and
+        # re-hang it on its elevator (Otomatic D1/D3/D5/D11/D13 stale origins, G12 chassis-parent).
+        try:
+            _is_rd_reseat = (str(getattr(settings, "game_preset", "") or "").upper() in ("WARGAME_RD", "STEEL_DIVISION_2")
+                             and not _is_reduced_lod)
+            _nws = _reseat_rd_wheel_origins(collection, _is_rd_reseat)
+            if _nws:
+                _warno_log(settings, f"wheel reseat: {_nws} wheel origin/parent pair(s) re-seated onto their geometry", stage="import")
+        except Exception as _exc:
+            _warno_log(settings, f"wheel reseat failed: {_exc}", level="WARNING", stage="import")
+        # RD SAM/AA units: separate the missile LAUNCHER (welded into the Chassis) into its own
+        # 'Launcher' object by clustering the chassis islands near the launcher bones. RD/SD2 only.
+        try:
+            _is_rd_preset2 = (str(getattr(settings, "game_preset", "") or "").upper() in ("WARGAME_RD", "STEEL_DIVISION_2")
+                              and not _is_reduced_lod)
+            _nls = _split_rd_launcher(collection, _is_rd_preset2)
+            if _nls:
+                _warno_log(settings, f"RD launcher split: {_nls} 'Launcher' part(s) separated from Chassis", stage="import")
+        except Exception as _exc:
+            _warno_log(settings, f"RD launcher split failed: {_exc}", level="WARNING", stage="import")
+        # RD AA/SAM units: separate the SEARCH RADAR welded into the Chassis (its single-token
+        # 'radar' bone classifies to Chassis) into its own object on the radar empty's spin axis.
+        # Runs BEFORE the antenna weld so the bar cannot be glued to a nearby part first.
+        try:
+            _is_rd_radar = (str(getattr(settings, "game_preset", "") or "").upper() in ("WARGAME_RD", "STEEL_DIVISION_2")
+                            and not _is_reduced_lod)
+            _nrsp = _split_rd_radar_from_chassis(collection, _is_rd_radar)
+            if _nrsp:
+                _warno_log(settings, f"RD radar split: {_nrsp} radar part(s) separated from Chassis onto their masts", stage="import")
+        except Exception as _exc:
+            _warno_log(settings, f"RD radar split failed: {_exc}", level="WARNING", stage="import")
+        # RD: weld each antenna/mast island left in the Chassis onto the part it is mounted on
+        # (turret etc.) by base proximity. Runs AFTER the launcher split so 'Launcher' is a target.
+        try:
+            _naw = _weld_rd_antennas_to_nearest_part(collection, _is_rd_preset2)
+            if _naw:
+                _warno_log(settings, f"RD antenna weld: {_naw} antenna island(s) merged into their nearest part", stage="import")
+        except Exception as _exc:
+            _warno_log(settings, f"RD antenna weld failed: {_exc}", level="WARNING", stage="import")
+        # Reduced LOD: the decimated weights group geometry by the wrong bone, so each object is a SOUP
+        # of islands from different parts (a 'turret' object holding a wheel + track tread). Re-resolve
+        # from scratch: split into connected-component islands, classify by geometry, re-merge into the
+        # correct parts (Chenille / Roue_<D/G><N> / Canon_01 / Tourelle_01 / Chassis / Part_NN).
+        try:
+            _nrg = _regroup_lod_islands(collection, _is_reduced_lod, _model_is_rd)
+            if _nrg:
+                _warno_log(settings, f"LOD island regroup: rebuilt {_nrg} part(s) from geometry", stage="import")
+                # the regroup deleted the original objects and built new ones -> refresh the list the
+                # later passes (selection, active object) iterate, else they touch removed StructRNA.
+                imported_objects[:] = list(getattr(collection, "all_objects", []) or [])
+        except Exception as _exc:
+            _warno_log(settings, f"LOD island regroup failed: {_exc}", level="WARNING", stage="import")
 
         # Finalize WARNO-reserved material names (e.g. 'Vitre'): rename the
         # namespaced material we just built ('<asset>__Vitre') back to the
@@ -17423,6 +20745,17 @@ class WARNO_OT_ImportAsset(Operator):
         except Exception as _exc:
             _warno_log(settings, f"colorspace/alpha hygiene failed: {_exc}", level="WARNING", stage="import")
 
+        # RD glass: LAST material pass (after the rename/transparency/hygiene passes) so it wins.
+        # Wire each 'vitre/verre/glass' material the WARNO way: Base Color = body diffuse, Alpha =
+        # a Non-Color '*_A' texture (Color -> Alpha), BLEND. RD/SD2 only -> WARNO untouched.
+        try:
+            _is_rd_glass = (str(getattr(settings, "game_preset", "") or "").upper() in ("WARGAME_RD", "STEEL_DIVISION_2"))
+            _ngl = _fix_rd_glass_vitre(collection, _is_rd_glass)
+            if _ngl:
+                _warno_log(settings, f"RD glass fix: {_ngl} glass material(s) wired (body diffuse + _A alpha)", stage="import")
+        except Exception as _exc:
+            _warno_log(settings, f"RD glass fix failed: {_exc}", level="WARNING", stage="import")
+
         new_scene_objects = [
             obj for obj in bpy.data.objects
             if int(obj.as_pointer()) not in preexisting_object_ptrs
@@ -17436,6 +20769,81 @@ class WARNO_OT_ImportAsset(Operator):
             t0=t0,
             extra=f"objects={mesh_count}",
         )
+
+        # Reduced-LOD requested but imported as the HIGH base. PREFERRED: swap the game's REAL
+        # _mid/_low geometry onto the high parts (true LOD mesh wearing the high rig / empties /
+        # bones / names / parents). FALLBACK (no LOD asset / decode failed / swap yielded nothing):
+        # decimate the high meshes with a NON-DESTRUCTIVE modifier as before.
+        if _lod_decimate_ratio and 0.0 < _lod_decimate_ratio < 1.0:
+            _nswap = 0
+            if _lod_real_parts:
+                try:
+                    # build the LOD's OWN materials (its UVs sample its own texture/atlas) from
+                    # the already-resolved maps — same node builder as the high materials.
+                    _lod_mat_by_mid: Dict[int, Any] = {}
+                    for _p in _lod_real_parts:
+                        _mid = int(_p.get("mid", -1))
+                        if _mid < 0 or _mid in _lod_mat_by_mid:
+                            continue
+                        _mname = material_name_by_id.get(_mid, f"Material_{_mid:03d}")
+                        _mmaps = material_maps_by_name.get(_mname) or {}
+                        _mat = bpy.data.materials.get(_mname)
+                        if _mat is None:
+                            _mat = bpy.data.materials.new(name=_mname)
+                            try:
+                                _apply_material_nodes(_mat, _mmaps, material_role_by_id.get(_mid, ""), ao_multiply_diffuse=False, normal_invert_mode="none")
+                            except Exception:
+                                pass
+                            if _mmaps.get("rd_material"):
+                                try:
+                                    _mat["warno_rd_material"] = True
+                                except Exception:
+                                    pass
+                        _lod_mat_by_mid[_mid] = _mat
+                    _nswap, _ntris, _swapped_names = _swap_in_real_lod_geometry(
+                        imported_objects, collection, _lod_real_parts, settings, _lod_mat_by_mid)
+                except Exception as _exc:
+                    _nswap = 0
+                    _warno_log(settings, f"real LOD swap failed ({_exc}) -> decimate fallback", level="WARNING", stage="import")
+            if _nswap:
+                _warno_log(settings, f"real LOD geometry: {_nswap} part(s) now carry the true game LOD mesh ({_ntris} tris; rig/names/empties from high)", stage="import")
+                # LOW quality: the game's low mesh depicts the running gear inside its welded
+                # hull/track, so any wheel object that received NO LOD geometry is a leftover
+                # high wheel FLOATING outside the (shorter) low silhouette -> drop it. MID keeps
+                # them (the mid wheel row matches the high stations).
+                if _lod_decimate_ratio <= 0.3:
+                    _npurge = 0
+                    _purge = [o for o in imported_objects
+                              if getattr(o, "type", "") == "MESH"
+                              and re.fullmatch(r"roue_[dg]\d+", _norm_low(getattr(o, "name", ""))) is not None
+                              and str(getattr(o, "name", "")) not in _swapped_names]
+                    _dead_ids = set(id(x) for x in _purge)
+                    imported_objects[:] = [x for x in imported_objects if id(x) not in _dead_ids]
+                    for _o in _purge:
+                        try:
+                            bpy.data.objects.remove(_o, do_unlink=True)
+                            _npurge += 1
+                        except Exception:
+                            pass
+                    if _npurge:
+                        _warno_log(settings, f"real LOD low: {_npurge} un-swapped high wheel(s) removed (depicted in the welded low mesh)", stage="import")
+            else:
+                _dn = 0
+                for obj in imported_objects:
+                    if getattr(obj, "type", "") != "MESH" or not getattr(obj, "data", None):
+                        continue
+                    if len(obj.data.polygons) < 60:
+                        continue
+                    try:
+                        _dm = obj.modifiers.new("LOD Decimate", "DECIMATE")
+                        _dm.decimate_type = "COLLAPSE"
+                        _dm.ratio = float(_lod_decimate_ratio)
+                        _dm.use_collapse_triangulate = True
+                        _dn += 1
+                    except Exception:
+                        pass
+                if _dn:
+                    _warno_log(settings, f"LOD decimate: ratio {_lod_decimate_ratio:.2f} on {_dn} mesh(es) (modifier - tune/apply as needed)", stage="import")
 
         for obj in context.scene.objects:
             obj.select_set(False)

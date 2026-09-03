@@ -19,8 +19,9 @@
 ## ✨ Features
 
 ### Asset extraction pipeline
-- Parses Eugen's `EDAT v1/v2` containers (`ZZ_*.dat`, `*_Assets.dat`) directly,
-  no QuickBMS dance required.
+- Parses Eugen's `EDAT v1/v2/v3` containers (`ZZ_*.dat`, `*_Assets.dat`) directly,
+  no QuickBMS dance required (v3 is the realigned/64-bit header Eugen shipped in
+  the 2026 update — build `197351/201602` — that hid every new DLC asset).
 - Handles **chained delta packs** — every WARNO update ships a new
   `Data/PC/<old_build>/<new_build>/ZZ_*.dat` and the resolver merges all
   layers (newest wins) automatically. New DLC content is picked up the

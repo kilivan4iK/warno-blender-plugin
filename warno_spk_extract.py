@@ -8301,16 +8301,26 @@ def _is_numbered_zz_dat_name(name: str) -> bool:
     return bool(suffix) and suffix.isdigit()
 
 
-def _zz_dat_sort_key(path: Path) -> int:
+def _zz_dat_sort_key(path: Path) -> tuple:
+    """Precedence for de-duping the SAME spk across WRD patch layers. WRD ships deltas under
+    .../PC/<oldver>/<newver>/ZZ_*.dat, and the file in the NEWEST patch (highest folder number) must
+    win. So rank by that PATCH VERSION first, then the ZZ archive number.
+
+    The old key returned only the ZZ number (ZZ_1->1), so every ZZ_1.dat tied at 1 and the caller's
+    string tiebreak picked whichever path sorted highest ('49964' > '130278' as a string) -- i.e. an
+    OLD layer. That silently dropped DLC content packed into a newer layer's mesh_all.spk / skeleton
+    spk (e.g. the Nation Pack: Italy units -> 'units/ita/...' meshes were never extracted)."""
+    patch_ver = 0
+    for part in path.parts:
+        if part.isdigit():
+            patch_ver = max(patch_ver, int(part))
     stem = path.stem.lower()
     if stem == "zz":
-        return -1
-    if stem.startswith("zz_"):
-        suffix = stem[3:]
-        if suffix.isdigit():
-            return int(suffix)
-    # Non-ZZ packages (e.g. *_Assets.dat) should have lower precedence than ZZ packs.
-    return -2
+        return (patch_ver, -1)
+    if stem.startswith("zz_") and stem[3:].isdigit():
+        return (patch_ver, int(stem[3:]))
+    # Non-ZZ packages (e.g. *_Assets.dat) keep lower precedence than ZZ packs in the same layer.
+    return (patch_ver, -2)
 
 
 def find_warno_zz_dat_files(warno_root: Path, *, game: "str | None" = None) -> List[Path]:
@@ -8413,12 +8423,22 @@ def _parse_zz_dat_header(dat_path: Path) -> Dict[str, int]:
     if head[:4] != b"edat":
         raise ValueError(f"Invalid EDAT magic in {dat_path}: {head[:4]!r}")
     version = _read_u32_le(head, 4)
-    if version not in {1, 2}:
+    if version == 3:
+        # WARNO 2026 update (build 197351/201602) repacked EDAT as v3: the header fields
+        # were realigned to 4-byte boundaries and the file-region offset/length widened to
+        # 64-bit (ZZ_3.dat is >4 GiB). The dictionary/entry layout is otherwise identical
+        # to v2 (see _parse_zz_dat_v2_entries), just without the legacy odd-length padding.
+        dict_offset = _read_u32_le(head, 8)
+        dict_length = _read_u32_le(head, 12)
+        file_offset = int(struct.unpack_from("<Q", head, 16)[0])
+        file_length = int(struct.unpack_from("<Q", head, 24)[0])
+    elif version in {1, 2}:
+        dict_offset = _read_u32_le(head, 25)
+        dict_length = _read_u32_le(head, 29)
+        file_offset = _read_u32_le(head, 33)
+        file_length = _read_u32_le(head, 37)
+    else:
         raise ValueError(f"Unsupported EDAT version {version} in {dat_path}")
-    dict_offset = _read_u32_le(head, 25)
-    dict_length = _read_u32_le(head, 29)
-    file_offset = _read_u32_le(head, 33)
-    file_length = _read_u32_le(head, 37)
     return {
         "version": int(version),
         "dict_offset": int(dict_offset),
@@ -8566,6 +8586,10 @@ def _scan_zz_dat_entries(dat_path: Path) -> Tuple[Dict[str, int], List[Dict[str,
     version = int(header["version"])
     if version == 1:
         return header, _parse_zz_dat_v1_entries(dat_path, header)
+    if version == 3:
+        # v3 shares the v2 dictionary/entry layout but never uses the legacy odd-length
+        # name padding, so parse it directly with padding disabled.
+        return header, _parse_zz_dat_v2_entries(dat_path, header, legacy_padding=False)
 
     try:
         return header, _parse_zz_dat_v2_entries(dat_path, header, legacy_padding=True)
