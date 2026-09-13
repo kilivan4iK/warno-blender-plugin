@@ -6085,16 +6085,17 @@ def _atlas_item_channel(item: Dict[str, Any]) -> str:
             str(Path(str(item.get("out_png", "") or "")).stem),
         ]
     )
+    # The atlas target channel is ground truth (derived from the source TGV role, with a
+    # combined ORM split into one target per channel). Never let a name-based guess override
+    # it: the unit's own folder/file name can contain a channel word (Alpha_Jet) and would
+    # re-file the diffuse as alpha, leaving the material with no base colour.
+    if channel != "generic":
+        return channel
     guessed = channel_from_token(token)
     guessed_channel = _canonical_channel(guessed) if guessed is not None else "generic"
     if guessed_channel != "generic":
-        if channel == "generic":
-            channel = guessed_channel
-        elif channel == "diffuse" and guessed_channel in {"alpha", "normal", "roughness", "metallic", "occlusion", "orm"}:
-            channel = guessed_channel
-    if channel == "generic":
-        channel = _canonical_channel(str(item.get("role", "")))
-    return channel
+        return guessed_channel
+    return _canonical_channel(str(item.get("role", "")))
 
 
 def pick_maps_for_material_from_atlas_resolved(
@@ -7939,7 +7940,7 @@ class SpkMeshExtractor:
             idx = vals[0] if vals else 0
             out: List[int] = []
             for v in vals:
-                vv = v + idx
+                vv = (v + idx) & 0xFFFF  # game index buffers are u16: the delta prefix-sum must wrap
                 out.append(vv)
                 idx = vv
         else:

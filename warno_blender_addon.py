@@ -1,7 +1,7 @@
 bl_info = {
     "name": "WARNO Importer",
     "author": "Kilivanchik",
-    "version": (1, 6, 3),
+    "version": (1, 6, 4),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > WARNO",
     "description": "Direct WARNO SPK importer with textures and optional helper bones",
@@ -687,8 +687,27 @@ def _choose_asset_variant_for_import(extractor_mod, spk, requested_asset: str) -
         requested_model = None
     if isinstance(requested_model, dict):
         req_good, req_total, req_ratio = _model_valid_face_stats(requested_model)
-        if req_good > 0 and req_ratio >= 0.98:
-            return req_norm, f"requested_exact good={req_good} total={req_total} ratio={req_ratio:.3f}"
+        if req_good > 0:
+            # The requested asset decodes to real geometry: ALWAYS honour it. Never
+            # substitute a LOD sibling for an explicitly requested mesh -- that silently
+            # downgraded a HIGH import to _MID, and with it the texture atlas the whole
+            # material chain is keyed on (T-55AMV -> T55AMV_MID -> 1024px instead of 4096).
+            # A decode defect must surface as a warning, not as a quiet quality drop.
+            note = f"requested_exact good={req_good} total={req_total} ratio={req_ratio:.3f}"
+            if req_ratio < 0.98:
+                note += " WARNING partial_decode importing_requested_anyway"
+            return req_norm, note
+
+    # Only reached when the requested asset yields NO usable geometry at all. Even then a
+    # non-LOD request may never resolve to a LOD/LODS variant.
+    if prefer_non_lod:
+        candidates = [
+            c
+            for c in candidates
+            if not _has_lod_suffix(PurePosixPath(c).stem) and "/lods/" not in c.lower()
+        ]
+        if not candidates:
+            return req_norm, "requested_empty no_non_lod_alternative"
 
     best_asset = req_norm
     best_score = -1.0e18
@@ -4242,12 +4261,16 @@ def _strict_atlas_item_channel(item: Dict[str, Any], extractor_mod: Any | None =
         except Exception:
             pass
 
+    # The atlas JSON's target channel is GROUND TRUTH: the exporter derives it from the
+    # source TGV role (TSCColor -> diffuse, TSCNM -> normal) and splits a combined ORM into
+    # one target per channel (metallic/occlusion/roughness). A name-based guess must never
+    # override it -- that is exactly what filed Alpha_Jet's diffuse under "alpha", because
+    # the unit FOLDER name contains "alpha". Guesses only fill an unknown channel.
+    if channel != "generic":
+        return channel
     for g in guesses:
         if g != "generic":
-            if channel == "generic":
-                channel = g
-            elif channel == "diffuse" and g in {"alpha", "normal", "roughness", "metallic", "occlusion", "orm"}:
-                channel = g
+            return g
     return channel
 
 
