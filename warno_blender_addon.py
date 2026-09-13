@@ -1,7 +1,7 @@
 bl_info = {
     "name": "WARNO Importer",
     "author": "Kilivanchik",
-    "version": (1, 6, 4),
+    "version": (1, 6, 5),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > WARNO",
     "description": "Direct WARNO SPK importer with textures and optional helper bones",
@@ -1335,6 +1335,23 @@ def _resolve_skeleton_spk_paths(
     return [p for p in out if "skeleton" in p.name.lower()]
 
 
+def _spk_scheme_rank(spk_path: Path) -> int:
+    """Rank mesh-pack layouts so the NEWER pack wins when both carry the same asset.
+
+    Eugen introduced the short ``MeshPack/`` layout for the delta/DLC packs; the legacy
+    ``PC/Mesh/Pack/`` pack is the older copy. On this install MeshPack holds 5035 entries
+    against the legacy 4204, and 3816 assets exist in BOTH. Ties used to be broken by
+    comparing the path STRING, and ``pc/mesh/pack/...`` happens to sort above
+    ``meshpack/...``, so every shared asset was silently read from the stale legacy pack.
+    """
+    low = str(spk_path).replace("\\", "/").lower()
+    if "/meshpack/" in low or low.startswith("meshpack/"):
+        return 2
+    if "/pc/mesh/pack/" in low:
+        return 1
+    return 0
+
+
 def _pick_best_asset_spk_path(
     extractor_mod,
     spk_paths: Sequence[Path],
@@ -1342,7 +1359,7 @@ def _pick_best_asset_spk_path(
     game: "str | None" = None,
 ) -> tuple[Path, str] | None:
     target = extractor_mod.normalize_asset_path(str(asset or "")).lower()
-    best: tuple[int, int, str, str, Path, str] | None = None
+    best: tuple[int, int, str, int, str, Path, str] | None = None
     for spk_path in spk_paths:
         try:
             with extractor_mod.SpkMeshExtractor(spk_path, game=game) as spk:
@@ -1362,13 +1379,21 @@ def _pick_best_asset_spk_path(
         except Exception:
             pass
         score -= len(asset_low)
-        key = (score, -len(asset_low), asset_low, str(spk_path).lower(), spk_path, asset_real)
+        key = (
+            score,
+            -len(asset_low),
+            asset_low,
+            _spk_scheme_rank(spk_path),
+            str(spk_path).lower(),
+            spk_path,
+            asset_real,
+        )
         if best is None or key > best:
             best = key
 
     if best is None:
         return None
-    _, _, _, _, out_path, out_asset = best
+    out_path, out_asset = best[-2], best[-1]
     return out_path, out_asset
 
 
@@ -5890,10 +5915,13 @@ def _resolve_material_maps(
                 return 10
 
             def _maps_from_material_name_or_slot_hints(mid: int, material_name: str, want_track: bool) -> tuple[Dict[str, Path], str]:
-                by_name, by_name_key = _maps_from_group_key(_exact_material_key(material_name), want_track)
-                if by_name:
-                    return by_name, by_name_key
-
+                # The mesh pack's per-material texture slots are the binding the GAME itself
+                # uses (DiffuseTextureNoAlpha -> "T55AMV.png", NormalTexture -> "T55AMV_NM.png"),
+                # so they outrank the material NAME. A name is only a label: it collides
+                # across units and is identical between a unit's HIGH and its LOD variants,
+                # which is how a material used to pick up another asset's textures. Name
+                # matching stays as the fallback for materials the pack carries no slots for
+                # (Wargame RD / Steel Division 2 keep their previous behaviour).
                 slot_map = raw_slot_hints_by_mid.get(int(mid), {})
                 if isinstance(slot_map, dict) and slot_map:
                     slot_items = sorted(slot_map.items(), key=lambda kv: (_slot_priority(str(kv[0])), str(kv[0]).lower()))
@@ -5905,7 +5933,8 @@ def _resolve_material_maps(
                         by_slot, by_slot_key = _maps_from_group_key(key, want_track)
                         if by_slot:
                             return by_slot, by_slot_key
-                return {}, ""
+
+                return _maps_from_group_key(_exact_material_key(material_name), want_track)
 
             for mid in material_ids:
                 mname = material_name_by_id.get(int(mid), f"Material_{int(mid):03d}")
@@ -5957,6 +5986,22 @@ def _resolve_material_maps(
                                 break
 
                 if not maps:
+                    # No exact binding matched: neither the pack's texture slots nor the
+                    # material name found an atlas group. Everything below this point is a
+                    # heuristic guess, so say out loud which material fell through and what
+                    # was tried -- a silent guess here is what produces a plausible but
+                    # wrong texture on one part of a model.
+                    _slot_dbg = raw_slot_hints_by_mid.get(int(mid), {})
+                    _slot_dbg_txt = ",".join(
+                        sorted(Path(str(v or "")).stem for v in _slot_dbg.values() if str(v or "").strip())
+                    ) if isinstance(_slot_dbg, dict) else ""
+                    _warno_log(
+                        settings,
+                        "no exact texture binding: material=%s role=%s slots=[%s] -> falling back to heuristic pick"
+                        % (mname, role_for_pick, _slot_dbg_txt or "none"),
+                        level="WARNING",
+                        stage="textures",
+                    )
                     maps = strict_picker(basis, role_for_pick)
                 if not maps and basis is not resolved:
                     maps = strict_picker(resolved, role_for_pick)

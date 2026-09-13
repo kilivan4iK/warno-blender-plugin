@@ -9736,6 +9736,15 @@ def run_tgv_converter(
     ]
     if only_logical_ref:
         cmd.extend(["--only-logical-ref", str(only_logical_ref)])
+    # Pin the exact source we already resolved (possibly extracted out of the ZZ archives).
+    # Without this the converter searches for the .tgv again with its own root order, which
+    # probes the game's Output/PC/Atlas folder first -- on an updated install that folder
+    # still holds pre-patch textures, so the conversion could silently use a stale source.
+    try:
+        if src_tgv is not None and Path(src_tgv).is_file():
+            cmd.extend(["--source-tgv", str(Path(src_tgv))])
+    except Exception:
+        pass
 
     try:
         proc = subprocess.run(

@@ -641,6 +641,7 @@ def convert_from_atlas_map(
     out_dir: Path,
     only_logical_ref: str | None = None,
     manifest_out: Path | None = None,
+    source_tgv: Path | None = None,
 ) -> None:
     entries, atlas_payload = _load_atlas_map_entries(atlas_map_path, asset_path)
     if only_logical_ref:
@@ -688,9 +689,23 @@ def convert_from_atlas_map(
 
     for _, items in grouped.items():
         source_rel = str(items[0].get("source_tgv_rel", "")).strip()
+        # The caller (the plugin) already resolved which TGV on disk backs this entry,
+        # including extracting it out of the ZZ archives. Use that exact file instead of
+        # searching again: the local search order probes the game's Output/PC/Atlas folder,
+        # which on an updated install still holds pre-patch textures, so re-resolving could
+        # silently convert a different (stale) source than the one that was resolved.
+        pinned = None
+        if source_tgv is not None:
+            try:
+                same_stem = Path(str(source_tgv)).stem.lower() == PurePosixPath(source_rel).stem.lower()
+            except Exception:
+                same_stem = False
+            if same_stem and Path(source_tgv).is_file():
+                pinned = Path(source_tgv)
+
         src_tgv = _resolve_source_tgv_for_atlas(
             source_tgv_rel=source_rel,
-            source_file=None,
+            source_file=pinned,
             atlas_map_path=atlas_map_path,
             search_roots=search_roots,
         )
@@ -810,6 +825,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out-dir", required=True, help="Output directory for atlas-driven conversion")
     parser.add_argument("--only-logical-ref", default="", help="Optional exact logical texture ref to convert")
     parser.add_argument("--manifest-out", default="", help="Optional output path for conversion_manifest.json")
+    parser.add_argument("--source-tgv", default="", help="Exact source .tgv the caller already resolved (skips the local search)")
     return parser
 
 
@@ -826,6 +842,7 @@ def main() -> int:
             out_dir=Path(str(args.out_dir).strip()),
             only_logical_ref=only_logical_ref,
             manifest_out=Path(manifest_out) if manifest_out else None,
+            source_tgv=Path(src_pin) if (src_pin := str(getattr(args, "source_tgv", "") or "").strip()) else None,
         )
     except Exception as exc:
         print(f"[ERROR] {exc}")
