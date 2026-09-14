@@ -686,6 +686,7 @@ def convert_from_atlas_map(
     records: list[dict[str, Any]] = []
     total_saved = 0
     orm_split_done: set[str] = set()
+    failed_sources: list[str] = []
 
     for _, items in grouped.items():
         source_rel = str(items[0].get("source_tgv_rel", "")).strip()
@@ -694,26 +695,46 @@ def convert_from_atlas_map(
         # searching again: the local search order probes the game's Output/PC/Atlas folder,
         # which on an updated install still holds pre-patch textures, so re-resolving could
         # silently convert a different (stale) source than the one that was resolved.
+        # Apply the pin only when this invocation converts a SINGLE entry (the plugin always
+        # passes --only-logical-ref together with the source it resolved), so a pinned file
+        # can never be attached to the wrong target. Do NOT require the names to match: the
+        # caller legitimately resolves a different-but-equivalent source when the atlas names
+        # a file that is not on disk -- e.g. GreenBerets' atlas points at
+        # tsccoloralpha_combineddatexture01.tgv while what exists is
+        # tsccolor_diffusetexturenoalpha01.tgv. Insisting on the atlas name is what lost that
+        # material its base colour.
         pinned = None
         if source_tgv is not None:
             try:
                 same_stem = Path(str(source_tgv)).stem.lower() == PurePosixPath(source_rel).stem.lower()
             except Exception:
                 same_stem = False
-            if same_stem and Path(source_tgv).is_file():
-                pinned = Path(source_tgv)
+            try:
+                if (same_stem or len(grouped) == 1) and Path(source_tgv).is_file():
+                    pinned = Path(source_tgv)
+            except Exception:
+                pinned = None
 
-        src_tgv = _resolve_source_tgv_for_atlas(
-            source_tgv_rel=source_rel,
-            source_file=pinned,
-            atlas_map_path=atlas_map_path,
-            search_roots=search_roots,
-        )
-        info = parse_tgv(src_tgv)
-        mip_idx, offset, size, raw_size = pick_fullres_mip(info)
-        raw = decompress_mip(info, offset, size, raw_size)
-        decoded = decode_tgv_image(info, raw)
-        src_role = detect_texture_role(src_tgv, info.fmt)
+        try:
+            src_tgv = _resolve_source_tgv_for_atlas(
+                source_tgv_rel=source_rel,
+                source_file=pinned,
+                atlas_map_path=atlas_map_path,
+                search_roots=search_roots,
+            )
+            info = parse_tgv(src_tgv)
+            mip_idx, offset, size, raw_size = pick_fullres_mip(info)
+            raw = decompress_mip(info, offset, size, raw_size)
+            decoded = decode_tgv_image(info, raw)
+            src_role = detect_texture_role(src_tgv, info.fmt)
+        except Exception as exc:
+            # One unusable source must not sink the others. The same logical target is often
+            # declared by TWO different sources -- GreenBerets' props colour is offered both
+            # by a CombinedDA page (which is not on disk) and by a DiffuseNoAlpha page (which
+            # is) -- and aborting the whole conversion on the first failure left that material
+            # with no base colour at all. Record it and try the next source.
+            failed_sources.append(f"{source_rel}: {exc}")
+            continue
 
         for item in items:
             rect = _clamp_rect_to_image(item.get("crop_rect_px", {}), decoded.size)
@@ -804,15 +825,24 @@ def convert_from_atlas_map(
                 }
             )
 
+    if total_saved == 0:
+        # Skipping a broken source is fine only while some other source still delivered the
+        # texture. Producing NOTHING must be loud, never a silent "material with no maps".
+        detail = " | ".join(failed_sources[:3]) if failed_sources else "no usable atlas entries"
+        raise RuntimeError(f"atlas conversion produced no output: {detail}")
+
     manifest_path = _write_conversion_manifest(
         out_path=Path(manifest_out) if manifest_out is not None else (out_dir / "conversion_manifest.json"),
         asset_path=asset_path,
         atlas_map_path=atlas_map_path,
         records=records,
     )
+    if failed_sources:
+        for msg in failed_sources[:3]:
+            print(f"[WARN] atlas source skipped: {msg}")
     print(
         f"[OK] atlas conversion complete | entries={len(records)} outputs={total_saved} "
-        f"manifest={manifest_path.name}"
+        f"skipped_sources={len(failed_sources)} manifest={manifest_path.name}"
     )
 
 

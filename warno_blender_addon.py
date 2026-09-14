@@ -1,7 +1,7 @@
 bl_info = {
     "name": "WARNO Importer",
     "author": "Kilivanchik",
-    "version": (1, 6, 5),
+    "version": (1, 7, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > WARNO",
     "description": "Direct WARNO SPK importer with textures and optional helper bones",
@@ -118,8 +118,117 @@ def _norm_token(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
 
+class _LockedPositions(dict):
+    """A resolved-position map whose exact entries are write-protected.
+
+    A node placed from the mesh pack's own world matrix is already correct, so
+    the positional inference passes must not move it.  Those passes are still
+    needed for scenes that carry no matrix stream, so rather than removing them
+    they are simply made ineffective here: an assignment to a locked index is
+    dropped instead of raising, and pop() keeps the value.
+    """
+
+    __slots__ = ("locked",)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.locked: set[int] = set()
+
+    def __setitem__(self, key, value):
+        if int(key) in self.locked:
+            return
+        super().__setitem__(key, value)
+
+    def pop(self, key, *default):
+        if int(key) in self.locked:
+            return super().get(key)
+        return super().pop(key, *default)
+
+
+# Display length for a character bone that has no child joint to reach towards.
+# The pack does not store bone lengths, so this only has to stay proportional and
+# out of the way; it is a cap, never a scale-up.
+CHARACTER_LEAF_BONE_LENGTH = 0.12
+
+
+def _mirrored_side_name(low_name: str) -> str:
+    """The same Eugen node name with its side swapped, or "" if it carries no side.
+
+    Eugen marks sides two ways: the French words droite/gauche, and a d/g letter in a
+    numbered suffix (roue_elev_d1 <-> roue_elev_g1).  Only one of the two is ever present,
+    so the swaps do not interfere.
+    """
+    low = str(low_name or "").strip().lower()
+    if not low:
+        return ""
+    if "droite" in low:
+        return low.replace("droite", "gauche")
+    if "gauche" in low:
+        return low.replace("gauche", "droite")
+    swapped, count = re.subn(
+        r"_([dg])(\d+)(?=_|$)",
+        lambda m: "_" + ("g" if m.group(1) == "d" else "d") + m.group(2),
+        low,
+    )
+    return swapped if count == 1 else ""
+
+
+def _game_to_blender_basis(settings: Any) -> "Matrix | None":
+    """The same game-space -> Blender-space map the vertices go through.
+
+    Mesh vertices are mapped with extractor_mod.apply_rotation and the importer's
+    rotate_* / mirror_y settings.  Deriving the node-matrix map from that same
+    function (by mapping the three unit axes) keeps bones, empties and geometry in
+    one space whatever those settings are, instead of assuming the current
+    mirror-Y-only default.
+    """
+    try:
+        extractor_mod = _extractor_module(settings)
+    except Exception:
+        extractor_mod = None
+    if extractor_mod is None:
+        return None
+    try:
+        rot = extractor_mod.build_rotation_params(
+            float(getattr(settings, "rotate_x", 0.0) or 0.0),
+            float(getattr(settings, "rotate_y", 0.0) or 0.0),
+            float(getattr(settings, "rotate_z", 0.0) or 0.0),
+            mirror_y=bool(getattr(settings, "mirror_y", True)),
+        )
+        cols = [
+            extractor_mod.apply_rotation(float(ax), float(ay), float(az), rot)
+            for ax, ay, az in ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        ]
+    except Exception:
+        return None
+    return Matrix([[float(cols[c][r]) for c in range(3)] for r in range(3)]).to_4x4()
+
+
 def _norm_low(value: str) -> str:
     return str(value or "").strip().lower()
+
+
+# Eugen's character rig always has the same five non-Bip01 nodes: the skeleton carrier
+# ("papyrus"), two weapon anchors ("arme_1"/"arme_2"), "props", and the skinned body. The
+# body node is spelled "soldat" on French-authored units and "soldier" on the rest. Matching
+# only the French spelling silently dropped the ENTIRE rig for every "soldier" unit: the body
+# mesh kept its dominant BONE name (Bip01_r_upperarm), the body node degenerated into an
+# empty, and no armature was built at all -- while the vertex groups were imported fine, so
+# the model looked skinned but had no skeleton to drive it.
+CHARACTER_BODY_NODE_NAMES = ("soldat", "soldier")
+
+
+def _is_character_body_node(name: str) -> bool:
+    return _norm_low(name) in CHARACTER_BODY_NODE_NAMES
+
+
+def _find_character_body_name(values) -> str:
+    """Return the asset's OWN spelling of the body node, or "" when it has none."""
+    for v in values or ():
+        if _is_character_body_node(str(v)):
+            return str(v)
+    return ""
+
 
 
 def _warno_dev_scaled_xyz(
@@ -3176,7 +3285,15 @@ class WARNOImporterSettings(PropertyGroup):
     auto_name_materials: BoolProperty(name="Auto material naming", default=True)
     auto_pull_bones: BoolProperty(
         name="Auto pull bones",
-        default=False,
+        # ON by default: Eugen's own reference blends ship the rig (GreenBeret_1 has a
+        # 53-bone "papyrus" armature driving a 50-group "soldat" mesh; M1_Abrams has four
+        # track armatures). The importer already reads those bones and builds matching
+        # vertex groups, so leaving this off produced skinned meshes with no skeleton to
+        # drive them -- infantry imported looking boneless.
+        # Every joint now comes from the pack's own world matrices, so the rig matches
+        # those reference blends exactly (all 53 Bip01 heads, to under a millimetre);
+        # there is no longer an approximation to opt out of.
+        default=True,
         description="Build helper armature from parsed bone names and parent imported parts to bones",
     )
 
@@ -8835,12 +8952,28 @@ def _apply_vertex_groups_from_bucket(
         except Exception:
             is_rd_track = False
 
+    # Memoised per part: this is called once per VERTEX of the bucket, and it used to copy
+    # the part list plus the part's entire bone_idx/bone_w arrays on every call, which was
+    # the single biggest cost of an import (50k calls / ~128 s on a tank). The returned
+    # lists are only read (indexed) downstream, so one shared copy per part is equivalent.
+    _raw_bone_cache: Dict[int, Tuple[List[float], List[float]]] = {}
+
     def _raw_bone_payload(part_i: int) -> Tuple[List[float], List[float]]:
-        parts = list(model.get("parts", []) or [])
-        if not (0 <= int(part_i) < len(parts)):
-            return [], []
-        verts = parts[int(part_i)].get("vertices", {}) or {}
-        return list(verts.get("bone_idx", []) or []), list(verts.get("bone_w", []) or [])
+        key = int(part_i)
+        hit = _raw_bone_cache.get(key)
+        if hit is not None:
+            return hit
+        parts = model.get("parts", []) or []
+        if not (0 <= key < len(parts)):
+            out: Tuple[List[float], List[float]] = ([], [])
+        else:
+            verts = parts[key].get("vertices", {}) or {}
+            out = (
+                list(verts.get("bone_idx", []) or []),
+                list(verts.get("bone_w", []) or []),
+            )
+        _raw_bone_cache[key] = out
+        return out
 
     track_weights: Dict[str, Dict[int, float]] = {}
     deform_weights: Dict[str, Dict[int, float]] = {}
@@ -8919,8 +9052,14 @@ def _apply_vertex_groups_from_bucket(
                 vg = obj.vertex_groups.new(name=vg_name)
             else:
                 vg = obj.vertex_groups[vg_name]
-            for mapped_idx, weight in sorted(track_weights[vg_name].items()):
-                vg.add([int(mapped_idx)], float(weight), "REPLACE")
+            # One vg.add per DISTINCT weight instead of one per vertex: vg.add crosses the
+            # RNA boundary on every call, and a belt/hull group assigns the same weight to
+            # thousands of vertices. Identical result, REPLACE is per-index idempotent.
+            _by_w: Dict[float, List[int]] = {}
+            for mapped_idx, weight in track_weights[vg_name].items():
+                _by_w.setdefault(float(weight), []).append(int(mapped_idx))
+            for _w, _idxs in _by_w.items():
+                vg.add(_idxs, _w, "REPLACE")
             result["track_groups_added"] += 1
             result["track_groups_explicit"] += 1
             created_track_group_names.append(str(vg_name))
@@ -8976,8 +9115,12 @@ def _apply_vertex_groups_from_bucket(
             vg = obj.vertex_groups.get(str(vg_name))
             if vg is None:
                 vg = obj.vertex_groups.new(name=str(vg_name))
-            for mapped_idx, weight in sorted(deform_weights[vg_name].items()):
-                vg.add([int(mapped_idx)], float(weight), "REPLACE")
+            # see the track-weight loop above: batch by weight, one RNA call per value
+            _by_w2: Dict[float, List[int]] = {}
+            for mapped_idx, weight in deform_weights[vg_name].items():
+                _by_w2.setdefault(float(weight), []).append(int(mapped_idx))
+            for _w, _idxs in _by_w2.items():
+                vg.add(_idxs, _w, "REPLACE")
         result["group_added"] += len(deform_weights)
         return result
 
@@ -9192,7 +9335,7 @@ def _display_warno_node_name(raw_name: str, asset_hint: str = "") -> str:
     asset_low = _norm_low(asset_hint).replace("\\", "/")
     if "/ammo/armes/" in asset_low:
         return raw or low
-    if low in {"papyrus", "props", "soldat", "trappe_avant"}:
+    if low in {"papyrus", "props", "soldat", "soldier", "trappe_avant"}:
         return low
     if low == "fx_tir":
         return low
@@ -12488,7 +12631,7 @@ def _build_helper_armature(
     }
     papyrus_character_proxy = (
         "papyrus" in display_name_values_low
-        and "soldat" in display_name_values_low
+        and any(_is_character_body_node(n) for n in display_name_values_low)
         and any(name.startswith("bip01") for name in display_name_values_low)
     )
     papyrus_root_index = next(
@@ -12496,7 +12639,7 @@ def _build_helper_armature(
         -1,
     )
     soldat_root_index = next(
-        (int(idx) for idx, name in display_name_by_index.items() if _norm_low(str(name)) == "soldat"),
+        (int(idx) for idx, name in display_name_by_index.items() if _is_character_body_node(str(name))),
         -1,
     )
     character_bip_indices: set[int] = {
@@ -12742,11 +12885,78 @@ def _build_helper_armature(
             continue
         child_by_parent.setdefault(parent, []).append(child)
 
-    resolved_positions: Dict[int, Vector] = (
+    # --- exact node transforms ------------------------------------------------
+    # The node blob carries the scene's own world matrix for every node (see
+    # SpkMeshExtractor.parse_node_matrix_sections).  Where that is available the
+    # position is not something to infer: it is the value Eugen shipped, and it
+    # reproduces their reference scenes in Mods/ExampleAssets/Meshes exactly.
+    # Seed it here and lock it, so the inference passes further down - which
+    # exist for scenes that carry no such stream, and for Red Dragon / Steel
+    # Division, whose node blobs use a different layout - cannot move it.
+    exact_world_matrix_by_index: Dict[int, Matrix] = {}
+    _game_to_blender = _game_to_blender_basis(settings)
+    if _game_to_blender is not None:
+        _game_to_blender_inv = _game_to_blender.inverted_safe()
+        for _idx, _record in raw_scene_record_by_index.items():
+            _rows = getattr(_record, "exact_world_matrix", None)
+            if not isinstance(_rows, (list, tuple)) or len(_rows) < 4:
+                continue
+            try:
+                _game = Matrix(tuple(tuple(float(v) for v in row[:4]) for row in _rows[:4]))
+            except Exception:
+                continue
+            exact_world_matrix_by_index[int(_idx)] = _game_to_blender @ _game @ _game_to_blender_inv
+
+    # An identity world matrix is the pack's default value, and "at the origin" is not
+    # distinguishable from "left unset".  Reading it literally is right for a mesh carrier
+    # (WARNO geometry is world-baked, so the object origin does belong at 0,0,0) and for the
+    # scene roots.  It is wrong where the model is simply missing a value: T64_obr81 ships
+    # fx_fumee_chenille_d1 at the identity while its g1 twin sits at (-2.70, 1.36, 0), so
+    # taking it at face value drops the right-hand track-dust emitter into the middle of the
+    # tank.  When a side-mirrored twin IS placed, drop the identity and let the mirror and
+    # fallback passes below place the node as they did before.
+    if exact_world_matrix_by_index:
+        _geometry_bone_indices: set[int] = set()
+        for _obj in imported_objects:
+            try:
+                _gb = int(_obj.get("warno_group_bone_index", -1))
+            except Exception:
+                continue
+            if _gb >= 0:
+                _geometry_bone_indices.add(_gb)
+        _exact_names = {
+            int(i): _norm_low(str(bone_name_by_index.get(int(i), "") or ""))
+            for i in exact_world_matrix_by_index
+        }
+        _placed_names = {
+            nm
+            for i, nm in _exact_names.items()
+            if nm and exact_world_matrix_by_index[i].translation.length > 1.0e-6
+        }
+        for _idx in list(exact_world_matrix_by_index):
+            if exact_world_matrix_by_index[_idx].translation.length > 1.0e-6:
+                continue
+            if int(_idx) in _geometry_bone_indices:
+                continue
+            _twin = _mirrored_side_name(_exact_names.get(int(_idx), ""))
+            if _twin and _twin in _placed_names:
+                del exact_world_matrix_by_index[_idx]
+
+    resolved_positions: Dict[int, Vector] = _LockedPositions(
         {}
         if use_deterministic_raw_scene
         else {int(k): v.copy() for k, v in weighted_positions_by_index.items()}
     )
+    for _idx, _m in exact_world_matrix_by_index.items():
+        dict.__setitem__(resolved_positions, int(_idx), _m.translation.copy())
+        resolved_positions.locked.add(int(_idx))
+    if exact_world_matrix_by_index:
+        _warno_log(
+            settings,
+            "exact node transforms: %d/%d nodes placed from the mesh pack's own world matrices"
+            % (len(exact_world_matrix_by_index), len(ordered_indices)),
+            stage="bones",
+        )
     pending: set[int] = {int(i) for i in ordered_indices if int(i) not in resolved_positions}
     fallback_from_children = 0
     fallback_from_parent = 0
@@ -15918,6 +16128,8 @@ def _build_helper_armature(
         raw_low = _norm_low(str(bone_name_by_index.get(int(bidx), "")))
         if raw_low not in semantic_scene_nodes and raw_low not in semantic_support_nodes:
             continue
+        if int(bidx) in exact_world_matrix_by_index:
+            continue
         pos = resolved_positions.get(int(bidx))
         parent_idx = int(bone_parent_by_index.get(int(bidx), -1))
         parent_anchor = resolved_positions.get(int(parent_idx))
@@ -15939,6 +16151,13 @@ def _build_helper_armature(
         role_name = str(_semantic_role_for_index(int(bidx)) or ("weapon_fx_anchor" if raw_low in gfx_fx_nodes else "subdepiction_anchor" if raw_low in gfx_subdepiction_nodes else "semantic_helper"))
         parent_idx = int(bone_parent_by_index.get(int(bidx), -1))
         parent_anchor = resolved_positions.get(int(parent_idx))
+        if int(bidx) in exact_world_matrix_by_index:
+            # Already placed from the pack's own world matrix; none of the candidate
+            # scoring below can improve on that, so record it and move on.
+            semantic_helper_source_by_index[int(bidx)] = "spk_world_matrix"
+            semantic_helper_reason_by_index[int(bidx)] = str(role_name or "semantic_helper")
+            semantic_helpers_exact += 1
+            continue
         if semantic_helper_source_by_index.get(int(bidx), "") in {"gfx_exact", "spk_exact"}:
             if _is_usable_world_point(resolved_positions.get(int(bidx)), parent_anchor=parent_anchor):
                 continue
@@ -16204,6 +16423,13 @@ def _build_helper_armature(
             continue
         parent_idx = int(bone_parent_by_index.get(int(bidx), -1))
         parent_anchor = resolved_positions.get(int(parent_idx))
+        if int(bidx) in exact_world_matrix_by_index:
+            support_helper_source_by_index[int(bidx)] = "spk_world_matrix"
+            support_helper_reason_by_index[int(bidx)] = str(
+                _support_role_for_index(int(bidx)) or "semantic_support"
+            )
+            support_helpers_exact += 1
+            continue
         if support_helper_source_by_index.get(int(bidx), "") in {"gfx_exact", "spk_exact"}:
             if _is_usable_world_point(resolved_positions.get(int(bidx)), parent_anchor=parent_anchor):
                 continue
@@ -16978,7 +17204,7 @@ def _build_helper_armature(
                 return "skipped_unresolved", "raw_cylinder_omitted"
             if raw_low.startswith("bip01"):
                 return "skipped_unresolved", "character_bone_omitted"
-            if papyrus_character_proxy and raw_low == "soldat":
+            if papyrus_character_proxy and _is_character_body_node(raw_low):
                 return "skipped_unresolved", "character_mesh_proxy"
         if raw_low.startswith("armature_"):
             return "hidden_deform_helper", "track_carrier"
@@ -17063,11 +17289,24 @@ def _build_helper_armature(
 
         bip_head_by_index: Dict[int, Vector] = {}
         weighted_head_by_index: Dict[int, Vector] = {}
+        exact_bip_indices: set[int] = set()
         papyrus_root_record = raw_scene_record_by_index.get(int(papyrus_root_index))
         papyrus_root_off_points = list(getattr(papyrus_root_record, "off_mat_points", []) or [])
+        # A joint position is not something to estimate.  The mesh pack stores the
+        # scene's own world matrix for every node, so when that is present every
+        # bone head is taken from it verbatim; measured against Eugen's reference
+        # rig in Mods/ExampleAssets/Meshes it matches all 53 Bip01 joints exactly.
+        # The skin-weight centroid below is a 2-5 cm approximation of a joint and
+        # is used only for scenes that carry no such matrices.
         for bidx in sorted(character_bip_indices):
             raw_name = str(display_name_by_index.get(int(bidx), "") or "").strip()
             raw_low = _norm_low(raw_name)
+            exact_matrix = exact_world_matrix_by_index.get(int(bidx))
+            if isinstance(exact_matrix, Matrix):
+                bip_head_by_index[int(bidx)] = exact_matrix.translation.copy()
+                exact_bip_indices.add(int(bidx))
+                papyrus_bone_name_by_index[int(bidx)] = _character_bone_name(raw_name)
+                continue
             weighted = _pick_position_from_payload(raw_name, bone_positions)
             if isinstance(weighted, Vector) and "finger" in raw_low and float(weighted.z) < 0.4:
                 weighted = None
@@ -17105,8 +17344,33 @@ def _build_helper_armature(
             _norm_low(str(display_name_by_index.get(int(idx), "") or "")): int(idx)
             for idx in character_bip_indices
         }
+        semantic_parent_by_name = {v: k for k, v in semantic_child_by_name.items()}
+
+        def _character_incoming_span(idx: int) -> float:
+            """How far this joint sits from the joint it hangs off.
+
+            Used to keep a bone with no child joint proportional to the limb it
+            continues, instead of a fixed length that looks absurd on a toe.
+            """
+            here = bip_head_by_index.get(int(idx))
+            if here is None:
+                return CHARACTER_LEAF_BONE_LENGTH
+            raw = _norm_low(str(display_name_by_index.get(int(idx), "") or ""))
+            candidates = []
+            sem = bip_index_by_raw_low.get(semantic_parent_by_name.get(raw, ""))
+            if sem is not None:
+                candidates.append(int(sem))
+            candidates.append(int(bone_parent_by_index.get(int(idx), -1)))
+            for cand in candidates:
+                anchor_head = bip_head_by_index.get(int(cand))
+                if anchor_head is not None:
+                    span = float((here - anchor_head).length)
+                    if span > 1.0e-4:
+                        return span
+            return CHARACTER_LEAF_BONE_LENGTH
+
         for bidx in sorted(character_bip_indices):
-            if int(bidx) in weighted_head_by_index:
+            if int(bidx) in weighted_head_by_index or int(bidx) in exact_bip_indices:
                 continue
             head = bip_head_by_index.get(int(bidx))
             if head is None:
@@ -17149,13 +17413,46 @@ def _build_helper_armature(
                     semantic_head = bip_head_by_index.get(int(semantic_next_idx))
                     if semantic_head is not None:
                         child_heads.append(semantic_head.copy())
+                # Which way a bone points is in the data: the tail runs along the +X
+                # column of the node's own world matrix.  Measured against Eugen's
+                # reference rig that holds for all 53 bones, to three decimals.
+                # Only the LENGTH is missing from the pack -- it comes from the FBX
+                # limb size -- so it is taken from the child joint where there is one
+                # and otherwise kept short, rather than invented.  The old code put a
+                # fixed 0.4 m spike straight up out of every toe, and gave Bip01 and
+                # Bip01 Footsteps hardcoded 0.3 m / 0.458 m lengths lifted from this
+                # one character, which left a bone jutting forward out of the hips.
+                axis = None
+                exact_matrix = exact_world_matrix_by_index.get(int(bidx))
+                if isinstance(exact_matrix, Matrix):
+                    col = Vector((exact_matrix[0][0], exact_matrix[1][0], exact_matrix[2][0]))
+                    if col.length > 1.0e-9:
+                        axis = col.normalized()
                 tail = None
-                if raw_low == "bip01":
-                    tail = head + Vector((0.3, 0.0, 0.0))
-                elif raw_low == "bip01 footsteps":
-                    tail = head + Vector((0.458033, 0.0, 0.0))
-                else:
-                    child_heads = [pt for pt in child_heads if (pt - head).length > 1.0e-5]
+                child_heads = [pt for pt in child_heads if (pt - head).length > 1.0e-5]
+                if axis is not None:
+                    # Only a child that actually sits along the axis says anything about
+                    # this bone's length. Eugen's foot bone points down through the ankle
+                    # while the toe joint is forward of it, so projecting the toe onto the
+                    # foot's axis would shorten the bone for no reason.
+                    spans = []
+                    for pt in child_heads:
+                        delta = pt - head
+                        along = axis.dot(delta)
+                        if along <= 1.0e-4:
+                            continue
+                        across = (delta - axis * along).length
+                        if across > along * 0.25:
+                            continue
+                        spans.append(along)
+                    if spans:
+                        length = min(spans)
+                    else:
+                        length = min(_character_incoming_span(int(bidx)), CHARACTER_LEAF_BONE_LENGTH)
+                    tail = head + axis * max(length, 0.012)
+                if tail is None:
+                    # No matrix for this node (a scene with no transform stream): keep
+                    # the previous behaviour rather than guessing a direction.
                     if child_heads:
                         tail = min(child_heads, key=lambda pt: (pt - head).length_squared)
                     parent_idx = int(bone_parent_by_index.get(int(bidx), -1))
@@ -17177,6 +17474,55 @@ def _build_helper_armature(
                         eb.parent = edit_bones_by_index[int(parent_idx)]
                     except Exception:
                         continue
+
+            # Bip01 and Bip01 Footsteps carry no skin weights at all: they are the
+            # Biped's root and ground markers, and Eugen draws them as bones pointing
+            # straight out of the hips and along the floor. They are part of the rig, so
+            # they stay, but a bone that deforms nothing does not belong in the way of
+            # someone posing the character - park them in a hidden collection instead.
+            weighted_bone_names = set()
+            for _obj in imported_objects:
+                try:
+                    for _vg in _obj.vertex_groups:
+                        weighted_bone_names.add(_norm_low(_vg.name))
+                except Exception:
+                    continue
+            # Technical means the bone deforms nothing AND nothing above it does either,
+            # so it sits outside the skinned chain entirely. Testing the bone alone would
+            # also catch a fingertip that just happens to have no weights in one model,
+            # and hiding that would make the hand look a segment short.
+            def _is_technical(idx, _seen=None):
+                seen = _seen or set()
+                if int(idx) in seen:
+                    return False
+                seen.add(int(idx))
+                eb_here = edit_bones_by_index.get(int(idx))
+                if eb_here is None:
+                    return False
+                if _norm_low(eb_here.name) in weighted_bone_names:
+                    return False
+                parent_idx = int(bone_parent_by_index.get(int(idx), -1))
+                if parent_idx not in edit_bones_by_index:
+                    return True
+                return _is_technical(parent_idx, seen)
+
+            technical = [eb for idx, eb in edit_bones_by_index.items() if _is_technical(idx)]
+            if technical and weighted_bone_names:
+                try:
+                    tech_coll = arm_data.collections.new("Technical")
+                    for eb in technical:
+                        tech_coll.assign(eb)
+                        eb.use_deform = False
+                    tech_coll.is_visible = False
+                    _warno_log(
+                        settings,
+                        "character rig: %d bone(s) carry no weights, hidden in the "
+                        "Technical collection (%s)"
+                        % (len(technical), ", ".join(sorted(eb.name for eb in technical))),
+                        stage="bones",
+                    )
+                except Exception:
+                    pass
         finally:
             bpy.ops.object.mode_set(mode="OBJECT")
 
@@ -17757,7 +18103,7 @@ def _build_helper_armature(
                 continue
         for obj in imported_objects:
             raw_low = _norm_low(str(obj.name))
-            if raw_low == "soldat":
+            if _is_character_body_node(raw_low):
                 if obj.type == "MESH":
                     try:
                         _set_object_origin_world(obj, Vector((0.0, 0.0, 0.0)))
@@ -17781,7 +18127,7 @@ def _build_helper_armature(
             if not bone_name:
                 continue
             transform_row = exact_local_transform_by_index.get(int(bidx))
-            keep_child_world = child.type == "MESH" and raw_low == "soldat"
+            keep_child_world = child.type == "MESH" and _is_character_body_node(raw_low)
             if child.parent != papyrus_armature_obj or child.parent_type != "BONE" or child.parent_bone != bone_name:
                 preserved_world = child.matrix_world.copy() if keep_child_world else None
                 child.parent = papyrus_armature_obj
@@ -18029,6 +18375,75 @@ def _build_helper_armature(
                 f"| policy_skipped={node_policy_counts.get('skipped_unresolved', 0)}"
             ),
             stage="armature",
+        )
+
+    # --- final pass: the game's own world transforms win -----------------------
+    # Everything above places nodes and then re-parents them.  Bone parenting makes
+    # `location` relative to the parent bone's tail, and a few passes deliberately
+    # nudge helpers (track smoke, rotor FX) away from their pivot.  Where the mesh
+    # pack gave us the scene's own world matrix there is nothing to nudge towards:
+    # re-assert it last so the result is what Eugen ships.  Meshes that the Red
+    # Dragon path intentionally re-origins to a geometric centroid are left alone.
+    exact_world_reasserted = 0
+    if exact_world_matrix_by_index:
+        # matrix_world is only recomputed on depsgraph evaluation, so refresh before
+        # reading it and again after each hierarchy level is moved - otherwise a
+        # parent moved in this pass would hand its children a stale basis.
+        bpy.context.view_layer.update()
+
+        def _object_depth(obj: bpy.types.Object) -> int:
+            depth = 0
+            cur = obj
+            while cur.parent is not None and depth < 64:
+                cur = cur.parent
+                depth += 1
+            return depth
+
+        targets: List[Tuple[int, bpy.types.Object, Matrix]] = []
+        for _bidx, _exact in exact_world_matrix_by_index.items():
+            node = node_by_bone_index.get(int(_bidx))
+            if node is None:
+                continue
+            if node.type == "MESH" and node.get("warno_rd_centroid_origin"):
+                continue
+            targets.append((_object_depth(node), node, _exact.copy()))
+
+        for depth in sorted({entry[0] for entry in targets}):
+            moved = False
+            for entry_depth, node, exact_matrix in targets:
+                if entry_depth != depth:
+                    continue
+                try:
+                    target = exact_matrix.translation.copy()
+                    if node.type == "MESH":
+                        # Mesh vertices are baked in world space here, so only the origin
+                        # moves; rotating the object would turn the geometry as well.
+                        if (node.matrix_world.translation - target).length <= 1.0e-5:
+                            continue
+                        _set_object_origin_world(node, target)
+                    else:
+                        # An empty carries no geometry, so its full orientation can come
+                        # from the pack. Riggers read it (FX direction, mount orientation).
+                        want = Matrix.Translation(target) @ exact_matrix.to_3x3().to_4x4()
+                        current = node.matrix_world
+                        if max(
+                            abs(want[r][c] - current[r][c]) for r in range(3) for c in range(4)
+                        ) <= 1.0e-5:
+                            continue
+                        node.matrix_world = want
+                    exact_world_reasserted += 1
+                    moved = True
+                except Exception:
+                    continue
+            if moved:
+                bpy.context.view_layer.update()
+
+    if exact_world_reasserted:
+        _warno_log(
+            settings,
+            "exact node transforms: re-asserted %d node world positions after parenting"
+            % exact_world_reasserted,
+            stage="bones",
         )
 
     if created_armatures:
@@ -20170,7 +20585,7 @@ class WARNO_OT_ImportAsset(Operator):
             vehicle_like_asset = _raw_scene_looks_vehicle_like(sorted(raw_name_values))
             papyrus_character_mesh_proxy = (
                 "papyrus" in raw_name_values
-                and "soldat" in raw_name_values
+                and any(_is_character_body_node(n) for n in raw_name_values)
                 and _norm_low(node_name_raw).startswith("bip01")
             )
             _peeled_name = str(bucket.get("warno_peeled_name", "") or "").strip()
@@ -20179,12 +20594,13 @@ class WARNO_OT_ImportAsset(Operator):
                 # chassis bone (which made antennas import as "Chassis_2/Chassis_3").
                 preferred_group_name = _peeled_name
             elif papyrus_character_mesh_proxy:
-                preferred_group_name = _display_warno_node_name("soldat", asset_real)
+                _body_node = _find_character_body_name(raw_name_values) or "soldat"
+                preferred_group_name = _display_warno_node_name(_body_node, asset_real)
                 soldat_proxy_index = next(
                     (
                         int(idx)
                         for idx, name in (node_name_map.items() if isinstance(node_name_map, dict) else [])
-                        if _norm_low(str(name)) == "soldat"
+                        if _is_character_body_node(str(name))
                     ),
                     group_bone_index,
                 )
@@ -20218,29 +20634,69 @@ class WARNO_OT_ImportAsset(Operator):
                 # (_split_track_chains_textures sets maps["uv_crop"]=(v0,v1)), remap that
                 # face's V into [0,1] of the crop so the UV fills the cropped texture like
                 # the Ninja-Rip — v' = (v - v0)/(v1 - v0). All other faces keep the exact UV.
+                # Written through foreach_set: assigning uv_layer.data[li].uv one loop at a
+                # time crosses the RNA boundary per element, which dominated import time on
+                # big meshes (a tank hull is ~120k loops). Same values, one C-level call.
                 _bu = bucket["uvs"]; _fmids = bucket["face_mids"]
                 _crop_by_mid: Dict[int, Any] = {}
                 for _mid in {int(m) for m in _fmids}:
                     _mm = material_maps_by_name.get(material_name_by_id.get(_mid))
                     if isinstance(_mm, dict) and _mm.get("uv_crop"):
                         _crop_by_mid[_mid] = _mm["uv_crop"]
-                for fi, poly in enumerate(mesh.polygons):
-                    vc = _crop_by_mid.get(int(_fmids[fi])) if fi < len(_fmids) else None
-                    for li, vi in zip(poly.loop_indices, poly.vertices):
-                        if 0 <= vi < len(_bu):
-                            u, v = _bu[vi]
-                            if vc is not None:
-                                v0, v1 = vc
-                                if (v1 - v0) > 1e-6:
-                                    v = (v - v0) / (v1 - v0)
-                            uv_layer.data[li].uv = (u, v)
-                        else:
-                            uv_layer.data[li].uv = (0.0, 0.0)
 
+                _nloops = len(mesh.loops)
+                _lvi = [0] * _nloops
+                mesh.loops.foreach_get("vertex_index", _lvi)
+                _nbu = len(_bu)
+                # default 0.0 keeps the old behaviour for loops whose vertex index is out of
+                # range of the decoded UV array
+                _uv_flat = [0.0] * (_nloops * 2)
+                if _crop_by_mid:
+                    _npoly = len(mesh.polygons)
+                    _lstart = [0] * _npoly
+                    _ltotal = [0] * _npoly
+                    mesh.polygons.foreach_get("loop_start", _lstart)
+                    mesh.polygons.foreach_get("loop_total", _ltotal)
+                    for fi in range(_npoly):
+                        vc = _crop_by_mid.get(int(_fmids[fi])) if fi < len(_fmids) else None
+                        _s = _lstart[fi]
+                        _e = _s + _ltotal[fi]
+                        if vc is None:
+                            for li in range(_s, _e):
+                                vi = _lvi[li]
+                                if 0 <= vi < _nbu:
+                                    u, v = _bu[vi]
+                                    _uv_flat[2 * li] = u
+                                    _uv_flat[2 * li + 1] = v
+                        else:
+                            v0, v1 = vc
+                            _dv = v1 - v0
+                            for li in range(_s, _e):
+                                vi = _lvi[li]
+                                if 0 <= vi < _nbu:
+                                    u, v = _bu[vi]
+                                    if _dv > 1e-6:
+                                        v = (v - v0) / _dv
+                                    _uv_flat[2 * li] = u
+                                    _uv_flat[2 * li + 1] = v
+                else:
+                    for li in range(_nloops):
+                        vi = _lvi[li]
+                        if 0 <= vi < _nbu:
+                            u, v = _bu[vi]
+                            _uv_flat[2 * li] = u
+                            _uv_flat[2 * li + 1] = v
+                uv_layer.data.foreach_set("uv", _uv_flat)
+
+            # order-preserving dedup with a set: `not in list` over every face id was
+            # quadratic on meshes with 100k+ faces
             mids_order: List[int] = []
+            _mids_seen: set[int] = set()
             for mid in bucket["face_mids"]:
-                if int(mid) not in mids_order:
-                    mids_order.append(int(mid))
+                _m = int(mid)
+                if _m not in _mids_seen:
+                    _mids_seen.add(_m)
+                    mids_order.append(_m)
 
             mat_slot_by_mid: Dict[int, int] = {}
             asset_namespace = _warno_asset_namespace(asset)

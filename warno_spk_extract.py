@@ -132,6 +132,12 @@ class RawNodeRecord:
     local_transform: RawNodeTransform | None = None
     world_translation: List[float] | None = None
     deterministic_miss: str = ""
+    # Exact transforms decoded from the node blob's matrix stream (game space,
+    # translations already scaled to metres).  Populated only when the stream
+    # self-validates; see SpkMeshExtractor.parse_node_matrix_sections.
+    exact_world_matrix: List[List[float]] | None = None
+    exact_local_matrix: List[List[float]] | None = None
+    exact_inverse_bind_matrix: List[List[float]] | None = None
 
 
 @dataclass
@@ -141,6 +147,9 @@ class RawSceneGraph:
     stream_start_index: int
     stream_end_index: int
     records: List[RawNodeRecord]
+    # True when every record carries an exact_world_matrix straight out of the
+    # node blob, so no positional guessing is needed for this scene at all.
+    exact_transforms: bool = False
 
 
 def _norm_low(value: str) -> str:
@@ -3506,7 +3515,23 @@ def split_faces_by_bone_deterministic(
         # e.g. the left track's bucket inherits the Droite material and both tracks end
         # up named "Chenille_Droite". When the part's side is known from its role/name,
         # keep ALL its triangles on that one side so object + material stay consistent.
-        force_side = default_track_side if default_track_side in ("left", "right") else ""
+        # ...but the SKELETON outranks the material name. A WARNO tank gives both belts the
+        # very same material (e.g. "T55AMV_tracks"), which carries no side at all, yet the
+        # role classifier answers "track_right" for a bare "tracks" -- so both belts were
+        # forced onto the right and merged into a single Chenille_Droite object holding two
+        # identically named material slots and only the D-side vertex groups. The bones are
+        # unambiguous here (roue_elev_d* / roue_elev_g*, chenille_droite_01 /
+        # chenille_gauche_01), so when THIS part's triangles all resolve to one side by
+        # bone, that side wins. Mixed or side-less bone evidence keeps the old behaviour.
+        _bone_sides = {
+            str(info.get("tri_side", "") or "")
+            for info in tri_infos
+            if str(info.get("tri_side", "") or "") in ("left", "right")
+        }
+        if len(_bone_sides) == 1:
+            force_side = next(iter(_bone_sides))
+        else:
+            force_side = default_track_side if default_track_side in ("left", "right") else ""
         for info in tri_infos:
             tri = info["tri"]
             gbone = int(info.get("group_bone_index", -1))
@@ -6250,6 +6275,8 @@ class SpkMeshExtractor:
         self._node_parents_cache: Dict[int, List[int]] = {}
         self._node_off_mat_points_cache: Dict[int, List[List[Tuple[float, float, float]]]] = {}
         self._node_off_mat_blocks_cache: Dict[int, List[List[List[float]]]] = {}
+        self._node_matrix_sections_cache: Dict[int, Any] = {}
+        self._node_exact_world_cache: Dict[int, Any] = {}
 
         try:
             self._parse_header()
@@ -7580,6 +7607,141 @@ class SpkMeshExtractor:
         self._node_off_mat_blocks_cache[node_index] = out
         return out
 
+    # ------------------------------------------------------------------
+    # Exact node transforms (reverse-engineered node-blob matrix stream)
+    #
+    # The bytes between off_mat and off_parent are a flat stream of
+    # 3 * node_count row-major 3x4 affine matrices, 48 bytes each, in three
+    # equal sections:
+    #
+    #     section 0   m = i                   inverse bind   world -> node
+    #     section 1   m = node_count + i      local          parent -> node
+    #     section 2   m = 2 * node_count + i  world          node -> world
+    #
+    # The translation of a section-2 matrix, times off_mat_scale, IS the node's
+    # exact world position; mirroring Y puts it in the same space as the mesh.
+    #
+    # Validated on every entry of every WARNO mesh pack (13177 assets,
+    # 183323 nodes): section0 @ section2 == identity and
+    # section2[i] == section2[parent] @ section1[i] for every node, to 1e-4.
+    # The section-2 translations also reproduce Eugen's own reference scenes in
+    # Mods/ExampleAssets/Meshes exactly: 234 of 234 comparable nodes over
+    # M1_Abrams, GAZ_66B, Mi_24V, AT_D44_85mm, AK_74 and GreenBeret_1.
+    #
+    # The legacy parse_node_off_mat_points / parse_node_off_mat_blocks readers
+    # group this same stream by 144-byte record instead of by section, so the
+    # three values they report for node i actually belong to matrices 3i, 3i+1
+    # and 3i+2 - three different nodes in three different sections.  They are
+    # kept for the older callers; new code should use the exact readers below.
+    # ------------------------------------------------------------------
+    _EXACT_MATRIX_TOL = 1.0e-4
+    _EXACT_MATRIX_REL_TOL = 1.0e-5
+
+    def parse_node_matrix_sections(
+        self, node_index: int
+    ) -> Tuple[List[List[List[float]]], List[List[List[float]]], List[List[List[float]]]] | None:
+        """Return (inverse_bind, local, world) 4x4 row-major matrices per node.
+
+        Translations are scaled to metres by off_mat_scale; rotation/scale parts
+        are returned as stored.  Returns None when the blob does not carry a
+        three-section matrix stream.
+        """
+        cached = self._node_matrix_sections_cache.get(node_index)
+        if cached is not None:
+            return cached if cached else None
+
+        blob = self.get_node_blob(node_index)
+        layout = self._parse_node_blob_layout(blob) if blob else None
+        if layout is None:
+            self._node_matrix_sections_cache[node_index] = ()
+            return None
+        node_count, off_mat, off_parent, _off_names = layout
+        if node_count <= 0 or int(off_parent) - int(off_mat) != node_count * 144:
+            self._node_matrix_sections_cache[node_index] = ()
+            return None
+
+        scale = float(self.off_mat_scale)
+
+        def _read(m: int) -> List[List[float]]:
+            v = struct.unpack_from("<12f", blob, off_mat + m * 48)
+            return [
+                [float(v[0]), float(v[1]), float(v[2]), float(v[3]) * scale],
+                [float(v[4]), float(v[5]), float(v[6]), float(v[7]) * scale],
+                [float(v[8]), float(v[9]), float(v[10]), float(v[11]) * scale],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+
+        try:
+            inverse_bind = [_read(i) for i in range(node_count)]
+            local = [_read(node_count + i) for i in range(node_count)]
+            world = [_read(2 * node_count + i) for i in range(node_count)]
+        except Exception:
+            self._node_matrix_sections_cache[node_index] = ()
+            return None
+
+        out = (inverse_bind, local, world)
+        self._node_matrix_sections_cache[node_index] = out
+        return out
+
+    def parse_node_exact_world_matrices(self, node_index: int) -> List[List[List[float]]] | None:
+        """Validated section-2 world matrices, or None if the stream fails its checks.
+
+        The two checks are structural identities of the format, not tolerant
+        guesses: the inverse-bind section must invert the world section, and the
+        world section must equal parent-world composed with the local section.
+        A blob in a foreign layout fails them, so callers fall back cleanly.
+        """
+        cached = self._node_exact_world_cache.get(node_index)
+        if cached is not None:
+            return cached if cached else None
+
+        sections = self.parse_node_matrix_sections(node_index)
+        if sections is None:
+            self._node_exact_world_cache[node_index] = ()
+            return None
+        inverse_bind, local, world = sections
+        node_count = len(world)
+        parents = list(self.parse_node_parent_indices(node_index))
+        if len(parents) < node_count:
+            self._node_exact_world_cache[node_index] = ()
+            return None
+
+        tol = float(self._EXACT_MATRIX_TOL)
+        rel = float(self._EXACT_MATRIX_REL_TOL)
+        identity = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+        for idx in range(node_count):
+            probe = _mat4_mul(inverse_bind[idx], world[idx])
+            for row in range(3):
+                for col in range(3):
+                    if abs(probe[row][col] - identity[row][col]) > tol:
+                        self._node_exact_world_cache[node_index] = ()
+                        return None
+                if abs(probe[row][3]) > tol:
+                    self._node_exact_world_cache[node_index] = ()
+                    return None
+            parent_idx = int(parents[idx])
+            parent_world = world[parent_idx] if 0 <= parent_idx < node_count else identity
+            composed = _mat4_mul(parent_world, local[idx])
+            magnitude = max(1.0, max(abs(world[idx][r][3]) for r in range(3)))
+            for row in range(3):
+                for col in range(3):
+                    if abs(composed[row][col] - world[idx][row][col]) > tol:
+                        self._node_exact_world_cache[node_index] = ()
+                        return None
+                if abs(composed[row][3] - world[idx][row][3]) > tol + rel * magnitude:
+                    self._node_exact_world_cache[node_index] = ()
+                    return None
+
+        self._node_exact_world_cache[node_index] = world
+        return world
+
+    def parse_node_exact_world_positions(self, node_index: int) -> List[Tuple[float, float, float]] | None:
+        """Exact per-node world positions in game space (Y not yet mirrored)."""
+        world = self.parse_node_exact_world_matrices(node_index)
+        if world is None:
+            return None
+        return [(float(m[0][3]), float(m[1][3]), float(m[2][3])) for m in world]
+
     def parse_raw_scene_graph(self, node_index: int) -> RawSceneGraph | None:
         names = list(self.parse_node_names(node_index))
         if not names:
@@ -7683,6 +7845,22 @@ class SpkMeshExtractor:
                     own_transform_candidates=own_transform_candidates,
                 )
             )
+
+        # Attach the exact transforms straight off the matrix stream.  When they
+        # are available nothing downstream needs to infer a position.
+        exact_sections = self.parse_node_matrix_sections(node_index)
+        exact_world = self.parse_node_exact_world_matrices(node_index)
+        exact_transforms = False
+        if exact_world is not None and len(exact_world) >= node_count:
+            exact_inverse, exact_local, _ = exact_sections or ([], [], [])
+            for idx in range(node_count):
+                record = records[idx]
+                record.exact_world_matrix = [[float(v) for v in row] for row in exact_world[idx]]
+                if idx < len(exact_local):
+                    record.exact_local_matrix = [[float(v) for v in row] for row in exact_local[idx]]
+                if idx < len(exact_inverse):
+                    record.exact_inverse_bind_matrix = [[float(v) for v in row] for row in exact_inverse[idx]]
+            exact_transforms = True
 
         stream_start_index, stream_end_index = _off_mat_stream_section_bounds(node_count)
         for source_idx in range(int(stream_start_index), int(stream_end_index)):
@@ -7813,6 +7991,7 @@ class SpkMeshExtractor:
             stream_start_index=int(stream_start_index),
             stream_end_index=int(stream_end_index),
             records=records,
+            exact_transforms=bool(exact_transforms),
         )
 
     def find_node_names_for_asset(self, asset_path: str) -> List[str]:
@@ -7963,6 +8142,12 @@ class SpkMeshExtractor:
             "$/M3D/System/VertexType/TVertex__Position_3f__TexCoord0_2wn__TangentIn01_4ubn__BinormalIn01_4ubn__TexPackedAtlas0_4ubn__TexPackedAtlas1_4ubn__TexPackedAtlas2_4ubn",
             "$/M3D/System/VertexType/TVertex__Position_3f__NormalIn01_4ubn__TexCoord0_2wn__TexPackedAtlas0_4ubn__TexPackedAtlas1_4ubn__TexPackedAtlas2_4ubn",
             "$/M3D/System/VertexType/TVertex__Position_3f__NormalIn01_4ubn__TexCoord0_2wn__TexPackedAtlas0_4ubn",
+            # Vegetation (trees, crops, bushes, hedges) uses the same layout WITHOUT the
+            # trailing atlas field. Measured stride on every foliage buffer in Fulda.spk is
+            # exactly 20 bytes = 12 (Position_3f) + 4 (NormalIn01_4ubn) + 4 (TexCoord0_2wn),
+            # which is what the name says. Without this entry the whole vegetation category
+            # failed the import outright with "Unsupported vertex format".
+            "$/M3D/System/VertexType/TVertex__Position_3f__NormalIn01_4ubn__TexCoord0_2wn",
             "$/M3D/System/VertexType/TVertex__Position_3f__BlW_4ubn__BlIdx_4ub__TexCoord0_2wn__TangentIn01_4ubn__BinormalIn01_4ubn",
             "$/M3D/System/VertexType/TVertex__Position_3f__BlW_4ubn__BlIdx_4ub__TexCoord0_2wn__TangentIn01_4ubn__BinormalAndChenilleIndexIn01_4ubn",
             "$/M3D/System/VertexType/TVertex__Position_3f__NormalIn01_4ubn__BlW_4ubn__BlIdx_4ub__TexCoord0_2wn",
@@ -8016,6 +8201,10 @@ class SpkMeshExtractor:
                 skip(0x04)
                 uv.extend([ru16_uv(), ru16_uv()])
                 skip(0x04)
+            elif fmt == "$/M3D/System/VertexType/TVertex__Position_3f__NormalIn01_4ubn__TexCoord0_2wn":
+                # identical to the branch above minus the trailing TexPackedAtlas0 (20-byte stride)
+                skip(0x04)
+                uv.extend([ru16_uv(), ru16_uv()])
             elif fmt in {
                 "$/M3D/System/VertexType/TVertex__Position_3f__BlW_4ubn__BlIdx_4ub__TexCoord0_2wn__TangentIn01_4ubn__BinormalIn01_4ubn",
                 "$/M3D/System/VertexType/TVertex__Position_3f__BlW_4ubn__BlIdx_4ub__TexCoord0_2wn__TangentIn01_4ubn__BinormalAndChenilleIndexIn01_4ubn",
@@ -9247,6 +9436,34 @@ def build_or_load_atlas_texture_map(
     return dict(result)
 
 
+def _gfx_sources_signature(warno_root: Path, gfx_cli_path: "Path | None") -> List[List[Any]]:
+    """Identity of everything the GFX CLI reads, so a negative result can be cached safely.
+
+    The CLI builds its manifest from <warnoRoot>/Output/AllPlatforms/NDF/GFX/*.ndfbin -- a
+    dump the USER produces with the game's own export. When that dump is missing or older
+    than the unit being imported, the CLI scans it for ~3 minutes and then fails, and the
+    importer silently falls back to the legacy manifest. Paying that on every import is
+    pure waste, so the failure is remembered against this signature and retried only once
+    the dump (or the CLI itself) actually changes.
+    """
+    out: List[List[Any]] = []
+    gfx_root = Path(warno_root) / "Output" / "AllPlatforms" / "NDF" / "GFX"
+    for name in ("Unit.ndfbin", "Weapon.ndfbin", "Depiction.ndfbin", "DepictionResources.ndfbin"):
+        f = gfx_root / name
+        try:
+            st = f.stat()
+            out.append([name, int(st.st_mtime_ns), int(st.st_size)])
+        except Exception:
+            out.append([name, 0, -1])
+    try:
+        if gfx_cli_path is not None and str(gfx_cli_path).strip():
+            st = Path(str(gfx_cli_path)).stat()
+            out.append(["cli", int(st.st_mtime_ns), int(st.st_size)])
+    except Exception:
+        out.append(["cli", 0, -1])
+    return out
+
+
 def build_or_load_gfx_manifest(
     warno_root: Path,
     modding_suite_root: Path,
@@ -9274,6 +9491,19 @@ def build_or_load_gfx_manifest(
         raise RuntimeError(f"GFX manifest wrapper not found: {wrapper}")
 
     need_export = force_rebuild or not out_json.exists()
+    miss_path = out_json.with_name(out_json.name[: -len(".json")] + ".miss.json")
+    gfx_sig = _gfx_sources_signature(warno_root, gfx_cli_path)
+    if need_export and not force_rebuild and miss_path.exists():
+        try:
+            _prev = json.loads(miss_path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            _prev = None
+        if isinstance(_prev, dict) and _prev.get("sources_signature") == gfx_sig:
+            raise RuntimeError(
+                "GFX manifest unavailable for this asset (remembered from the previous "
+                "attempt; the Output/AllPlatforms/NDF/GFX dump has not changed since): "
+                + str(_prev.get("error", ""))[:300]
+            )
     if need_export:
         temp_out = out_json.with_suffix(".tmp.json")
         cmd_tail = [
@@ -9315,7 +9545,19 @@ def build_or_load_gfx_manifest(
             msg = (proc.stderr or proc.stdout or "").strip()
             errors.append(f"[{' '.join(py_cmd)}] rc={proc.returncode}: {msg}")
         if errors:
-            raise RuntimeError("GFX manifest export failed: " + " | ".join(errors[:2]))
+            joined = " | ".join(errors[:2])
+            try:
+                miss_path.write_text(
+                    json.dumps(
+                        {"asset_path": asset_norm, "sources_signature": gfx_sig, "error": joined},
+                        ensure_ascii=False,
+                        indent=1,
+                    ),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+            raise RuntimeError("GFX manifest export failed: " + joined)
 
     sig = _atlas_map_signature(out_json)
     try:
