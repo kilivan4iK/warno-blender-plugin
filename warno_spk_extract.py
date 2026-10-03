@@ -3326,20 +3326,31 @@ def conservative_cleanup_bucket_geometry(
 def resolve_center_wheel_bone_index(
     elev_idx: int,
     bone_name_by_index: Dict[int, str],
+    bone_parent_by_index: Dict[int, int] | None = None,
 ) -> int:
-    cur_name = str(bone_name_by_index.get(int(elev_idx), "")).strip()
-    parsed = _parse_wheel_bone_name(cur_name)
+    """The wheel bone an elevator (suspension) bone carries.
+
+    Taken from the node table: the elevator's own wheel child with the same side and
+    number. The old version rebuilt the name as "roue_<side><num>" and missed every
+    other spelling ("roue_elev_d01" -> "roue_d01", "roue_elev_droite_2").
+    """
+    parsed = _parse_wheel_bone_name(str(bone_name_by_index.get(int(elev_idx), "")).strip())
     if parsed is None:
         return int(elev_idx)
     kind, side, num = parsed
     if kind != "elev":
         return int(elev_idx)
 
-    target_low = f"roue_{side.lower()}{num}"
-    for bidx, raw_name in bone_name_by_index.items():
-        if _normalize_bone_name_for_tokens(str(raw_name or "")) == target_low:
-            return int(bidx)
-    return int(elev_idx)
+    def _same_wheel(bidx: int) -> bool:
+        other = _parse_wheel_bone_name(str(bone_name_by_index.get(int(bidx), "")).strip())
+        return other is not None and other[0] != "elev" and other[1] == side and int(other[2]) == int(num)
+
+    if bone_parent_by_index:
+        children = [int(b) for b, parent in bone_parent_by_index.items() if int(parent) == int(elev_idx) and _same_wheel(int(b))]
+        if len(children) == 1:
+            return children[0]
+    matches = [int(b) for b in bone_name_by_index if _same_wheel(int(b))]
+    return matches[0] if len(matches) == 1 else int(elev_idx)
 
 
 def split_faces_by_bone_deterministic(
@@ -3401,29 +3412,50 @@ def split_faces_by_bone_deterministic(
     tri_infos: List[Dict[str, Any]] = []
     side_counter: Dict[str, int] = {"left": 0, "right": 0}
 
-    for tri in tris_all:
-        a, b, c = tri
-        if min(a, b, c) < 0 or max(a, b, c) >= len(dominant):
-            continue
+    # Everything below depends only on the bone, so resolve each bone once instead of
+    # running the name classifiers' regexes for every triangle.
+    bone_info_cache: Dict[int, Tuple[str, str, int, str, str]] = {}
 
-        votes = [int(dominant[a]), int(dominant[b]), int(dominant[c])]
-        vote_counts: Dict[int, int] = {}
-        for v in votes:
-            vote_counts[v] = vote_counts.get(v, 0) + 1
-        dom_bone = min(vote_counts.keys(), key=lambda x: (-vote_counts[x], int(x)))
-
+    def _bone_info(dom_bone: int) -> Tuple[str, str, int, str, str]:
+        cached = bone_info_cache.get(dom_bone)
+        if cached is not None:
+            return cached
         raw_bone_name = str(bone_name_by_index.get(int(dom_bone), f"bone_{int(dom_bone):03d}") or f"bone_{int(dom_bone):03d}")
         group_name = classify_group_from_bone_name(raw_bone_name)
         group_bone_index = int(dom_bone)
-        tri_side = _track_side_from_bone_name(raw_bone_name)
-
         if group_name.startswith("Roue_"):
-            center_idx = resolve_center_wheel_bone_index(int(dom_bone), bone_name_by_index)
+            center_idx = resolve_center_wheel_bone_index(int(dom_bone), bone_name_by_index, bone_parent_by_index)
             group_bone_index = int(center_idx)
             center_name = str(bone_name_by_index.get(int(center_idx), raw_bone_name) or raw_bone_name)
             center_group = classify_group_from_bone_name(center_name)
             if center_group.startswith("Roue_"):
                 group_name = center_group
+        result = (
+            raw_bone_name,
+            str(group_name),
+            int(group_bone_index),
+            str(_track_side_from_bone_name(raw_bone_name) or ""),
+            _normalize_bone_name_for_tokens(raw_bone_name),
+        )
+        bone_info_cache[dom_bone] = result
+        return result
+
+    n_dominant = len(dominant)
+    for tri in tris_all:
+        a, b, c = tri
+        if min(a, b, c) < 0 or max(a, b, c) >= n_dominant:
+            continue
+
+        da, db, dc = int(dominant[a]), int(dominant[b]), int(dominant[c])
+        # Majority of the three corners; on a three-way split the lowest index wins.
+        if da == db or da == dc:
+            dom_bone = da
+        elif db == dc:
+            dom_bone = db
+        else:
+            dom_bone = min(da, db, dc)
+
+        raw_bone_name, group_name, group_bone_index, tri_side, raw_low = _bone_info(dom_bone)
 
         if tri_side in side_counter:
             side_counter[tri_side] += 1
@@ -3431,11 +3463,11 @@ def split_faces_by_bone_deterministic(
         tri_infos.append(
             {
                 "tri": (int(a), int(b), int(c)),
-                "group_name": str(group_name),
-                "group_bone_index": int(group_bone_index),
-                "tri_side": str(tri_side or ""),
-                "raw_bone_name": str(raw_bone_name),
-                "raw_bone_name_low": _normalize_bone_name_for_tokens(raw_bone_name),
+                "group_name": group_name,
+                "group_bone_index": group_bone_index,
+                "tri_side": tri_side,
+                "raw_bone_name": raw_bone_name,
+                "raw_bone_name_low": raw_low,
                 "group_name_source": "classifier",
             }
         )
@@ -3530,14 +3562,49 @@ def split_faces_by_bone_deterministic(
             for info in tri_infos
             if str(info.get("tri_side", "") or "") in ("left", "right")
         }
+        component_side: Dict[int, str] = {}
         if len(_bone_sides) == 1:
             force_side = next(iter(_bone_sides))
+        elif len(_bone_sides) == 2:
+            # Both belts in ONE draw call (one material, e.g. "T55AMV_tracks"): the side
+            # comes from the bones, per connected piece of belt -- each component takes the
+            # side most of its triangles are skinned to. Forcing the material-name side here
+            # merged both belts into Chenille_Droite and threw the left belt's weights away.
+            force_side = ""
+            parent_of: Dict[int, int] = {}
+
+            def _find(v: int) -> int:
+                root = v
+                while parent_of.get(root, root) != root:
+                    root = parent_of[root]
+                while parent_of.get(v, v) != root:
+                    parent_of[v], v = root, parent_of[v]
+                return root
+
+            for info in tri_infos:
+                a, b, c = info["tri"]
+                ra, rb, rc = _find(a), _find(b), _find(c)
+                parent_of[rb] = ra
+                parent_of[_find(rc)] = ra
+            votes: Dict[int, List[int]] = {}
+            for info in tri_infos:
+                side = str(info.get("tri_side", "") or "")
+                if side in ("left", "right"):
+                    row = votes.setdefault(_find(info["tri"][0]), [0, 0])
+                    row[0 if side == "left" else 1] += 1
+            for root, (n_left, n_right) in votes.items():
+                if n_left != n_right:
+                    component_side[root] = "left" if n_left > n_right else "right"
         else:
             force_side = default_track_side if default_track_side in ("left", "right") else ""
         for info in tri_infos:
             tri = info["tri"]
             gbone = int(info.get("group_bone_index", -1))
-            tri_side = force_side or str(info.get("tri_side", "") or "")
+            tri_side = (
+                force_side
+                or (component_side.get(_find(tri[0]), "") if component_side else "")
+                or str(info.get("tri_side", "") or "")
+            )
             if tri_side == "left":
                 side_left.append(tri)
                 if side_bone_hint["left"] < 0 and gbone >= 0:
@@ -3606,10 +3673,12 @@ def split_faces_by_bone_deterministic(
                     "group_bone_index": int(group_bone_index),
                     "tris": [],
                     "_tri_infos": [],
+                    "_bone_votes": {},
                 }
                 grouped[key] = payload
-            elif int(payload.get("group_bone_index", -1)) < 0 and int(group_bone_index) >= 0:
-                payload["group_bone_index"] = int(group_bone_index)
+            if int(group_bone_index) >= 0:
+                bone_votes = payload["_bone_votes"]
+                bone_votes[int(group_bone_index)] = int(bone_votes.get(int(group_bone_index), 0)) + 1
             info_copy = dict(info)
             info_copy["group_name"] = str(group_name)
             info_copy["group_name_source"] = str(group_name_source)
@@ -3624,6 +3693,15 @@ def split_faces_by_bone_deterministic(
         if not isinstance(tris, list) or not tris:
             continue
         tri_group_infos = list(payload.pop("_tri_infos", []) or [])
+        # The object is parented to (and named after) this bone, so it must be the bone
+        # most of the group's triangles belong to. Several bones can classify into one
+        # group ("Chassis" also takes mg_01, ...) and taking the first triangle's bone
+        # made the hull follow the machine gun.
+        bone_votes = dict(payload.pop("_bone_votes", {}) or {})
+        if bone_votes:
+            payload["group_bone_index"] = int(
+                min(bone_votes.keys(), key=lambda b: (-int(bone_votes[b]), int(b)))
+            )
         raw_node_triangles: Dict[str, int] = {}
         raw_name_by_low: Dict[str, str] = {}
         source_counts: Dict[str, int] = {}
@@ -3667,268 +3745,6 @@ def split_faces_by_bone_deterministic(
         }
         out.append(payload)
     return out
-
-
-def _resnap_degenerate_uv_faces(
-    vertex_rows: List[Tuple[float, float, float]],
-    uv_rows: List[Tuple[float, float]],
-    src_rows: List[int],
-    faces: List[Tuple[int, ...]],
-    min_span_threshold: float = 1.0e-3,
-    area_threshold: float = 1.0e-5,
-    max_iterations: int = 10,
-) -> Tuple[
-    List[Tuple[float, float, float]],
-    List[Tuple[float, float]],
-    List[int],
-    List[Tuple[int, ...]],
-    int,
-]:
-    """For every face (triangle or quad) whose UV is degenerate, find a
-    neighbor face (sharing one edge) with non-degenerate UV and rebuild
-    the degenerate face's UV by mirroring the neighbor's far-vertex UV
-    across the shared edge midpoint.
-
-    Degenerate is defined as either:
-      * min(u_span, v_span) < min_span_threshold — stripe pattern
-        (1px on a 1024 atlas at default 1e-3), or
-      * u_span * v_span < area_threshold — fully collapsed point.
-    The first condition catches the WARNO DECORS striping artifact where
-    span looks like (0.041, 0.001); the second catches sub-pixel collapses.
-
-    Why: WARNO composite DECORS assets (e.g. HLM_10_L.fbx aggregating 11
-    sibling FBX) and a few unit edge cases ship with faces whose UV span
-    is ~0 in one axis. Blender then samples a 1-2 pixel slice and repeats
-    it across the entire face, producing visible stripes.
-
-    Algorithm:
-      * iterate to a fixed point (max `max_iterations` passes) so that
-        degenerate clusters dissolve outward — once an outer face gets
-        resnapped, its previously-also-degenerate inner neighbors finally
-        have a non-degenerate neighbor to mirror against on the next pass.
-      * supports both triangles (3 verts) and quads (4 verts).
-      * non-edge vertices of the degenerate face are duplicated (new
-        vertex + new UV) so other faces sharing those vertices are not
-        disturbed by the UV change.
-    Returns (vertices, uvs, src_refs, faces, resnapped_count).
-    """
-    if not uv_rows or not faces:
-        return list(vertex_rows), list(uv_rows), list(src_rows), list(faces), 0
-
-    new_vertices = list(vertex_rows)
-    new_uvs = list(uv_rows)
-    new_srcs = list(src_rows)
-    new_faces = [tuple(face) for face in faces]
-    resnapped = 0
-
-    def _is_uv_degenerate(face: Sequence[int]) -> bool:
-        if len(face) < 3:
-            return False
-        try:
-            us = [float(new_uvs[v][0]) for v in face]
-            vs_ = [float(new_uvs[v][1]) for v in face]
-        except Exception:
-            return False
-        u_span = max(us) - min(us)
-        v_span = max(vs_) - min(vs_)
-        # 1) Stripe pattern (one axis collapsed to ~1px on a 1024 atlas).
-        if min(u_span, v_span) < min_span_threshold:
-            return True
-        # 2) Sub-pixel area collapse.
-        if u_span * v_span < area_threshold:
-            return True
-        # NOTE: We deliberately do NOT flag butterfly UV on quads as
-        # degenerate. Eugen's source FBX in WARNO DECORS (e.g. HLM_10_L
-        # rooftops) maps two diagonal corners of a quad to the same texel
-        # by design — that is the in-game look the developers chose. Any
-        # automatic re-projection here yields a worse, mismatched texture
-        # for the modder. Users that want a different roof texture can
-        # Smart-UV-Project the face manually in Edit Mode.
-        return False
-
-    for _iteration in range(int(max_iterations)):
-        # Rebuild edge -> face map each pass so newly-resnapped faces
-        # become available as donors for their still-degenerate neighbors.
-        edge_to_faces: Dict[Tuple[int, int], List[int]] = {}
-        for fi, face in enumerate(new_faces):
-            if len(face) < 3:
-                continue
-            n = len(face)
-            for i in range(n):
-                a = int(face[i])
-                b = int(face[(i + 1) % n])
-                edge = (min(a, b), max(a, b))
-                edge_to_faces.setdefault(edge, []).append(fi)
-
-        # Detect currently degenerate faces.
-        degenerate_indices: List[int] = []
-        for fi, face in enumerate(new_faces):
-            if 3 <= len(face) <= 4 and _is_uv_degenerate(face):
-                degenerate_indices.append(fi)
-        if not degenerate_indices:
-            break
-
-        progressed = False
-        for fi in degenerate_indices:
-            face = new_faces[fi]
-            face_verts = [int(v) for v in face]
-            n = len(face_verts)
-            # Find a non-degenerate neighbor via any shared edge.
-            chosen: Tuple[int, int, int] | None = None
-            for i in range(n):
-                a = face_verts[i]
-                b = face_verts[(i + 1) % n]
-                edge = (min(a, b), max(a, b))
-                for nfi in edge_to_faces.get(edge, []):
-                    if nfi == fi:
-                        continue
-                    nface = new_faces[nfi]
-                    if len(nface) < 3:
-                        continue
-                    if _is_uv_degenerate(nface):
-                        continue
-                    chosen = (nfi, a, b)
-                    break
-                if chosen is not None:
-                    break
-            if chosen is None:
-                continue
-            nfi, ea, eb = chosen
-            nface = new_faces[nfi]
-            # Pick any neighbor vertex that is not on the shared edge.
-            c_neighbor = -1
-            for v in nface:
-                iv = int(v)
-                if iv != ea and iv != eb:
-                    c_neighbor = iv
-                    break
-            if c_neighbor < 0:
-                continue
-            if ea >= len(new_uvs) or eb >= len(new_uvs) or c_neighbor >= len(new_uvs):
-                continue
-            ua = new_uvs[ea]
-            ub = new_uvs[eb]
-            uc_n = new_uvs[c_neighbor]
-            # Skip donors whose own shared edge is degenerate in UV space —
-            # their mirror would just collapse our face to another stripe.
-            if abs(float(ua[0]) - float(ub[0])) < 1.0e-6 and abs(float(ua[1]) - float(ub[1])) < 1.0e-6:
-                continue
-            mid_u = (float(ua[0]) + float(ub[0])) * 0.5
-            mid_v = (float(ua[1]) + float(ub[1])) * 0.5
-            mirrored_uv = (
-                2.0 * mid_u - float(uc_n[0]),
-                2.0 * mid_v - float(uc_n[1]),
-            )
-            # Detect butterfly only by strict diagonal-collapse — same rule
-            # as _is_uv_degenerate above. Keep these in sync.
-            is_butterfly = False
-            if n == 4:
-                eps = 1.0e-5
-                try:
-                    fu = [float(new_uvs[v][0]) for v in face_verts]
-                    fv = [float(new_uvs[v][1]) for v in face_verts]
-                    d02 = ((fu[0] - fu[2]) ** 2 + (fv[0] - fv[2]) ** 2) ** 0.5
-                    d13 = ((fu[1] - fu[3]) ** 2 + (fv[1] - fv[3]) ** 2) ** 0.5
-                    if d02 < eps or d13 < eps:
-                        is_butterfly = True
-                except Exception:
-                    is_butterfly = False
-
-            if is_butterfly:
-                # For butterfly quads, single-point mirror leaves the whole
-                # face as a flat-color patch — visually worse than the source
-                # stripe in many cases. Instead reproject our face's 3D
-                # positions onto the neighbor's UV bounding box, preserving
-                # the size ratio so the texture tiles at the same resolution
-                # as on the donor face. This yields a roof that looks like
-                # an extension of the neighboring wall pattern instead of a
-                # uniform color blob.
-                try:
-                    nb_us = [float(new_uvs[int(v)][0]) for v in nface]
-                    nb_vs_ = [float(new_uvs[int(v)][1]) for v in nface]
-                    nb_u_min, nb_u_max = min(nb_us), max(nb_us)
-                    nb_v_min, nb_v_max = min(nb_vs_), max(nb_vs_)
-                    nb_u_span = max(nb_u_max - nb_u_min, 1.0e-6)
-                    nb_v_span = max(nb_v_max - nb_v_min, 1.0e-6)
-
-                    our_pts3d = [tuple(new_vertices[v]) for v in face_verts]
-                    nb_pts3d = [tuple(new_vertices[int(v)]) for v in nface]
-
-                    # Pick the two 3D axes with the largest spread on our face
-                    # (drops the dominant-normal axis).
-                    spans = [
-                        max(p[i] for p in our_pts3d) - min(p[i] for p in our_pts3d)
-                        for i in range(3)
-                    ]
-                    axis_priority = sorted(range(3), key=lambda i: -spans[i])
-                    u_axis, v_axis = axis_priority[0], axis_priority[1]
-
-                    our_u_min = min(p[u_axis] for p in our_pts3d)
-                    our_v_min = min(p[v_axis] for p in our_pts3d)
-                    our_u_span = max(spans[u_axis], 1.0e-6)
-                    our_v_span = max(spans[v_axis], 1.0e-6)
-
-                    nb_u_min_axis = min(p[u_axis] for p in nb_pts3d)
-                    nb_v_min_axis = min(p[v_axis] for p in nb_pts3d)
-                    nb_u_span_axis = max(
-                        (max(p[u_axis] for p in nb_pts3d) - nb_u_min_axis),
-                        1.0e-6,
-                    )
-                    nb_v_span_axis = max(
-                        (max(p[v_axis] for p in nb_pts3d) - nb_v_min_axis),
-                        1.0e-6,
-                    )
-
-                    # UV-per-3D-unit on the donor; we use the same density
-                    # so 1m on our face occupies the same UV distance.
-                    u_density = nb_u_span / nb_u_span_axis
-                    v_density = nb_v_span / nb_v_span_axis
-
-                    new_uv_list: List[Tuple[float, float]] = []
-                    for p in our_pts3d:
-                        u = nb_u_min + (p[u_axis] - our_u_min) * u_density
-                        v = nb_v_min + (p[v_axis] - our_v_min) * v_density
-                        new_uv_list.append((u, v))
-                except Exception:
-                    new_uv_list = [mirrored_uv] * n
-
-                rebuilt: List[int] = []
-                for vi, v in enumerate(face_verts):
-                    if v >= len(new_vertices):
-                        rebuilt.append(v)
-                        continue
-                    new_idx = len(new_vertices)
-                    new_vertices.append(tuple(new_vertices[v]))
-                    new_uvs.append(new_uv_list[vi])
-                    new_srcs.append(new_srcs[v] if v < len(new_srcs) else 0)
-                    rebuilt.append(new_idx)
-                new_faces[fi] = tuple(rebuilt)
-                resnapped += 1
-                progressed = True
-            else:
-                # Normal stripe / area-collapse path: keep the shared-edge
-                # vertices, duplicate the rest with the mirrored UV.
-                rebuilt = []
-                for v in face_verts:
-                    if v == ea or v == eb:
-                        rebuilt.append(v)
-                        continue
-                    if v >= len(new_vertices):
-                        rebuilt.append(v)
-                        continue
-                    new_idx = len(new_vertices)
-                    new_vertices.append(tuple(new_vertices[v]))
-                    new_uvs.append(mirrored_uv)
-                    new_srcs.append(new_srcs[v] if v < len(new_srcs) else 0)
-                    rebuilt.append(new_idx)
-                new_faces[fi] = tuple(rebuilt)
-                resnapped += 1
-                progressed = True
-
-        if not progressed:
-            break
-
-    return new_vertices, new_uvs, new_srcs, new_faces, resnapped
 
 
 def cleanup_bucket_geometry(
@@ -4011,37 +3827,6 @@ def cleanup_bucket_geometry(
                 return 0.0
         return float(area)
 
-    def _component_groups(face_rows: Sequence[Sequence[int]]) -> List[List[int]]:
-        edge_to_faces: Dict[Tuple[int, int], List[int]] = {}
-        for face_i, face in enumerate(face_rows):
-            for a, b in _polygon_edges(face):
-                edge = (min(int(a), int(b)), max(int(a), int(b)))
-                edge_to_faces.setdefault(edge, []).append(int(face_i))
-        adjacency: Dict[int, set[int]] = {}
-        for face_ids in edge_to_faces.values():
-            if len(face_ids) < 2:
-                continue
-            for face_id in face_ids:
-                adjacency.setdefault(int(face_id), set()).update(int(other) for other in face_ids if int(other) != int(face_id))
-        visited: set[int] = set()
-        groups: List[List[int]] = []
-        for face_i in range(len(face_rows)):
-            if face_i in visited:
-                continue
-            queue = [int(face_i)]
-            visited.add(int(face_i))
-            group: List[int] = []
-            while queue:
-                cur = queue.pop()
-                group.append(int(cur))
-                for nxt in sorted(adjacency.get(int(cur), set())):
-                    if nxt in visited:
-                        continue
-                    visited.add(int(nxt))
-                    queue.append(int(nxt))
-            groups.append(group)
-        return groups
-
     def _compact(
         face_rows: Sequence[Sequence[int]],
         mid_rows: Sequence[int],
@@ -4119,55 +3904,9 @@ def cleanup_bucket_geometry(
     vertex_rows = welded_vertices
     uv_rows = welded_uvs
     src_rows = welded_refs
-    pre_component_count = len(_component_groups(face_rows))
-    total_area = sum(_polygon_area(face) for face in face_rows)
-    used_vertices = sorted({int(vi) for face in face_rows for vi in face})
-    if used_vertices:
-        xs = [vertex_rows[idx][0] for idx in used_vertices]
-        ys = [vertex_rows[idx][1] for idx in used_vertices]
-        zs = [vertex_rows[idx][2] for idx in used_vertices]
-        total_diag = math.dist((min(xs), min(ys), min(zs)), (max(xs), max(ys), max(zs)))
-    else:
-        total_diag = 0.0
-
-    dropped_components = 0
-    components = _component_groups(face_rows)
-    if len(components) > 1:
-        keep_face_ids: set[int] = set()
-        area_floor = max(1.0e-8, float(total_area) * 0.0004)
-        diag_floor = max(0.0025, float(total_diag) * 0.015)
-        for comp in components:
-            comp_faces = [face_rows[idx] for idx in comp]
-            comp_vertices = sorted({int(vi) for face in comp_faces for vi in face})
-            comp_area = sum(_polygon_area(face) for face in comp_faces)
-            if comp_vertices:
-                xs = [vertex_rows[idx][0] for idx in comp_vertices]
-                ys = [vertex_rows[idx][1] for idx in comp_vertices]
-                zs = [vertex_rows[idx][2] for idx in comp_vertices]
-                comp_diag = math.dist((min(xs), min(ys), min(zs)), (max(xs), max(ys), max(zs)))
-            else:
-                comp_diag = 0.0
-            should_drop = (
-                len(comp_faces) <= 2
-                and len(comp_vertices) <= 6
-                and comp_area <= area_floor
-                and comp_diag <= diag_floor
-            )
-            if should_drop:
-                dropped_components += 1
-                continue
-            keep_face_ids.update(int(idx) for idx in comp)
-        if keep_face_ids:
-            kept_faces: List[Tuple[int, ...]] = []
-            kept_mids: List[int] = []
-            for face_i, face in enumerate(face_rows):
-                if face_i not in keep_face_ids:
-                    continue
-                kept_faces.append(face)
-                kept_mids.append(mid_rows[face_i])
-            face_rows = kept_faces
-            mid_rows = kept_mids
-            vertex_rows, uv_rows, src_rows, face_rows, mid_rows = _compact(face_rows, mid_rows)
+    # Small disconnected pieces are kept: they are real geometry (a bolt plate, a
+    # 1-triangle UV island split off by the weld key). The old "tiny component" pass
+    # deleted such pieces by size thresholds.
 
     def _face_normal(face: Sequence[int]) -> Tuple[float, float, float]:
         if len(face) < 3:
@@ -4196,43 +3935,27 @@ def cleanup_bucket_geometry(
     def _safe_quad_from_pair(face_a: Sequence[int], face_b: Sequence[int]) -> Tuple[int, int, int, int] | None:
         if len(face_a) != 3 or len(face_b) != 3:
             return None
-        shared = sorted(set(int(v) for v in face_a) & set(int(v) for v in face_b))
+        shared = set(int(v) for v in face_a) & set(int(v) for v in face_b)
         if len(shared) != 2:
             return None
-        unique = [int(v) for v in list(face_a) + list(face_b) if int(v) not in shared]
-        if len(unique) != 2:
+        ua = [int(v) for v in face_a if int(v) not in shared]
+        ub = [int(v) for v in face_b if int(v) not in shared]
+        if len(ua) != 1 or len(ub) != 1 or ua[0] == ub[0]:
             return None
-        boundary_counts: Dict[Tuple[int, int], int] = {}
-        for edge in _polygon_edges(face_a):
-            key = (min(int(edge[0]), int(edge[1])), max(int(edge[0]), int(edge[1])))
-            boundary_counts[key] = int(boundary_counts.get(key, 0)) + 1
-        for edge in _polygon_edges(face_b):
-            key = (min(int(edge[0]), int(edge[1])), max(int(edge[0]), int(edge[1])))
-            boundary_counts[key] = int(boundary_counts.get(key, 0)) + 1
-        boundary_edges = [edge for edge, count in boundary_counts.items() if int(count) == 1]
-        if len(boundary_edges) != 4:
+        # Rotate face_a to (p, ua, q): the quad (p, ua, q, ub) keeps face_a's winding and
+        # puts the shared edge p-q on the 0-2 diagonal, which is where Blender splits a
+        # convex quad, so it renders with the game's own triangulation. The old cycle
+        # walk started at the lowest vertex index, so half the merges flipped the
+        # diagonal (different UV interpolation) and some valid pairs were rejected.
+        fa = [int(v) for v in face_a]
+        k = fa.index(ua[0])
+        p_v, q_v = fa[(k - 1) % 3], fa[(k + 1) % 3]
+        fb = [int(v) for v in face_b]
+        kb = fb.index(ub[0])
+        # face_b must traverse the shared edge the other way: (q, ub, p).
+        if fb[(kb - 1) % 3] != q_v or fb[(kb + 1) % 3] != p_v:
             return None
-        adjacency: Dict[int, List[int]] = {}
-        for a, b in boundary_edges:
-            adjacency.setdefault(int(a), []).append(int(b))
-            adjacency.setdefault(int(b), []).append(int(a))
-        if len(adjacency) != 4 or any(len(nei) != 2 for nei in adjacency.values()):
-            return None
-        start = min(adjacency.keys())
-        cycle = [int(start)]
-        prev = None
-        cur = int(start)
-        for _ in range(3):
-            candidates = [n for n in adjacency[cur] if n != prev]
-            if not candidates:
-                return None
-            nxt = min(candidates)
-            cycle.append(int(nxt))
-            prev, cur = cur, nxt
-        if len(set(cycle)) != 4:
-            return None
-        if start not in adjacency.get(int(cycle[-1]), []):
-            return None
+        cycle = [p_v, ua[0], q_v, ub[0]]
         norm_a = _face_normal(face_a)
         norm_b = _face_normal(face_b)
         dot = sum(float(norm_a[i]) * float(norm_b[i]) for i in range(3))
@@ -4319,45 +4042,17 @@ def cleanup_bucket_geometry(
         used_faces.add(int(face_i))
 
     vertex_rows, uv_rows, src_rows, merged_faces, merged_mids = _compact(merged_faces, merged_mids)
-    # Re-snap any remaining triangles whose UV-rectangle collapsed below the
-    # area threshold. This is a Blender-rendering fix for source FBX shipped
-    # by Eugen with degenerate UV in WARNO composite DECORS and rare unit
-    # corner cases. See _resnap_degenerate_uv_faces docstring for the full
-    # rationale; the mirror-from-neighbor strategy preserves geometry and
-    # replaces 1-pixel stripes with a copy of the adjacent texture region.
-    # EXCEPTION: RD/SD2 track (chenille) buckets — their UV is set by the
-    # connectivity flood-fill (_floodfill_track_uv_seam); the tread legitimately
-    # produces small/near-degenerate UV faces at the link seams, and the resnap's
-    # reproject-from-neighbor heuristic mistakes those for FBX-degenerate faces and
-    # REPROJECTS them, undoing the flood-fill (the merkava_2x "ювішка попливла"
-    # smear: bucketV came out [0.26,1.24] instead of [0.5,1.0]). Skip it for tracks.
-    # Gate on "chenille" ONLY (the RD/SD2 track bucket is named "Chenille"; WARNO tracks
-    # are "chenille_droite/gauche"). The earlier extra "track" substring was too broad — a
-    # NON-track chassis node like "suspension_track_arm" would wrongly skip the legit FBX
-    # degenerate-UV resnap. "chenille" (= track in French) is the reliable track signal.
-    _gl = str(group_name or "").strip().lower()
-    if "chenille" in _gl:
-        uv_resnapped_count = 0
-    else:
-        vertex_rows, uv_rows, src_rows, merged_faces, uv_resnapped_count = _resnap_degenerate_uv_faces(
-            list(vertex_rows),
-            list(uv_rows),
-            list(src_rows),
-            list(merged_faces),
-        )
-    post_component_count = len(_component_groups(merged_faces))
+    # UVs are kept exactly as shipped: the game samples them as stored. (A "degenerate
+    # UV resnap" used to overwrite thin-but-valid UV triangles with copies of their
+    # neighbours.)
     diagnostics = {
         "group_name": str(group_name or ""),
         "vertex_count_pre": int(len(vertices or [])),
         "polygon_count_pre": int(len(faces or [])),
         "vertex_count_post": int(len(vertex_rows)),
         "polygon_count_post": int(len(merged_faces)),
-        "component_count_pre": int(pre_component_count),
-        "component_count_post": int(post_component_count),
         "degenerate_polygons_removed": int(degenerate_removed),
-        "tiny_components_removed": int(dropped_components),
         "quad_merges": int(quad_merges),
-        "uv_degenerate_resnapped": int(uv_resnapped_count),
     }
     return {
         "vertices": list(vertex_rows),
@@ -6244,7 +5939,10 @@ def _load_iriszoom():
 
 
 class SpkMeshExtractor:
-    def __init__(self, spk_path: Path, *, game: "str | None" = None):
+    def __init__(self, spk_path: Path, *, game: "str | None" = None, fat_only: bool = False):
+        """Open a MESH/PCPC pack. ``fat_only`` reads just the header and the asset table
+        (enough to answer "is this asset in this pack?") and skips the material NDF,
+        mesh, draw-call and buffer tables."""
         if not spk_path.exists():
             raise FileNotFoundError(f"SPK not found: {spk_path}")
         self.path = spk_path
@@ -6280,9 +5978,12 @@ class SpkMeshExtractor:
         self._node_matrix_sections_cache: Dict[int, Any] = {}
         self._node_exact_world_cache: Dict[int, Any] = {}
 
+        self._fat_lower: Dict[str, str] | None = None
         try:
             self._parse_header()
             self._parse_fat()
+            if fat_only:
+                return
             self._parse_vertex_formats()
             self._parse_material_texture_refs()
             self._parse_meshes()
@@ -7200,34 +6901,25 @@ class SpkMeshExtractor:
         return []
 
     def find_best_fat_entry_for_asset(self, asset_path: str) -> Tuple[str, Dict[str, Any]] | None:
+        """The pack's entry for exactly this asset path (case-insensitive), or None.
+
+        Asset paths come from this very table (the asset index is a FAT scan), so there is
+        nothing to guess. The old scored fallback matched by file name / LOD-stripped stem
+        and could silently import X_LOW, or a same-named asset of another faction, when X
+        was not in the pack.
+        """
         if not self.fat:
             return None
         asset_norm = normalize_asset_path(asset_path)
         exact = self.fat.get(asset_norm)
         if exact is not None:
             return asset_norm, exact
-
-        tgt = PurePosixPath(asset_norm)
-        tgt_name = tgt.name.lower()
-        tgt_stem = strip_lod_suffix(tgt.stem).lower()
-
-        candidates: List[Tuple[int, int, str, Dict[str, Any]]] = []
-        for path, meta in self.fat.items():
-            p = PurePosixPath(path)
-            score = 0
-            if p.name.lower() == tgt_name:
-                score += 5000
-            if strip_lod_suffix(p.stem).lower() == tgt_stem and p.suffix.lower() == tgt.suffix.lower():
-                score += 3000
-            score += shared_suffix_score(path, asset_norm) * 10
-            if score > 0:
-                candidates.append((score, len(path), path, meta))
-
-        if not candidates:
+        if self._fat_lower is None:
+            self._fat_lower = {path.lower(): path for path in self.fat}
+        real = self._fat_lower.get(asset_norm.lower())
+        if real is None:
             return None
-        candidates.sort(key=lambda x: (-x[0], x[1], x[2].lower()))
-        _, _, best_path, best_meta = candidates[0]
-        return best_path, best_meta
+        return real, self.fat[real]
 
     def get_node_blob(self, node_index: int) -> bytes:
         cached = self._node_blob_cache.get(node_index)
@@ -9112,7 +8804,7 @@ def _canonical_channel(value: str) -> str:
     return low
 
 
-def _atlas_target_output_rel(target_logical_rel: str, target_basename: str) -> Path:
+def _atlas_target_output_rel(target_logical_rel: str, target_basename: str, target_channel: str = "") -> Path:
     logical = _normalize_logical_ref(target_logical_rel)
     if logical.startswith("assets/"):
         rel = Path(*PurePosixPath(logical).parts[1:])
@@ -9120,6 +8812,15 @@ def _atlas_target_output_rel(target_logical_rel: str, target_basename: str) -> P
     else:
         parent = Path()
     stem = str(target_basename or "").strip() or Path(logical).stem or "Texture"
+    # Same name tgv_to_png writes (its _canonicalize_output_basename): a diffuse "X_D"
+    # is saved as "X.png" and an occlusion "X_AO" as "X_O.png". Expecting "X_D.png"
+    # meant the PNG was never found -- reconverted on every import and dropped from
+    # the material.
+    channel = _canonical_channel(target_channel)
+    if channel == "diffuse" and stem.upper().endswith("_D"):
+        stem = stem[:-2]
+    elif channel == "occlusion" and stem.upper().endswith("_AO"):
+        stem = stem[:-3] + "_O"
     return parent / f"{stem}.png"
 
 
@@ -9307,8 +9008,11 @@ def build_or_load_atlas_texture_map(
 
     cache_root = Path(cache_dir)
     cache_root.mkdir(parents=True, exist_ok=True)
-    rel = Path(*PurePosixPath(asset_norm).parts).with_suffix(".atlas_map.json")
-    out_json = cache_root / rel
+    # The CLI is run with --include-sibling-assets, so its answer depends only on the
+    # asset's folder: one JSON per folder serves every asset (and LOD) in it, instead of
+    # re-running the CLI for each.
+    folder_parts = PurePosixPath(asset_norm).parent.parts
+    out_json = cache_root.joinpath(*folder_parts) / "_folder.atlas_map.json"
     out_json.parent.mkdir(parents=True, exist_ok=True)
     sig_path = _sidecar_path(out_json, "sig")
 
@@ -9387,10 +9091,12 @@ def build_or_load_atlas_texture_map(
         raise RuntimeError("Atlas JSON schema mismatch: textures[] is missing")
 
     cli_version = str(data.get("cli_version", "") or "").strip() or "unknown"
-    cache_key = (asset_norm.lower(), sig[0], sig[1], sig[2], cli_version)
+    cache_key = (str(out_json).lower(), sig[0], sig[1], sig[2], cli_version)
     cached = _ATLAS_JSON_CACHE.get(cache_key)
     if cached is not None:
-        return dict(cached)
+        result = dict(cached)
+        result["asset_path"] = asset_norm
+        return result
 
     index, entries = _build_atlas_json_index(data)
     atlas_targets = _atlas_target_refs_from_entries(entries)
@@ -9407,7 +9113,8 @@ def build_or_load_atlas_texture_map(
             "size": int(sig[2]),
         },
     }
-    _ATLAS_JSON_CACHE.clear()
+    if len(_ATLAS_JSON_CACHE) >= 64:
+        _ATLAS_JSON_CACHE.pop(next(iter(_ATLAS_JSON_CACHE)))
     _ATLAS_JSON_CACHE[cache_key] = dict(result)
     return dict(result)
 
@@ -9895,6 +9602,7 @@ def run_tgv_converter(
     atlas_asset_path: str = "",
     atlas_out_dir: Path | None = None,
     only_logical_ref: str | None = None,
+    only_source_tgv_rel: str | None = None,
 ) -> None:
     """Convert one atlas texture with tgv_to_png.convert_from_atlas_map.
 
@@ -9939,6 +9647,7 @@ def run_tgv_converter(
             only_logical_ref=str(only_logical_ref).strip() if only_logical_ref else None,
             manifest_out=out_dir / "conversion_manifest.json",
             source_tgv=source_pin,
+            only_source_tgv_rel=str(only_source_tgv_rel).strip() if only_source_tgv_rel else None,
         )
     except Exception as exc:
         raise RuntimeError(f"converter_failed_other: TGV converter failed for {src_tgv.name}: {exc}") from exc
@@ -10048,7 +9757,6 @@ def resolve_texture_from_atlas_ref(
     atlas_json_strict: bool = True,
 ) -> Dict[str, Any]:
     rel = atlas_ref_to_rel_under_assets(ref)
-    role_hint = classify_texture_role(ref)
     src_png = atlas_assets_root / rel
     src_tgv = src_png.with_suffix(".tgv")
     atlas_source = "manual_path"
@@ -10067,22 +9775,25 @@ def resolve_texture_from_atlas_ref(
     if isinstance(atlas_map_index, dict) and atlas_map_index:
         atlas_mode = "json_export"
         matched = _atlas_map_lookup_entries(atlas_map_index, ref)
-        if matched:
-            if len(matched) == 1:
-                atlas_entry = matched[0]
-            else:
-                role_hint = classify_texture_role(ref)
-                ranked = sorted(
-                    matched,
-                    key=lambda item: (
-                        0
-                        if _canonical_channel(str(item.get("target_channel", ""))) == role_hint
-                        else 1,
-                        str(item.get("target_logical_rel", "")).lower(),
-                        str(item.get("source_tgv_rel", "")).lower(),
-                    ),
-                )
-                atlas_entry = ranked[0]
+        if len(matched) == 1:
+            atlas_entry = matched[0]
+        elif matched:
+            # Several atlas pages declare this target (e.g. a CombinedDA page and a
+            # DiffuseNoAlpha page). Take the first, in atlas order, whose source page
+            # actually exists in the game packs -- not a guess from the ref's file name.
+            def _source_in_packs(item: Dict[str, Any]) -> bool:
+                src = _normalize_logical_ref(str(item.get("source_tgv_rel", "")))
+                under = src[len("assets/"):] if src.startswith("assets/") else src
+                stem_rel = PurePosixPath(under).with_suffix("")
+                for ext in (".tgv", ".png"):
+                    if zz_resolver is not None and zz_resolver.find_exact(f"PC/Atlas/Assets/{stem_rel}{ext}") is not None:
+                        return True
+                    if (atlas_assets_root / Path(*stem_rel.parts)).with_suffix(ext).is_file():
+                        return True
+                return False
+
+            available = [item for item in matched if _source_in_packs(item)]
+            atlas_entry = (available or matched)[0]
         if atlas_entry is None and bool(atlas_json_strict):
             raise FileNotFoundError(
                 f"missing_source: atlas_json_strict no mapping for ref {ref}"
@@ -10092,6 +9803,7 @@ def resolve_texture_from_atlas_ref(
         out_rel = _atlas_target_output_rel(
             target_logical_rel=str(atlas_entry.get("target_logical_rel", "")),
             target_basename=str(atlas_entry.get("target_basename", "")),
+            target_channel=str(atlas_entry.get("target_channel", "")),
         )
         out_png = out_model_dir / texture_subdir / out_rel
     else:
@@ -10152,6 +9864,11 @@ def resolve_texture_from_atlas_ref(
                 atlas_out_dir=out_png.parent,
                 only_logical_ref=(
                     str(atlas_entry.get("target_logical_rel", "")).strip()
+                    if atlas_entry is not None
+                    else None
+                ),
+                only_source_tgv_rel=(
+                    str(atlas_entry.get("source_tgv_rel", "")).strip()
                     if atlas_entry is not None
                     else None
                 ),
