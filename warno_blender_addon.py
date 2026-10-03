@@ -1210,6 +1210,27 @@ def _prepare_zz_runtime_sources(
     return dict(info)
 
 
+def _gfx_input_log_text(gfx_input: Any) -> str:
+    """Where the GFX manifest's ndfbins came from, for the import log."""
+    if not isinstance(gfx_input, dict) or not gfx_input:
+        return ""
+    kind = str(gfx_input.get("kind", "") or "")
+    text = f" input={kind}"
+    if kind == "zz":
+        text += f" archive_dir={gfx_input.get('archive_dir', '')} pack={Path(str(gfx_input.get('pack', '') or '')).name}"
+        alternatives = gfx_input.get("alternatives") or []
+        if alternatives:
+            text += f" (not chosen: {', '.join(str(a) for a in alternatives)})"
+    else:
+        text += f" dir={gfx_input.get('dir', '')}"
+    cli_read = gfx_input.get("cli_read")
+    if isinstance(cli_read, dict) and cli_read.get("kind"):
+        text += f" cli_read={cli_read.get('kind')}"
+    if gfx_input.get("note"):
+        text += f" note={gfx_input.get('note')}"
+    return text
+
+
 def _dedupe_paths(paths: Sequence[Path]) -> List[Path]:
     seen: set[str] = set()
     out: List[Path] = []
@@ -18417,6 +18438,14 @@ class WARNO_OT_ImportAsset(Operator):
                             legacy_operators_source=None,
                             enable_operator_semantics=False,
                             game=game,
+                            # The GFX ndfbins come from the game packs (--gfx-root) when
+                            # they are there; otherwise the CLI reads the Output dump.
+                            zz_resolver=runtime_info.get("zz_resolver"),
+                            zz_runtime_root=(
+                                Path(str(runtime_info.get("runtime_root", "")).strip())
+                                if str(runtime_info.get("runtime_root", "") or "").strip()
+                                else None
+                            ),
                         )
                         gfx_manifest_info = gfx_resolver.manifest_for_asset(asset_real)
                     except Exception as exc:
@@ -18441,6 +18470,7 @@ class WARNO_OT_ImportAsset(Operator):
                             f"turrets={len(gfx_manifest_info.get('turrets', []) or [])} "
                             f"fx={len(gfx_manifest_info.get('weapon_fx_anchors', []) or [])} "
                             f"subdepictions={len(gfx_manifest_info.get('subdepictions', []) or [])}"
+                            + _gfx_input_log_text(gfx_manifest_info.get("gfx_input"))
                         ),
                         level="WARNING" if str(gfx_manifest_info.get("source", "none")) == "legacy_ndf_mirror" else "INFO",
                         stage="gfx",

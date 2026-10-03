@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from contextlib import ExitStack
 import importlib.util
+import inspect
 from dataclasses import dataclass, field
 import json
 import math
@@ -1422,8 +1423,14 @@ class GfxManifestResolver:
         legacy_operators_source: Path | None = None,
         enable_operator_semantics: bool = True,
         game: "str | None" = None,
+        zz_resolver: "ZZDatResolver | None" = None,
+        zz_runtime_root: Path | None = None,
     ):
         self.warno_root = Path(warno_root)
+        # Game-pack index and extraction folder: the GFX ndfbins are then read from the
+        # packs (--gfx-root) instead of the Output dump. None keeps the dump.
+        self.zz_resolver = zz_resolver
+        self.zz_runtime_root = Path(zz_runtime_root) if zz_runtime_root is not None and str(zz_runtime_root).strip() else None
         self.modding_suite_root = Path(modding_suite_root)
         self.cache_dir = Path(cache_dir)
         self.wrapper_path = Path(wrapper_path)
@@ -1718,10 +1725,13 @@ class GfxManifestResolver:
                     force_rebuild=force_rebuild,
                     timeout_sec=self.timeout_sec,
                     game=self.game,
+                    zz_resolver=self.zz_resolver,
+                    zz_runtime_root=self.zz_runtime_root,
                 )
                 manifest = dict(info.get("gfx_manifest", {}) or {})
                 manifest["source"] = "gfx_manifest"
                 manifest["error"] = ""
+                manifest["gfx_input"] = dict(info.get("gfx_input", {}) or {})
                 return self._enrich_manifest_semantics(manifest)
             except Exception as exc:
                 errors.append(str(exc))
@@ -7986,10 +7996,18 @@ class ZZDatResolver:
             "abs_offset": abs_offset,
             "checksum": checksum.hex(),
             "dat_path": self._dat_list[dat_idx],
+            # Patch layer of the pack the entry comes from: 0 = newest.
+            "layer": dat_idx,
             # Identity of the bytes: the archive MD5 when the pack has one (v2/v3),
             # otherwise the pack file identity plus the entry location (v1).
             "ident": checksum.hex() if checksum else f"{self._dat_ident[dat_idx]}|{abs_offset}|{size}",
         }
+
+    def find_all_by_basename(self, basename: str) -> List[Dict[str, Any]]:
+        """Every entry with this file name (case-insensitive), newest patch layer first."""
+        self._build_index()
+        keys = self._basename_to_keys.get(str(basename or "").strip().lower(), [])
+        return [hit for hit in (self._hit(k) for k in keys) if hit is not None]
 
     def all_asset_keys(self) -> List[str]:
         self._build_index()
@@ -8372,6 +8390,18 @@ def _load_wrapper_module(path: Path, entry_point: str):
     return mod
 
 
+def _accepts_kwargs(fn: Any, *names: str) -> bool:
+    """True when fn takes every keyword in names. A wrapper script set in the add-on
+    settings may predate an option; it is then simply not passed."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return True
+    return all(n in params for n in names)
+
+
 def _file_ident(path: "Path | None") -> List[Any]:
     if path is None:
         return ["", 0, -1]
@@ -8451,10 +8481,11 @@ def build_or_load_atlas_texture_map(
         except Exception:
             resolver = None
     atlas_ident: Any = None
+    atlas_file: "Path | None" = None
     if resolver is not None and atlas_rel:
         hit = resolver.find_exact(atlas_rel)
         if hit is not None:
-            resolver.extract_hit_to_runtime(hit, lookup_root)
+            atlas_file = resolver.extract_hit_to_runtime(hit, lookup_root)
             atlas_ident = "zz:" + str(hit.get("ident", ""))
     if atlas_ident is None and atlas_rel:
         # Not in the packs: the CLI falls back to the mod / Output copies.
@@ -8475,6 +8506,12 @@ def build_or_load_atlas_texture_map(
     need_export = force_rebuild or not out_json.exists() or prev is None or prev.get("sig") != sig
     if need_export:
         temp_out = out_json.with_suffix(".tmp.json")
+        extra: Dict[str, Any] = {}
+        if atlas_file is not None and _accepts_kwargs(mod.export_atlas_json, "atlas_file", "fallback"):
+            # The atlas came from the current game packs: make the CLI read exactly that
+            # file, never a stale Mods/ModData/base or Output copy. CLIs without these
+            # options skip them and read the same file from --cache-dir first anyway.
+            extra = {"atlas_file": atlas_file, "fallback": "none"}
         rc, log = mod.export_atlas_json(
             warno_root=Path(warno_root),
             modding_suite_root=Path(modding_suite_root),
@@ -8483,6 +8520,7 @@ def build_or_load_atlas_texture_map(
             lookup_cache_dir=lookup_root,
             atlas_cli_override=str(atlas_cli_path or ""),
             timeout_sec=max(5, int(timeout_sec)),
+            **extra,
         )
         if rc == 0 and temp_out.exists():
             temp_out.replace(out_json)
@@ -8538,8 +8576,88 @@ def build_or_load_atlas_texture_map(
     return dict(result)
 
 
+GFX_NDFBIN_NAMES = ("Unit.ndfbin", "Weapon.ndfbin", "Depiction.ndfbin", "DepictionResources.ndfbin")
+
+
+def find_gfx_ndfbins_in_zz(resolver: "ZZDatResolver") -> Dict[str, Any] | None:
+    """The game-pack folder holding all four GFX ndfbins the GFX CLI reads.
+
+    Candidates are entries named unit/weapon/depiction/depictionresources.ndfbin (any
+    case) whose folder path has a "gfx" segment. A folder qualifies only when it holds
+    all four. When several do, the one whose files come from the newest patch layer wins
+    (then the one met first in the resolver's newest-layer-first order).
+    Returns {"archive_dir", "hits": {name: hit}, "layer", "alternatives"} or None.
+    """
+    by_dir: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    first_seen: Dict[str, int] = {}
+    for name in GFX_NDFBIN_NAMES:
+        for hit in resolver.find_all_by_basename(name):
+            path = normalize_asset_path(str(hit.get("path", "") or ""))
+            parent = path.rsplit("/", 1)[0] if "/" in path else ""
+            if "gfx" not in parent.lower().split("/"):
+                continue
+            key = parent.lower()
+            first_seen.setdefault(key, len(first_seen))
+            by_dir.setdefault(key, {}).setdefault(name, hit)
+    complete = [key for key, hits in by_dir.items() if len(hits) == len(GFX_NDFBIN_NAMES)]
+    if not complete:
+        return None
+
+    def rank(key: str) -> Tuple[int, int, int]:
+        layers = [int(h.get("layer", 0) or 0) for h in by_dir[key].values()]
+        return (min(layers), max(layers), first_seen[key])
+
+    complete.sort(key=rank)
+    best = complete[0]
+    hits = by_dir[best]
+    return {
+        "archive_dir": normalize_asset_path(str(hits[GFX_NDFBIN_NAMES[0]].get("path", ""))).rsplit("/", 1)[0],
+        "hits": hits,
+        "layer": rank(best)[0],
+        "alternatives": complete[1:],
+    }
+
+
+def _gfx_inputs_from_zz(resolver: "ZZDatResolver", runtime_root: Path) -> Dict[str, Any] | None:
+    """Extract the four GFX ndfbins from the game packs into runtime_root (MD5-validated,
+    so a patched file replaces the old copy). Returns their folder and archive idents,
+    or None when the packs do not hold all four in one gfx folder."""
+    found = find_gfx_ndfbins_in_zz(resolver)
+    if found is None:
+        return None
+    dirs: set[str] = set()
+    out_dir: "Path | None" = None
+    idents: List[List[Any]] = []
+    for name in GFX_NDFBIN_NAMES:
+        hit = found["hits"][name]
+        out_path = resolver.extract_hit_to_runtime(hit, Path(runtime_root))
+        out_dir = out_path.parent
+        dirs.add(os.path.normcase(str(out_dir)))
+        idents.append(["zz", name, str(hit.get("ident", "") or "")])
+    if out_dir is None or len(dirs) != 1:
+        # Folder names differing only by case land in different folders on a
+        # case-sensitive file system; the CLI needs all four side by side.
+        return None
+    first = found["hits"][GFX_NDFBIN_NAMES[0]]
+    return {
+        "dir": out_dir,
+        "archive_dir": found["archive_dir"],
+        "idents": idents,
+        "layer": int(found["layer"]),
+        "pack": str(first.get("dat_path", "")),
+        "alternatives": list(found["alternatives"]),
+    }
+
+
+def _gfx_cli_signature(gfx_cli_path: "Path | None") -> List[List[Any]]:
+    if gfx_cli_path is None or not str(gfx_cli_path).strip():
+        return []
+    ident = _file_ident(Path(str(gfx_cli_path)))
+    return [["cli", ident[1], ident[2]]]
+
+
 def _gfx_sources_signature(warno_root: Path, gfx_cli_path: "Path | None") -> List[List[Any]]:
-    """Identity of everything the GFX CLI reads.
+    """Identity of everything the GFX CLI reads from the Output dump.
 
     The CLI builds its manifest from <warnoRoot>/Output/AllPlatforms/NDF/GFX/*.ndfbin --
     a dump the USER produces with the game's own export. A manifest (or a remembered
@@ -8548,12 +8666,10 @@ def _gfx_sources_signature(warno_root: Path, gfx_cli_path: "Path | None") -> Lis
     """
     gfx_root = Path(warno_root) / "Output" / "AllPlatforms" / "NDF" / "GFX"
     out: List[List[Any]] = []
-    for name in ("Unit.ndfbin", "Weapon.ndfbin", "Depiction.ndfbin", "DepictionResources.ndfbin"):
+    for name in GFX_NDFBIN_NAMES:
         ident = _file_ident(gfx_root / name)
         out.append([name, ident[1], ident[2]])
-    if gfx_cli_path is not None and str(gfx_cli_path).strip():
-        ident = _file_ident(Path(str(gfx_cli_path)))
-        out.append(["cli", ident[1], ident[2]])
+    out.extend(_gfx_cli_signature(gfx_cli_path))
     return out
 
 
@@ -8567,7 +8683,16 @@ def build_or_load_gfx_manifest(
     force_rebuild: bool = False,
     timeout_sec: int = 180,
     game: "str | None" = None,
+    zz_resolver: "ZZDatResolver | None" = None,
+    zz_runtime_root: "Path | None" = None,
 ) -> Dict[str, Any]:
+    """GFX manifest for one asset, exported by moddingSuite's GFX CLI and cached.
+
+    With zz_resolver and zz_runtime_root, the four GFX ndfbins are taken from the game
+    packs (extracted into zz_runtime_root) and passed as --gfx-root, and the cache is
+    keyed on their archive MD5s. Otherwise (or when the packs lack them) the CLI reads
+    the Output/AllPlatforms/NDF/GFX dump, keyed on those files' stats.
+    """
     asset_norm = normalize_asset_path(str(asset_path or "")).strip()
     if not asset_norm:
         raise RuntimeError("GFX manifest build failed: empty asset path")
@@ -8583,16 +8708,60 @@ def build_or_load_gfx_manifest(
         raise RuntimeError(f"GFX manifest wrapper not found: {wrapper}")
     mod = _load_wrapper_module(wrapper, "export_gfx_json")
     cli_exe, _tried = mod._resolve_cli_exe(Path(modding_suite_root), str(gfx_cli_path or ""))
-    gfx_sig = _gfx_sources_signature(warno_root, cli_exe)
+    dump_sig = _gfx_sources_signature(warno_root, cli_exe)
+    gfx_input: Dict[str, Any] = {
+        "kind": "output_dump",
+        "dir": str(Path(warno_root) / "Output" / "AllPlatforms" / "NDF" / "GFX"),
+    }
+    gfx_root_arg: "Path | None" = None
+    zz_sig: List[List[Any]] | None = None
+    if zz_resolver is not None and zz_runtime_root is not None:
+        if not _accepts_kwargs(mod.export_gfx_json, "gfx_root"):
+            gfx_input["note"] = f"wrapper {wrapper.name} has no gfx_root option; reading the Output dump"
+        else:
+            try:
+                zz_in = _gfx_inputs_from_zz(zz_resolver, Path(zz_runtime_root))
+            except Exception as exc:
+                zz_in = None
+                gfx_input["note"] = f"GFX ndfbins could not be extracted from the game packs: {exc}"
+            else:
+                if zz_in is None:
+                    gfx_input["note"] = "the game packs hold no gfx folder with all four GFX ndfbins"
+            if zz_in is not None:
+                gfx_root_arg = Path(zz_in["dir"])
+                gfx_input = {
+                    "kind": "zz",
+                    "dir": str(gfx_root_arg),
+                    "archive_dir": zz_in["archive_dir"],
+                    "pack": zz_in["pack"],
+                    "layer": zz_in["layer"],
+                    "alternatives": zz_in["alternatives"],
+                }
+                zz_sig = (
+                    list(zz_in["idents"])
+                    + [["gfx_root", str(gfx_root_arg).lower()]]
+                    + _gfx_cli_signature(cli_exe)
+                )
+    # Signatures an earlier export may be stored under. A CLI without --gfx-root skips
+    # the option and reads the Output dump, so such an export (and any failure, whose
+    # cause is unknown) is keyed on the pack entries AND the dump.
+    if zz_sig is not None:
+        accepted_sigs = [zz_sig, zz_sig + dump_sig]
+    else:
+        accepted_sigs = [dump_sig]
+    conservative_sig = accepted_sigs[-1]
+    sources_text = (
+        "the GFX ndfbins in the game packs" if zz_sig is not None else "the Output/AllPlatforms/NDF/GFX dump"
+    )
 
     miss_path = _sidecar_path(out_json, "miss")
     sig_path = _sidecar_path(out_json, "sig")
     if not force_rebuild:
         prev_miss = _read_sidecar(miss_path)
-        if prev_miss is not None and prev_miss.get("sources_signature") == gfx_sig:
+        if prev_miss is not None and prev_miss.get("sources_signature") in accepted_sigs:
             raise RuntimeError(
                 "GFX manifest unavailable for this asset (remembered from the previous "
-                "attempt; the Output/AllPlatforms/NDF/GFX dump has not changed since): "
+                f"attempt; {sources_text} and the CLI have not changed since): "
                 + str(prev_miss.get("error", ""))[:300]
             )
     prev_ok = _read_sidecar(sig_path)
@@ -8600,10 +8769,11 @@ def build_or_load_gfx_manifest(
         force_rebuild
         or not out_json.exists()
         or prev_ok is None
-        or prev_ok.get("sources_signature") != gfx_sig
+        or prev_ok.get("sources_signature") not in accepted_sigs
     )
     if need_export:
         temp_out = out_json.with_suffix(".tmp.json")
+        extra: Dict[str, Any] = {"gfx_root": gfx_root_arg} if gfx_root_arg is not None else {}
         rc, log = mod.export_gfx_json(
             warno_root=Path(warno_root),
             modding_suite_root=Path(modding_suite_root),
@@ -8612,10 +8782,20 @@ def build_or_load_gfx_manifest(
             cache_dir=cache_root,
             gfx_cli_override=str(gfx_cli_path or ""),
             timeout_sec=max(5, int(timeout_sec)),
+            **extra,
         )
         if rc == 0 and temp_out.exists():
+            store_sig = conservative_sig
+            if zz_sig is not None:
+                try:
+                    exported = json.loads(temp_out.read_text(encoding="utf-8-sig"))
+                    cli_src = exported.get("gfx_source") if isinstance(exported, dict) else None
+                    if isinstance(cli_src, dict) and str(cli_src.get("kind", "")) == "gfx_root":
+                        store_sig = zz_sig
+                except (OSError, ValueError):
+                    pass
             temp_out.replace(out_json)
-            _write_sidecar(sig_path, {"asset_path": asset_norm, "sources_signature": gfx_sig})
+            _write_sidecar(sig_path, {"asset_path": asset_norm, "sources_signature": store_sig})
             try:
                 miss_path.unlink()
             except OSError:
@@ -8626,7 +8806,7 @@ def build_or_load_gfx_manifest(
             except OSError:
                 pass
             error = f"rc={rc}: {log[-1500:]}"
-            _write_sidecar(miss_path, {"asset_path": asset_norm, "sources_signature": gfx_sig, "error": error})
+            _write_sidecar(miss_path, {"asset_path": asset_norm, "sources_signature": conservative_sig, "error": error})
             raise RuntimeError("GFX manifest export failed: " + error)
 
     sig = _atlas_map_signature(out_json)
@@ -8660,11 +8840,20 @@ def build_or_load_gfx_manifest(
         if "transform_debug" not in data:
             raise RuntimeError("GFX manifest schema mismatch: missing transform_debug")
 
+    cli_src = data.get("gfx_source")
+    if isinstance(cli_src, dict):
+        gfx_input["cli_read"] = {"kind": str(cli_src.get("kind", "") or ""), "dir": str(cli_src.get("dir", "") or "")}
+    elif gfx_input.get("kind") == "zz":
+        # The CLI does not report its input: it predates --gfx-root and read the Output dump.
+        gfx_input["cli_read"] = {"kind": "output_dump (CLI without --gfx-root)", "dir": ""}
+
     cli_version = str(data.get("cli_version", "") or "").strip() or "unknown"
     cache_key = (asset_norm.lower(), sig[0], sig[1], sig[2], cli_version)
     cached = _GFX_JSON_CACHE.get(cache_key)
     if cached is not None:
-        return dict(cached)
+        result = dict(cached)
+        result["gfx_input"] = dict(gfx_input)
+        return result
 
     result = {
         "asset_path": asset_norm,
@@ -8686,6 +8875,7 @@ def build_or_load_gfx_manifest(
         "track_kind": str(data.get("track_kind", "") or ""),
         "semantic_nodes": list(data.get("semantic_nodes", []) or []),
         "transform_debug": list(data.get("transform_debug", []) or []),
+        "gfx_input": dict(gfx_input),
     }
     _GFX_JSON_CACHE.clear()
     _GFX_JSON_CACHE[cache_key] = dict(result)

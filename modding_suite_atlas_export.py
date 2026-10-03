@@ -32,9 +32,13 @@ def _resolve_output(path: Path) -> Path:
     return path / "atlas_map.json"
 
 
+ATLAS_FALLBACK_MODES = ("ambient", "none")
+
+
 def atlas_rel_for_asset(asset_path: str) -> str:
-    """The one atlas the CLI reads for an asset: PC/Atlas/<asset folder>/TextureSmall.atlas
-    (AtlasCliRunner.ResolveAtlasPath looks nowhere else)."""
+    """The atlas the CLI reads for an asset: PC/Atlas/<asset folder>/TextureSmall.atlas,
+    under --cache-dir first, then (fallback "ambient", the default) under
+    Mods/ModData/base and Output. "--atlas-file PATH" names the file outright."""
     parts = [p for p in _norm_asset(asset_path).split("/") if p]
     if len(parts) < 2:
         return ""
@@ -224,10 +228,17 @@ def export_atlas_json(
     atlas_cli_override: str = "",
     timeout_sec: int = 45,
     verbose: bool = False,
+    atlas_file: "str | Path | None" = None,
+    fallback: "str | None" = None,
 ) -> tuple[int, str]:
     """Run the Atlas CLI for one asset and validate its JSON.
 
-    The atlas must already sit at <lookup_cache_dir>/PC/Atlas/<asset folder>/TextureSmall.atlas.
+    The atlas must already sit at <lookup_cache_dir>/PC/Atlas/<asset folder>/TextureSmall.atlas,
+    unless atlas_file names it ("--atlas-file PATH": exactly that file, nothing else is
+    searched). fallback "none" ("--fallback none") stops the CLI from falling back to the
+    Mods/ModData/base and Output copies, which keep pre-patch atlases; "ambient" is the
+    CLI's default. Both are passed only when set, as "--key value" pairs, which CLIs
+    older than the moddingSuite branch blender-plugin-interop skip.
     Returns (exit code, log text): 0 ok, 2 the atlas has no entries for the asset,
     3 hard failure, 4 the CLI wrote an invalid JSON. Called in-process by the add-on,
     which spares a Python start-up and a full re-index of the game packs per asset.
@@ -240,6 +251,9 @@ def export_atlas_json(
 
     if not Path(warno_root).is_dir():
         return 3, f"Atlas export failed: WARNO root not found: {warno_root}"
+    fallback_mode = str(fallback or "").strip().lower()
+    if fallback_mode and fallback_mode not in ATLAS_FALLBACK_MODES:
+        return 3, f"Atlas export failed: invalid fallback {fallback!r} (expected one of {', '.join(ATLAS_FALLBACK_MODES)})"
 
     cli_exe, tried = _resolve_cli_exe(modding_suite_root=Path(modding_suite_root), atlas_cli_override=str(atlas_cli_override or ""))
     if cli_exe is None:
@@ -256,6 +270,10 @@ def export_atlas_json(
         str(lookup_cache_dir),
         "--include-sibling-assets",
     ]
+    if atlas_file is not None and str(atlas_file).strip():
+        base_args += ["--atlas-file", str(atlas_file)]
+    if fallback_mode:
+        base_args += ["--fallback", fallback_mode]
     if verbose:
         base_args.append("--verbose")
 
@@ -313,6 +331,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Folder holding PC/Atlas/<asset folder>/TextureSmall.atlas (extracted from the game packs if missing)",
     )
     ap.add_argument("--atlas-cli", default="", help="Optional explicit path to moddingSuite.exe / moddingSuite.AtlasCli.exe")
+    ap.add_argument(
+        "--atlas-file",
+        default="",
+        help="Read exactly this TextureSmall.atlas (needs a CLI with --atlas-file; older ones ignore it)",
+    )
+    ap.add_argument(
+        "--fallback",
+        choices=ATLAS_FALLBACK_MODES,
+        default=None,
+        help="none: only <cache-dir>/PC/Atlas/<asset folder>/TextureSmall.atlas, no Mods/Output copies "
+        "(CLI default: ambient)",
+    )
     ap.add_argument("--timeout-sec", type=int, default=45)
     ap.add_argument("--game", default="WARNO", help="Active Eugen game id (WARNO|WARGAME_RD|STEEL_DIVISION_2)")
     ap.add_argument("--verbose", action="store_true")
@@ -339,6 +369,8 @@ def main() -> int:
         atlas_cli_override=str(args.atlas_cli or ""),
         timeout_sec=int(args.timeout_sec or 45),
         verbose=bool(args.verbose),
+        atlas_file=str(args.atlas_file or "").strip() or None,
+        fallback=args.fallback,
     )
     if log:
         print(log, file=sys.stderr)

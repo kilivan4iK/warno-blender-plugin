@@ -3,7 +3,12 @@
 WARNO GFX JSON export wrapper (strict headless mode).
 
 This wrapper runs the dedicated moddingSuite.GfxCli executable against
-compiled Output/AllPlatforms/NDF/GFX/*.ndfbin files.
+compiled GFX *.ndfbin files: Unit, Weapon, Depiction and DepictionResources.
+By default the CLI reads <warno-root>/Output/AllPlatforms/NDF/GFX (a dump the user
+makes with the game's own export); with --gfx-root it reads the folder given
+instead (the add-on extracts the four files from the game packs there). CLIs older
+than the moddingSuite branch blender-plugin-interop ignore --gfx-root, since they
+put any unknown "--key value" pair into a map and never read it.
 """
 from __future__ import annotations
 
@@ -186,8 +191,13 @@ def export_gfx_json(
     gfx_cli_override: str = "",
     timeout_sec: int = 180,
     verbose: bool = False,
+    gfx_root: "str | Path | None" = None,
 ) -> tuple[int, str]:
-    """Run the GFX CLI for one asset and validate its manifest. Returns (exit code, log)."""
+    """Run the GFX CLI for one asset and validate its manifest. Returns (exit code, log).
+
+    gfx_root: folder holding Unit/Weapon/Depiction/DepictionResources.ndfbin to read
+    instead of <warno_root>/Output/AllPlatforms/NDF/GFX (passed as --gfx-root).
+    """
     log: List[str] = []
     asset_path = _norm_asset(asset_path)
     out_json = _resolve_output(Path(out_json))
@@ -210,6 +220,9 @@ def export_gfx_json(
         "--cache-dir",
         str(cache_dir),
     ]
+    if gfx_root is not None and str(gfx_root).strip():
+        # Always a "--key value" pair: older CLIs skip unknown pairs.
+        cmd += ["--gfx-root", str(gfx_root)]
     if verbose:
         cmd.append("--verbose")
     log.append("[gfx] cmd: " + " ".join(shlex.quote(x) for x in cmd))
@@ -248,6 +261,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--gfx-cli", default="", help="Optional explicit path to moddingSuite.GfxCli.exe")
     ap.add_argument("--timeout-sec", type=int, default=180)
     ap.add_argument(
+        "--gfx-root",
+        default="",
+        help="Folder with Unit/Weapon/Depiction/DepictionResources.ndfbin to read instead of "
+        "<warno-root>/Output/AllPlatforms/NDF/GFX (needs a CLI with --gfx-root; older ones ignore it)",
+    )
+    ap.add_argument(
         "--game",
         default="WARNO",
         help="Active Eugen game id (WARNO|WARGAME_RD|STEEL_DIVISION_2); informational, passed via --warno-root",
@@ -267,6 +286,7 @@ def main() -> int:
         gfx_cli_override=str(args.gfx_cli or ""),
         timeout_sec=int(args.timeout_sec or 180),
         verbose=bool(args.verbose),
+        gfx_root=str(args.gfx_root or "").strip() or None,
     )
     if log:
         print(log, file=sys.stderr)

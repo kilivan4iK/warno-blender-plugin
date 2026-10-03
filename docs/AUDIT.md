@@ -200,8 +200,22 @@ smoke-імпортом модуля. Перед злиттям її треба �
    проходи по іменах.
 3. **Точний join текстур за слотом SPK** (`material_texture_slots_by_id` у поєднанні з каналом
    atlas) замість групового пікера `_build_strict_grouped_maps`, `_pick_primary_*`.
-4. **GFX зі ZZ замість дампу `Output/`.** Потрібен ключ `--gfx-root` у GfxCli: Python уже вміє
-   діставати ці ndfbin з архіву. Ще варто використати `turrets[].yul_bone_ordinal` і
+4. **GFX зі ZZ замість дампу `Output/`.** З боку плагіна зроблено: `GfxManifestResolver` отримує
+   ZZ-резолвер і runtime-папку, шукає в архівах папку з сегментом `gfx`, де лежать усі чотири
+   файли (`unit`, `weapon`, `depiction`, `depictionresources.ndfbin`, регістр не важливий). Якщо
+   таких папок кілька, береться та, чиї файли з найновішого шару патча; вибір пишеться в лог
+   імпорту (`gfx manifest: … input=zz archive_dir=…`). Файли розпаковуються в zz_runtime з
+   перевіркою MD5 і передаються CLI як `--gfx-root`. Кеш маніфесту тепер прив'язаний до MD5 цих
+   записів в архіві та до самого CLI, а не до дат файлів дампу. Якщо в архівах немає всіх
+   чотирьох файлів, лишається стара поведінка: дамп `Output/AllPlatforms/NDF/GFX` без
+   `--gfx-root`. Atlas так само: якщо `TextureSmall.atlas` знайдено в архіві, CLI отримує
+   `--atlas-file <розпакований файл> --fallback none` і не може взяти застарілу копію з `Mods/`
+   чи `Output/`.
+   Це потребує moddingSuite з гілки `blender-plugin-interop` (GfxCli `--gfx-root`, AtlasCli
+   `--atlas-file`/`--fallback`). Старіші CLI пропускають незнайомі пари `--ключ значення` і далі
+   читають дамп `Output/`. Плагін розпізнає це за відсутнім полем `gfx_source` у JSON і тоді
+   кешує результат і за архівом, і за дампом.
+   Ще не зроблено: використати `turrets[].yul_bone_ordinal` і
    `matched_units[].gameplay_bbox_bone_name`, які плагін зараз ігнорує.
 5. **`TextureSmall.atlas` у Python** (CNDF-рідер уже є): це прибере залежність від .NET для
    текстур.
