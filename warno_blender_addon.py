@@ -1014,6 +1014,18 @@ def _restore_project_root_and_auto_config(settings: "WARNOImporterSettings") -> 
     _enforce_fixed_runtime_defaults(settings)
 
 
+_LOG_HANDLES: Dict[str, Any] = {}
+
+
+def _close_log_handles() -> None:
+    for fh in list(_LOG_HANDLES.values()):
+        try:
+            fh.close()
+        except Exception:
+            pass
+    _LOG_HANDLES.clear()
+
+
 def _warno_log(settings: Any, message: str, level: str = "INFO", stage: str = "") -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lvl = str(level or "INFO").upper().strip() or "INFO"
@@ -1026,10 +1038,16 @@ def _warno_log(settings: Any, message: str, level: str = "INFO", stage: str = ""
     if settings is None or not bool(getattr(settings, "log_to_file", False)):
         return
     try:
+        # One line-buffered handle per log file instead of open/append/close for every
+        # line (an import writes thousands of lines).
         path = _log_file_path(settings)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+        key = str(path)
+        fh = _LOG_HANDLES.get(key)
+        if fh is None or fh.closed:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fh = path.open("a", encoding="utf-8", buffering=1)
+            _LOG_HANDLES[key] = fh
+        fh.write(line + "\n")
     except Exception:
         pass
 
@@ -1844,7 +1862,8 @@ def _scan_assets_from_spk_paths(
     out: List[str] = []
     for spk_path in spk_paths:
         try:
-            with extractor_mod.SpkMeshExtractor(spk_path, game=game) as spk:
+            # Listing assets needs only the pack's asset table, not its materials/buffers.
+            with extractor_mod.SpkMeshExtractor(spk_path, game=game, fat_only=True) as spk:
                 for asset, _meta in spk.find_matches(query_for_scan, None):
                     txt = str(asset).strip()
                     key = txt.lower()
@@ -16094,6 +16113,10 @@ def _build_helper_armature(
             armatures_by_side.setdefault(side, []).append(arm_obj)
 
     # Hierarchical OBJECT parenting from bone tree.
+    # _set_parent_keep_world reads matrix_world, which Blender only recomputes on a
+    # depsgraph update; the empties above were placed through .location, so without this
+    # their world matrix is still the identity and keep-world parenting loses the offset.
+    bpy.context.view_layer.update()
     parented_nodes = 0
     for bidx in ordered_indices:
         child = node_by_bone_index.get(int(bidx))
@@ -18075,6 +18098,9 @@ class WARNO_OT_ImportAsset(Operator):
                 pass
             _toggle_import_console(settings, open_console=False, active=self._warno_console_toggled)
             return {"CANCELLED"}
+        finally:
+            # Release the log file between imports (Windows would keep it locked).
+            _close_log_handles()
 
     def _execute_impl(self, context):
         settings = context.scene.warno_import
@@ -18363,7 +18389,8 @@ class WARNO_OT_ImportAsset(Operator):
                 if need_bone_map:
                     for skeleton_path in _resolve_skeleton_spk_paths(project_root, settings, runtime_info):
                         try:
-                            skeleton_spks.append(stack.enter_context(extractor_mod.SpkMeshExtractor(skeleton_path, game=game)))
+                            # Only the node tables are read from skeleton packs.
+                            skeleton_spks.append(stack.enter_context(extractor_mod.SpkMeshExtractor(skeleton_path, game=game, fat_only=True)))
                         except Exception:
                             continue
 
@@ -19674,6 +19701,7 @@ def unregister():
         bpy.utils.unregister_class(cls)
     ASSET_PICKER_VIEW_CACHE.clear()
     ASSET_INDEX_SESSION_CACHE.clear()
+    _close_log_handles()
 
 
 if __name__ == "__main__":

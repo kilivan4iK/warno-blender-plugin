@@ -78,14 +78,24 @@ def parse_tgv(path: Path) -> TGVInfo:
         raise RuntimeError(f"{path.name}: file too small to be valid TGV")
 
     version, unk, width, height = struct.unpack_from("<4I", data, 0)
-    mip_count = struct.unpack_from("<H", data, 0x18)[0]
-    fmt = normalize_format(data[0x1C : 0x1C + 16])
+    # Header as moddingSuite's TgvReader reads it: ImageWidth/ImageHeight (the pixel
+    # size the full-res mip is decoded with), mip count, then the pixel-format string
+    # with its own length, padded to 4 bytes, a 16-byte checksum and the mip tables.
+    image_w, image_h = struct.unpack_from("<2I", data, 0x10)
+    if image_w > 0 and image_h > 0:
+        width, height = image_w, image_h
+    mip_count, fmt_len = struct.unpack_from("<2H", data, 0x18)
+    fmt_len = min(int(fmt_len), max(0, len(data) - 0x1C)) if 0 < fmt_len <= 64 else 16
+    fmt = normalize_format(data[0x1C : 0x1C + fmt_len])
 
     best = (0, None, None, None)
-    for table_start in TABLE_CANDIDATES:
+    exact_start = 0x1C + ((fmt_len + 3) // 4) * 4 + 16
+    for table_start in (exact_start, *[c for c in TABLE_CANDIDATES if c != exact_start]):
         valid, offsets, sizes = try_table(data, table_start, mip_count)
         if valid > best[0]:
             best = (valid, table_start, offsets, sizes)
+        if table_start == exact_start and valid == mip_count and valid > 0:
+            break  # the declared layout checks out; no need to probe others
 
     valid, table_start, offsets, sizes = best
     if valid == 0 or table_start is None or offsets is None or sizes is None:

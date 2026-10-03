@@ -5306,6 +5306,63 @@ def _load_iriszoom():
     return mod
 
 
+try:  # numpy ships with Blender; the pure-Python paths below remain for bare interpreters
+    import numpy as _np
+except Exception:  # pragma: no cover
+    _np = None
+
+_VT = "$/M3D/System/VertexType/TVertex__"
+# Byte layout per vertex format: (field, kind, size). "skip" fields are read past
+# (tangents/normals/atlas packing); see _parse_vertices_by_format for the formats.
+_VERTEX_LAYOUTS: Dict[str, List[Tuple[str, str, int]]] = {
+    _VT + "Position_3f__TexCoord0_2wn__TangentIn01_4ubn__BinormalIn01_4ubn":
+        [("pos", "pos", 12), ("uv", "uv", 4), ("s0", "skip", 8)],
+    _VT + "Position_3f__TexCoord0_2wn__TangentIn01_4ubn__BinormalIn01_4ubn__TexPackedAtlas0_4ubn__TexPackedAtlas1_4ubn__TexPackedAtlas2_4ubn":
+        [("pos", "pos", 12), ("uv", "uv", 4), ("s0", "skip", 20)],
+    _VT + "Position_3f__NormalIn01_4ubn__TexCoord0_2wn__TexPackedAtlas0_4ubn__TexPackedAtlas1_4ubn__TexPackedAtlas2_4ubn":
+        [("pos", "pos", 12), ("s0", "skip", 4), ("uv", "uv", 4), ("s1", "skip", 12)],
+    _VT + "Position_3f__NormalIn01_4ubn__TexCoord0_2wn__TexPackedAtlas0_4ubn":
+        [("pos", "pos", 12), ("s0", "skip", 4), ("uv", "uv", 4), ("s1", "skip", 4)],
+    _VT + "Position_3f__NormalIn01_4ubn__TexCoord0_2wn":
+        [("pos", "pos", 12), ("s0", "skip", 4), ("uv", "uv", 4)],
+    _VT + "Position_3f__BlW_4ubn__BlIdx_4ub__TexCoord0_2wn__TangentIn01_4ubn__BinormalIn01_4ubn":
+        [("pos", "pos", 12), ("w", "w", 4), ("bi", "bi", 4), ("uv", "uv", 4), ("s0", "skip", 8)],
+    _VT + "Position_3f__BlW_4ubn__BlIdx_4ub__TexCoord0_2wn__TangentIn01_4ubn__BinormalAndChenilleIndexIn01_4ubn":
+        [("pos", "pos", 12), ("w", "w", 4), ("bi", "bi", 4), ("uv", "uv", 4), ("s0", "skip", 8)],
+    _VT + "Position_3f__NormalIn01_4ubn__BlW_4ubn__BlIdx_4ub__TexCoord0_2wn":
+        [("pos", "pos", 12), ("s0", "skip", 4), ("w", "w", 4), ("bi", "bi", 4), ("uv", "uv", 4)],
+}
+
+
+def _decode_vertices_numpy(fmt: str, raw: bytes, num_vertices: int) -> Dict[str, List[float]] | None:
+    """Vectorised twin of the per-vertex loop in _parse_vertices_by_format (same values,
+    ~10x faster on a 60k-vertex unit). Returns None when numpy is unavailable."""
+    layout = _VERTEX_LAYOUTS.get(fmt)
+    if _np is None or layout is None:
+        return None
+    kinds = {"pos": ("<f4", (3,)), "uv": ("<u2", (2,)), "w": ("u1", (4,)), "bi": ("u1", (4,))}
+    dtype = _np.dtype([
+        (name, kinds[kind][0], kinds[kind][1]) if kind != "skip" else (name, f"V{size}")
+        for name, kind, size in layout
+    ])
+    n = int(num_vertices)
+    if n * dtype.itemsize > len(raw):
+        raise ValueError(f"Vertex buffer too short: {len(raw)} bytes for {n} x {dtype.itemsize}")
+    rec = _np.frombuffer(raw, dtype=dtype, count=n)
+    out: Dict[str, List[float]] = {
+        "xyz": (rec["pos"].astype(_np.float64) / 100.0).reshape(-1).tolist(),
+        "uv": (rec["uv"].astype(_np.float64) / 8192.0).reshape(-1).tolist(),
+    }
+    if "w" in dtype.names and n > 0:
+        w = rec["w"].astype(_np.float64) / 255.0
+        total = w[:, 0] + w[:, 1] + w[:, 2] + w[:, 3]
+        nz = total > 0.0
+        w[nz] = w[nz] / total[nz][:, None]
+        out["bone_idx"] = rec["bi"].astype(_np.float64).reshape(-1).tolist()
+        out["bone_w"] = w.reshape(-1).tolist()
+    return out
+
+
 class SpkMeshExtractor:
     def __init__(self, spk_path: Path, *, game: "str | None" = None, fat_only: bool = False):
         """Open a MESH/PCPC pack. ``fat_only`` reads just the header and the asset table
@@ -7162,6 +7219,18 @@ class SpkMeshExtractor:
             raw = zlib_decode_compat(bytes(comp))
             if length > 0 and len(raw) < length:
                 raise ValueError("Corrupted compressed index buffer")
+            if _np is not None and num > 0:
+                # Delta prefix-sum seeded with the first value, wrapping at u16 (game index
+                # buffers are u16) -- the same arithmetic as the loop below, vectorised.
+                deltas = _np.frombuffer(raw, dtype="<i2", count=num).astype(_np.int64)
+                arr = (_np.cumsum(deltas) + int(deltas[0])) & 0xFFFF
+                tri = (len(arr) // 3) * 3
+                if tri:
+                    view = arr[:tri].reshape(-1, 3)
+                    view[:, [0, 2]] = view[:, [2, 0]]
+                out = arr.tolist()
+                self._index_cache[table_index] = out
+                return out
             vals = list(struct.unpack_from(f"<{num}h", raw, 0))
             idx = vals[0] if vals else 0
             out: List[int] = []
@@ -7201,6 +7270,10 @@ class SpkMeshExtractor:
         }
         if fmt not in patterns:
             raise ValueError(f"Unsupported vertex format: {fmt}")
+
+        fast = _decode_vertices_numpy(fmt, raw, num_vertices)
+        if fast is not None:
+            return fast
 
         pos = 0
         xyz: List[float] = []
@@ -8865,7 +8938,17 @@ def _ensure_converter_python_deps(py_cmd: Sequence[str], target_dir: Path) -> Tu
 
     ensure_cmd = [*py_cmd, "-m", "ensurepip", "--upgrade"]
     ensure_cmd_text = " ".join(ensure_cmd)
-    ensure_proc = subprocess.run(ensure_cmd, capture_output=True, text=True)
+    def _run(cmd: List[str]) -> subprocess.CompletedProcess:
+        # Bounded: a stalled pip (offline, proxy) used to hang Blender indefinitely.
+        try:
+            return subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return subprocess.CompletedProcess(cmd, 1, "", f"{type(exc).__name__}: {exc}")
+
+    ensure_proc = _run(ensure_cmd)
     ensure_msg = (ensure_proc.stderr or ensure_proc.stdout or "").strip()
 
     pip_cmd = [
@@ -8880,7 +8963,7 @@ def _ensure_converter_python_deps(py_cmd: Sequence[str], target_dir: Path) -> Tu
         "zstandard",
     ]
     pip_cmd_text = " ".join(pip_cmd)
-    pip_proc = subprocess.run(pip_cmd, capture_output=True, text=True)
+    pip_proc = _run(pip_cmd)
     pip_msg = (pip_proc.stderr or pip_proc.stdout or "").strip()
     if pip_proc.returncode == 0:
         _DEPS_READY_CACHE[key] = True
