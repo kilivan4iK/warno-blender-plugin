@@ -338,10 +338,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument(
         "--fallback",
-        choices=ATLAS_FALLBACK_MODES,
         default=None,
-        help="none: only <cache-dir>/PC/Atlas/<asset folder>/TextureSmall.atlas, no Mods/Output copies "
-        "(CLI default: ambient)",
+        # No argparse choices: argparse exits 2 on a bad choice, which here means "no
+        # entries". export_atlas_json rejects an invalid value with exit 3.
+        help="ambient|none. none: only <cache-dir>/PC/Atlas/<asset folder>/TextureSmall.atlas, "
+        "no Mods/Output copies (CLI default: ambient)",
     )
     ap.add_argument("--timeout-sec", type=int, default=45)
     ap.add_argument("--game", default="WARNO", help="Active Eugen game id (WARNO|WARGAME_RD|STEEL_DIVISION_2)")

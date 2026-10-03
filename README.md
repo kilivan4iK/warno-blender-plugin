@@ -148,6 +148,17 @@ current settings out, **Load My config** to restore them. Key fields:
 | `fbx_auto_smooth_mode` | `MODIFIER` / `OFF` / `APPLY`. |
 | `import_semantic_mode` | `REFERENCE` matches the developer reference `.blend` layout. |
 
+**Where the GFX manifest and atlas data come from.** The plugin extracts each
+asset's `TextureSmall.atlas` and the four GFX ndfbins (`Unit`, `Weapon`, `Depiction`,
+`DepictionResources`) from the game packs and passes them to the CLIs with
+`--atlas-file` / `--gfx-root`. Only a moddingSuite build that has these options
+(branch `blender-plugin-interop`) reads them; older builds skip them. For atlases that
+changes little, since every build looks in the extracted copy first. The GFX CLI of an
+older build, however, reads `<WARNO>/Output/AllPlatforms/NDF/GFX/*.ndfbin`, a dump you
+make with the game's own export and must refresh yourself after every game patch. The
+plugin also falls back to that dump when the packs have no complete `gfx` folder, or
+when the CLI rejects the pack files or finds no unit in them.
+
 ---
 
 ## 🧠 How it works (architecture)
@@ -207,7 +218,7 @@ of the SPK/FBX pipeline; others are open work.
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `ZZ runtime prepare failed: No texture DAT packages found under WARNO folder` | WARNO folder path wrong, or Steam is mid-update. | Verify `<WARNO>/Data/PC/.../ZZ_*.dat` exists; wait for Steam if downloading. |
-| `Asset not found in SPK` after WARNO updated | Asset index from before the update. | Click **Scan ALL Assets** (extracted files, atlas JSON, GFX manifests and converted PNGs refresh on their own: they are checked against the MD5 each `ZZ_*.dat` stores per file). |
+| `Asset not found in SPK` after WARNO updated | Asset index from before the update. | Click **Scan ALL Assets** (extracted files, atlas JSON and converted PNGs refresh on their own: they are checked against the MD5 each `ZZ_*.dat` stores per file). GFX manifests refresh the same way with a moddingSuite build that has `--gfx-root`; with an older build, or when the packs have no complete `gfx` folder, they come from `<WARNO>/Output/AllPlatforms/NDF/GFX`, so redo that dump after the update (see Configuration). |
 | Newly added DLC unit doesn't appear in Browse | Asset index cache from before the update. | Same as above. |
 | `ZZ pack problem (its files are missing from the index)` in the log | A `ZZ_*.dat` could not be parsed (e.g. a new EDAT version). | Report it with the log line; every file of that patch layer is missing until it is supported. |
 | Window glass shows the wrong unit's texture | Two units in the scene; latest import owns `Vitre`. | Delete the older unit, or rename `<old>__Vitre` back to `Vitre` before exporting. |

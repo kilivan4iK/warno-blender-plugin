@@ -8618,25 +8618,36 @@ def find_gfx_ndfbins_in_zz(resolver: "ZZDatResolver") -> Dict[str, Any] | None:
     }
 
 
+GFX_ASSEMBLED_ROOT = "_gfx_root"
+
+
 def _gfx_inputs_from_zz(resolver: "ZZDatResolver", runtime_root: Path) -> Dict[str, Any] | None:
     """Extract the four GFX ndfbins from the game packs into runtime_root (MD5-validated,
     so a patched file replaces the old copy). Returns their folder and archive idents,
-    or None when the packs do not hold all four in one gfx folder."""
+    or None when the packs do not hold all four in one gfx folder.
+
+    find_gfx_ndfbins_in_zz groups folders case-insensitively, so a patch layer may store
+    one file under e.g. "PC/NDF/Patchable/GFX" and the rest under "pc/ndf/patchable/gfx".
+    Extracted under their own paths, these land in two folders on a case-sensitive file
+    system. The four files are then extracted side by side, under their canonical names,
+    into runtime_root/_gfx_root/<archive_dir> instead ("assembled": True)."""
     found = find_gfx_ndfbins_in_zz(resolver)
     if found is None:
         return None
+    hits = [found["hits"][name] for name in GFX_NDFBIN_NAMES]
+    parents = {normalize_asset_path(str(h.get("path", "") or "")).rsplit("/", 1)[0] for h in hits}
+    assembled = len(parents) != 1
     dirs: set[str] = set()
     out_dir: "Path | None" = None
     idents: List[List[Any]] = []
-    for name in GFX_NDFBIN_NAMES:
-        hit = found["hits"][name]
+    for name, hit in zip(GFX_NDFBIN_NAMES, hits):
+        if assembled:
+            hit = dict(hit, path=f"{GFX_ASSEMBLED_ROOT}/{found['archive_dir']}/{name}")
         out_path = resolver.extract_hit_to_runtime(hit, Path(runtime_root))
         out_dir = out_path.parent
         dirs.add(os.path.normcase(str(out_dir)))
         idents.append(["zz", name, str(hit.get("ident", "") or "")])
     if out_dir is None or len(dirs) != 1:
-        # Folder names differing only by case land in different folders on a
-        # case-sensitive file system; the CLI needs all four side by side.
         return None
     first = found["hits"][GFX_NDFBIN_NAMES[0]]
     return {
@@ -8646,6 +8657,7 @@ def _gfx_inputs_from_zz(resolver: "ZZDatResolver", runtime_root: Path) -> Dict[s
         "layer": int(found["layer"]),
         "pack": str(first.get("dat_path", "")),
         "alternatives": list(found["alternatives"]),
+        "assembled": assembled,
     }
 
 
@@ -8737,6 +8749,11 @@ def build_or_load_gfx_manifest(
                     "layer": zz_in["layer"],
                     "alternatives": zz_in["alternatives"],
                 }
+                if zz_in.get("assembled"):
+                    gfx_input["note"] = (
+                        "the four GFX ndfbins sit in pack folders differing only by case; "
+                        "extracted side by side into " + str(gfx_root_arg)
+                    )
                 zz_sig = (
                     list(zz_in["idents"])
                     + [["gfx_root", str(gfx_root_arg).lower()]]
@@ -8753,6 +8770,8 @@ def build_or_load_gfx_manifest(
     sources_text = (
         "the GFX ndfbins in the game packs" if zz_sig is not None else "the Output/AllPlatforms/NDF/GFX dump"
     )
+    # The dump is a fallback for a --gfx-root run only when it holds all four files.
+    dump_complete = all(int(entry[2]) >= 0 for entry in dump_sig[: len(GFX_NDFBIN_NAMES)])
 
     miss_path = _sidecar_path(out_json, "miss")
     sig_path = _sidecar_path(out_json, "sig")
@@ -8765,6 +8784,8 @@ def build_or_load_gfx_manifest(
                 + str(prev_miss.get("error", ""))[:300]
             )
     prev_ok = _read_sidecar(sig_path)
+    if prev_ok is not None and str(prev_ok.get("gfx_input_note", "") or "") and prev_ok.get("sources_signature") in accepted_sigs:
+        gfx_input["note"] = str(prev_ok["gfx_input_note"])
     need_export = (
         force_rebuild
         or not out_json.exists()
@@ -8773,29 +8794,74 @@ def build_or_load_gfx_manifest(
     )
     if need_export:
         temp_out = out_json.with_suffix(".tmp.json")
-        extra: Dict[str, Any] = {"gfx_root": gfx_root_arg} if gfx_root_arg is not None else {}
-        rc, log = mod.export_gfx_json(
-            warno_root=Path(warno_root),
-            modding_suite_root=Path(modding_suite_root),
-            asset_path=asset_norm,
-            out_json=temp_out,
-            cache_dir=cache_root,
-            gfx_cli_override=str(gfx_cli_path or ""),
-            timeout_sec=max(5, int(timeout_sec)),
-            **extra,
-        )
-        if rc == 0 and temp_out.exists():
-            store_sig = conservative_sig
-            if zz_sig is not None:
+
+        def run_export(dest: Path, use_gfx_root: bool) -> Tuple[int, str, Dict[str, Any] | None]:
+            extra: Dict[str, Any] = {"gfx_root": gfx_root_arg} if use_gfx_root and gfx_root_arg is not None else {}
+            rc_, log_ = mod.export_gfx_json(
+                warno_root=Path(warno_root),
+                modding_suite_root=Path(modding_suite_root),
+                asset_path=asset_norm,
+                out_json=dest,
+                cache_dir=cache_root,
+                gfx_cli_override=str(gfx_cli_path or ""),
+                timeout_sec=max(5, int(timeout_sec)),
+                **extra,
+            )
+            exported_: Dict[str, Any] | None = None
+            if rc_ == 0 and dest.exists():
                 try:
-                    exported = json.loads(temp_out.read_text(encoding="utf-8-sig"))
-                    cli_src = exported.get("gfx_source") if isinstance(exported, dict) else None
-                    if isinstance(cli_src, dict) and str(cli_src.get("kind", "")) == "gfx_root":
-                        store_sig = zz_sig
+                    loaded = json.loads(dest.read_text(encoding="utf-8-sig"))
+                    exported_ = loaded if isinstance(loaded, dict) else {}
                 except (OSError, ValueError):
+                    exported_ = {}
+            else:
+                try:
+                    dest.unlink()
+                except OSError:
                     pass
+            return rc_, str(log_ or ""), exported_
+
+        rc, log, exported = run_export(temp_out, use_gfx_root=True)
+        store_sig = conservative_sig
+        note = ""
+        if exported is not None and zz_sig is not None:
+            cli_src = exported.get("gfx_source")
+            if isinstance(cli_src, dict) and str(cli_src.get("kind", "")) == "gfx_root":
+                store_sig = zz_sig
+        if gfx_root_arg is not None and dump_complete:
+            # The pack layout and the CLI's reading of the pack files are not verified
+            # against every game version: when the CLI rejects the pack files, or finds no
+            # unit in them, retry on the Output dump (the behaviour before --gfx-root).
+            if exported is None:
+                dump_out = out_json.with_suffix(".dump.tmp.json")
+                rc2, log2, exported2 = run_export(dump_out, use_gfx_root=False)
+                if exported2 is not None:
+                    dump_out.replace(temp_out)
+                    exported, store_sig = exported2, conservative_sig
+                    note = f"the CLI rejected the GFX ndfbins from the game packs (rc={rc}); read the Output dump instead"
+                else:
+                    log = f"{log[-700:]}\n[gfx] retry on the Output dump: rc={rc2}: {log2[-700:]}"
+            elif store_sig is zz_sig and not list(exported.get("matched_units", []) or []):
+                # (Only when the CLI says it read --gfx-root: an older CLI that skipped
+                # the option already read the dump.)
+                dump_out = out_json.with_suffix(".dump.tmp.json")
+                _rc2, _log2, exported2 = run_export(dump_out, use_gfx_root=False)
+                if exported2 is not None and list(exported2.get("matched_units", []) or []):
+                    dump_out.replace(temp_out)
+                    exported, store_sig = exported2, conservative_sig
+                    note = "no unit matched in the GFX ndfbins from the game packs; the Output dump matched some and was used"
+                else:
+                    try:
+                        dump_out.unlink()
+                    except OSError:
+                        pass
+        if exported is not None and temp_out.exists():
             temp_out.replace(out_json)
-            _write_sidecar(sig_path, {"asset_path": asset_norm, "sources_signature": store_sig})
+            payload: Dict[str, Any] = {"asset_path": asset_norm, "sources_signature": store_sig}
+            if note:
+                payload["gfx_input_note"] = note
+                gfx_input["note"] = note
+            _write_sidecar(sig_path, payload)
             try:
                 miss_path.unlink()
             except OSError:
