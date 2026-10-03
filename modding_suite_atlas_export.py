@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 WARNO Atlas JSON export wrapper (strict headless mode).
 
@@ -32,41 +32,13 @@ def _resolve_output(path: Path) -> Path:
     return path / "atlas_map.json"
 
 
-def _has_atlas_tree(root: Path) -> bool:
-    try:
-        return (root / "PC" / "Atlas").exists()
-    except Exception:
-        return False
-
-
-def _resolve_lookup_cache_dir(requested_cache_dir: Path) -> Path:
-    """
-    AtlasCli uses --cache-dir only for Atlas lookup (expects <cache>/PC/Atlas/...).
-    In strict ZZ runtime flow atlas_json_cache usually does not contain atlas binaries,
-    so we auto-point lookup to prepared ZZ runtime when available.
-    """
-    script_root = Path(__file__).resolve().parent
-    candidates: List[Path] = []
-
-    req = requested_cache_dir
-    candidates.append(req)
-    candidates.append(script_root / "out_blender_runtime" / "zz_runtime")
-    candidates.append(script_root / "output_blender" / "_zz_runtime")
-    candidates.append(script_root / "output_blender")
-
-    seen: set[str] = set()
-    uniq: List[Path] = []
-    for c in candidates:
-        key = str(c).lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        uniq.append(c)
-
-    for c in uniq:
-        if _has_atlas_tree(c):
-            return c
-    return req
+def atlas_rel_for_asset(asset_path: str) -> str:
+    """The one atlas the CLI reads for an asset: PC/Atlas/<asset folder>/TextureSmall.atlas
+    (AtlasCliRunner.ResolveAtlasPath looks nowhere else)."""
+    parts = [p for p in _norm_asset(asset_path).split("/") if p]
+    if len(parts) < 2:
+        return ""
+    return "PC/Atlas/" + "/".join(parts[:-1]) + "/TextureSmall.atlas"
 
 
 def _load_extractor_module(script_root: Path):
@@ -86,83 +58,22 @@ def _load_extractor_module(script_root: Path):
         raise
 
 
-def _atlas_rel_candidates_for_asset(asset_path: str) -> List[str]:
-    norm = _norm_asset(asset_path)
-    parts = [p for p in norm.split("/") if p]
-    if len(parts) < 2:
-        return []
-    dir_parts = parts[:-1]  # drop .fbx
-    # Try exact dir first, then parents up to Assets.
-    rels: List[str] = []
-    for i in range(len(dir_parts), 0, -1):
-        cur = "/".join(dir_parts[:i]).strip("/")
-        if not cur:
-            continue
-        if not cur.lower().startswith("assets/"):
-            continue
-        rels.append(f"PC/Atlas/{cur}/TextureSmall.atlas")
-        if cur.lower() == "assets":
-            break
-    # De-dup preserve order.
-    out: List[str] = []
-    seen: set[str] = set()
-    for r in rels:
-        k = r.lower()
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(r)
-    return out
-
-
-def _ensure_atlas_for_asset_from_zz(
-    *,
-    warno_root: Path,
-    lookup_cache_dir: Path,
-    asset_path: str,
-    verbose: bool,
-) -> bool:
-    rel_candidates = _atlas_rel_candidates_for_asset(asset_path)
-    if not rel_candidates:
-        return False
-
-    # Fast path: already present.
-    for rel in rel_candidates:
-        p = lookup_cache_dir / Path(*rel.split("/"))
-        if p.exists() and p.is_file():
-            return True
-
-    script_root = Path(__file__).resolve().parent
-    extractor = _load_extractor_module(script_root)
+def _ensure_atlas_for_asset_from_zz(*, warno_root: Path, lookup_cache_dir: Path, asset_path: str, game: str) -> str:
+    """Standalone use only: extract the asset's TextureSmall.atlas from the game packs
+    into <lookup_cache_dir>/PC/Atlas/... (checksum-validated, so a patched atlas
+    replaces the old copy). The Blender add-on does this in-process instead."""
+    rel = atlas_rel_for_asset(asset_path)
+    if not rel:
+        return "no atlas path for asset"
+    extractor = _load_extractor_module(Path(__file__).resolve().parent)
     if extractor is None:
-        return False
-
+        return "warno_spk_extract.py not found"
     try:
-        resolver = extractor.get_zz_runtime_resolver(Path(warno_root))
-    except Exception:
-        return False
-
-    extracted = False
-    for rel in rel_candidates:
-        try:
-            out = resolver.extract_asset_to_runtime(rel, Path(lookup_cache_dir), exact_only=True)
-            if out is None:
-                out = resolver.extract_asset_to_runtime(rel, Path(lookup_cache_dir), exact_only=False)
-            if out is not None and Path(out).exists():
-                extracted = True
-                if verbose:
-                    print(f"[atlas-wrapper] extracted atlas from zz: {out}", file=sys.stderr)
-                break
-        except Exception:
-            continue
-
-    # Confirm file exists where AtlasCli expects it.
-    if extracted:
-        for rel in rel_candidates:
-            p = lookup_cache_dir / Path(*rel.split("/"))
-            if p.exists() and p.is_file():
-                return True
-    return False
+        resolver = extractor.get_zz_runtime_resolver(Path(warno_root), game=game)
+        out = resolver.extract_asset_to_runtime(rel, Path(lookup_cache_dir), exact_only=True)
+    except Exception as exc:
+        return f"zz extract failed: {exc}"
+    return f"extracted {out}" if out is not None else f"{rel} is not in the game packs"
 
 
 def _tail_text(text: str, max_chars: int = 1600) -> str:
@@ -228,19 +139,22 @@ def _load_and_validate(path: Path, asset_path: str, atlas_source: str) -> Dict[s
 
 def _resolve_cli_exe(modding_suite_root: Path, atlas_cli_override: str) -> tuple[Path | None, List[Path]]:
     script_root = Path(__file__).resolve().parent
-    # Preferred: unified moddingSuite.exe (one binary, subcommand routes the
-    # call). Legacy AtlasCli.exe kept as fallback for older plugin installs.
-    unified_primary   = script_root / "moddingSuite" / "moddingSuite.exe"
-    unified_secondary = modding_suite_root / "moddingSuite.exe"
-    legacy_a = script_root / "moddingSuite" / "atlas_cli" / "moddingSuite.AtlasCli.exe"
-    legacy_b = script_root / "moddingSuite" / "moddingSuite.AtlasCli.exe"
-    legacy_c = modding_suite_root / "atlas_cli" / "moddingSuite.AtlasCli.exe"
-    legacy_d = modding_suite_root / "moddingSuite.AtlasCli.exe"
-    override = Path(atlas_cli_override).expanduser() if atlas_cli_override.strip() else None
-
-    candidates: List[Path] = [unified_primary, unified_secondary, legacy_a, legacy_b, legacy_c, legacy_d]
-    if override is not None:
+    candidates: List[Path] = []
+    # An explicit path from the settings wins; it used to be tried LAST, so a
+    # self-built CLI was silently ignored whenever a bundled one existed.
+    if atlas_cli_override.strip():
+        override = Path(atlas_cli_override).expanduser()
         candidates.append(override if override.is_absolute() else (script_root / override))
+    candidates += [
+        # Unified moddingSuite.exe (the subcommand routes the call).
+        script_root / "moddingSuite" / "moddingSuite.exe",
+        modding_suite_root / "moddingSuite.exe",
+        # Dedicated AtlasCli.exe from older moddingSuite builds.
+        script_root / "moddingSuite" / "atlas_cli" / "moddingSuite.AtlasCli.exe",
+        script_root / "moddingSuite" / "moddingSuite.AtlasCli.exe",
+        modding_suite_root / "atlas_cli" / "moddingSuite.AtlasCli.exe",
+        modding_suite_root / "moddingSuite.AtlasCli.exe",
+    ]
 
     seen: set[str] = set()
     uniq: List[Path] = []
@@ -274,15 +188,21 @@ def _run_cli(cmd: List[str], timeout_sec: int) -> tuple[int, str, str, float, bo
             cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=max(5, int(timeout_sec)),
+            # No console window flashing up over Blender for the dotnet host.
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         elapsed = time.monotonic() - t0
         return int(proc.returncode), str(proc.stdout or ""), str(proc.stderr or ""), elapsed, False
     except subprocess.TimeoutExpired as exc:
         elapsed = time.monotonic() - t0
-        out = str(getattr(exc, "stdout", "") or "")
-        err = str(getattr(exc, "stderr", "") or "")
+        out = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else str(exc.stdout or "")
+        err = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else str(exc.stderr or "")
         return 124, out, err, elapsed, True
+    except OSError as exc:
+        return 127, "", f"cannot start {cmd[0]}: {exc}", time.monotonic() - t0, False
 
 
 def _build_dotnet_fallback_cmd(cli_exe: Path) -> List[str] | None:
@@ -294,50 +214,36 @@ def _build_dotnet_fallback_cmd(cli_exe: Path) -> List[str] | None:
     return None
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="Export WARNO Atlas crop/name map via headless Atlas CLI")
-    ap.add_argument("--warno-root", required=True)
-    ap.add_argument("--modding-suite-root", required=True)
-    ap.add_argument("--asset-path", required=True)
-    ap.add_argument("--out-json", required=True)
-    ap.add_argument("--cache-dir", required=True)
-    ap.add_argument("--atlas-cli", default="", help="Optional explicit path to moddingSuite.AtlasCli.exe")
-    ap.add_argument("--timeout-sec", type=int, default=45)
-    ap.add_argument(
-        "--game",
-        default="WARNO",
-        help="Active Eugen game id (WARNO|WARGAME_RD|STEEL_DIVISION_2); informational, passed via --warno-root",
-    )
-    ap.add_argument("--verbose", action="store_true")
-    return ap
+def export_atlas_json(
+    *,
+    warno_root: Path,
+    modding_suite_root: Path,
+    asset_path: str,
+    out_json: Path,
+    lookup_cache_dir: Path,
+    atlas_cli_override: str = "",
+    timeout_sec: int = 45,
+    verbose: bool = False,
+) -> tuple[int, str]:
+    """Run the Atlas CLI for one asset and validate its JSON.
 
-
-def main() -> int:
-    args = build_arg_parser().parse_args()
-
-    warno_root = Path(args.warno_root)
-    modding_suite_root = Path(args.modding_suite_root)
-    asset_path = _norm_asset(args.asset_path)
-    print(f"[atlas-wrapper] game: {args.game}", file=sys.stderr)
-    out_json = _resolve_output(Path(args.out_json))
-    cache_dir = Path(args.cache_dir)
-    lookup_cache_dir = _resolve_lookup_cache_dir(cache_dir)
+    The atlas must already sit at <lookup_cache_dir>/PC/Atlas/<asset folder>/TextureSmall.atlas.
+    Returns (exit code, log text): 0 ok, 2 the atlas has no entries for the asset,
+    3 hard failure, 4 the CLI wrote an invalid JSON. Called in-process by the add-on,
+    which spares a Python start-up and a full re-index of the game packs per asset.
+    """
+    log: List[str] = []
+    asset_path = _norm_asset(asset_path)
+    out_json = _resolve_output(Path(out_json))
     out_json.parent.mkdir(parents=True, exist_ok=True)
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    timeout_sec = max(5, int(timeout_sec or 45))
 
-    if not warno_root.exists() or not warno_root.is_dir():
-        print(f"Atlas export failed: WARNO root not found: {warno_root}", file=sys.stderr)
-        return 3
+    if not Path(warno_root).is_dir():
+        return 3, f"Atlas export failed: WARNO root not found: {warno_root}"
 
-    cli_exe, tried = _resolve_cli_exe(modding_suite_root=modding_suite_root, atlas_cli_override=str(args.atlas_cli or ""))
+    cli_exe, tried = _resolve_cli_exe(modding_suite_root=Path(modding_suite_root), atlas_cli_override=str(atlas_cli_override or ""))
     if cli_exe is None:
-        tried_text = ", ".join(str(p) for p in tried)
-        print(
-            "Atlas export failed: headless Atlas CLI was not found. "
-            f"Tried: {tried_text}",
-            file=sys.stderr,
-        )
-        return 3
+        return 3, "Atlas export failed: headless Atlas CLI was not found. Tried: " + ", ".join(str(p) for p in tried)
 
     base_args = [
         "--warno-root",
@@ -350,85 +256,95 @@ def main() -> int:
         str(lookup_cache_dir),
         "--include-sibling-assets",
     ]
+    if verbose:
+        base_args.append("--verbose")
 
-    cmd = _build_cli_cmd(cli_exe, base_args)
-    if bool(args.verbose):
-        cmd.append("--verbose")
+    def _attempt(cmd: List[str], tag: str) -> tuple[int, bool]:
+        log.append(f"[atlas] {tag}cmd: " + " ".join(shlex.quote(x) for x in cmd))
+        rc, out, err, elapsed, timed_out = _run_cli(cmd, timeout_sec=timeout_sec)
+        log.append(f"[atlas] {tag}exit_code={rc} elapsed={elapsed:.2f}s")
+        if _tail_text(out):
+            log.append(f"[atlas] {tag}stdout: {_tail_text(out)}")
+        if _tail_text(err):
+            log.append(f"[atlas] {tag}stderr: {_tail_text(err)}")
+        return rc, timed_out
 
-    quoted = " ".join(shlex.quote(x) for x in cmd)
-    print(f"[atlas-wrapper] cmd: {quoted}", file=sys.stderr)
-    if str(lookup_cache_dir) != str(cache_dir):
-        print(f"[atlas-wrapper] cache_dir_for_lookup: {lookup_cache_dir}", file=sys.stderr)
-
-    # On clean PCs atlas files may be missing outside ZZ.dat; pre-extract expected atlas on demand.
-    _ensure_atlas_for_asset_from_zz(
-        warno_root=warno_root,
-        lookup_cache_dir=lookup_cache_dir,
-        asset_path=asset_path,
-        verbose=bool(args.verbose),
-    )
-
-    rc, out, err, elapsed, timed_out = _run_cli(cmd, timeout_sec=max(5, int(args.timeout_sec or 45)))
-    print(f"[atlas-wrapper] elapsed: {elapsed:.2f}s", file=sys.stderr)
-    print(f"[atlas-wrapper] exit_code: {rc}", file=sys.stderr)
-    out_tail = _tail_text(out)
-    err_tail = _tail_text(err)
-    if out_tail:
-        print(f"[atlas-wrapper] stdout_tail: {out_tail}", file=sys.stderr)
-    if err_tail:
-        print(f"[atlas-wrapper] stderr_tail: {err_tail}", file=sys.stderr)
-
-    # Some environments crash when launching apphost EXE directly (e.g. CLR assert),
-    # but succeed through dotnet + DLL host. Retry once before failing strict flow.
+    rc, timed_out = _attempt(_build_cli_cmd(cli_exe, base_args), "")
+    # Some machines crash launching the apphost EXE directly (CLR assert) but work
+    # through the dotnet host + DLL; retry that once.
     if not timed_out and rc not in {0, 2}:
         dotnet_exec = _build_dotnet_fallback_cmd(cli_exe)
         if dotnet_exec is not None:
-            retry_cmd = list(dotnet_exec)
+            retry = list(dotnet_exec)
             if cli_exe.name.lower() == "moddingsuite.exe":
-                retry_cmd.append("atlas")
-            retry_cmd.extend(base_args)
-            if bool(args.verbose):
-                retry_cmd.append("--verbose")
-            quoted_retry = " ".join(shlex.quote(x) for x in retry_cmd)
-            print(f"[atlas-wrapper] retry_cmd: {quoted_retry}", file=sys.stderr)
-            rc2, out2, err2, elapsed2, timed_out2 = _run_cli(
-                retry_cmd,
-                timeout_sec=max(5, int(args.timeout_sec or 45)),
-            )
-            print(f"[atlas-wrapper] retry_elapsed: {elapsed2:.2f}s", file=sys.stderr)
-            print(f"[atlas-wrapper] retry_exit_code: {rc2}", file=sys.stderr)
-            out2_tail = _tail_text(out2)
-            err2_tail = _tail_text(err2)
-            if out2_tail:
-                print(f"[atlas-wrapper] retry_stdout_tail: {out2_tail}", file=sys.stderr)
-            if err2_tail:
-                print(f"[atlas-wrapper] retry_stderr_tail: {err2_tail}", file=sys.stderr)
-            rc, out, err, timed_out = rc2, out2, err2, timed_out2
+                retry.append("atlas")
+            rc, timed_out = _attempt(retry + base_args, "retry_")
 
     if timed_out:
-        print(f"atlas_cli_timeout: exceeded {int(args.timeout_sec or 45)}s", file=sys.stderr)
-        return 3
-
-    # Preserve "no entries" contract.
+        log.append(f"atlas_cli_timeout: exceeded {timeout_sec}s")
+        return 3, "\n".join(log)
     if rc == 2:
-        return 2
+        log.append(f"atlas_cli_no_entries: atlas data has no entries for asset {asset_path}")
+        return 2, "\n".join(log)
     if rc != 0:
-        print("Atlas export failed: headless Atlas CLI returned non-zero exit code.", file=sys.stderr)
-        return 3
-
-    if not out_json.exists() or not out_json.is_file():
-        print(f"Atlas export failed: output JSON missing: {out_json}", file=sys.stderr)
-        return 3
-
+        log.append("Atlas export failed: headless Atlas CLI returned non-zero exit code.")
+        return 3, "\n".join(log)
+    if not out_json.is_file():
+        log.append(f"Atlas export failed: output JSON missing: {out_json}")
+        return 3, "\n".join(log)
     try:
         data = _load_and_validate(out_json, asset_path=asset_path, atlas_source="")
     except Exception as exc:
-        print(str(exc), file=sys.stderr)
-        return 4
-
+        log.append(str(exc))
+        return 4, "\n".join(log)
     out_json.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[OK] Atlas JSON exported: {out_json}")
-    return 0
+    return 0, "\n".join(log)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(description="Export WARNO Atlas crop/name map via headless Atlas CLI")
+    ap.add_argument("--warno-root", required=True)
+    ap.add_argument("--modding-suite-root", required=True)
+    ap.add_argument("--asset-path", required=True)
+    ap.add_argument("--out-json", required=True)
+    ap.add_argument(
+        "--cache-dir",
+        required=True,
+        help="Folder holding PC/Atlas/<asset folder>/TextureSmall.atlas (extracted from the game packs if missing)",
+    )
+    ap.add_argument("--atlas-cli", default="", help="Optional explicit path to moddingSuite.exe / moddingSuite.AtlasCli.exe")
+    ap.add_argument("--timeout-sec", type=int, default=45)
+    ap.add_argument("--game", default="WARNO", help="Active Eugen game id (WARNO|WARGAME_RD|STEEL_DIVISION_2)")
+    ap.add_argument("--verbose", action="store_true")
+    return ap
+
+
+def main() -> int:
+    args = build_arg_parser().parse_args()
+    cache_dir = Path(args.cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    note = _ensure_atlas_for_asset_from_zz(
+        warno_root=Path(args.warno_root),
+        lookup_cache_dir=cache_dir,
+        asset_path=args.asset_path,
+        game=str(args.game or "WARNO"),
+    )
+    print(f"[atlas-wrapper] {note}", file=sys.stderr)
+    rc, log = export_atlas_json(
+        warno_root=Path(args.warno_root),
+        modding_suite_root=Path(args.modding_suite_root),
+        asset_path=args.asset_path,
+        out_json=Path(args.out_json),
+        lookup_cache_dir=cache_dir,
+        atlas_cli_override=str(args.atlas_cli or ""),
+        timeout_sec=int(args.timeout_sec or 45),
+        verbose=bool(args.verbose),
+    )
+    if log:
+        print(log, file=sys.stderr)
+    if rc == 0:
+        print(f"[OK] Atlas JSON exported: {_resolve_output(Path(args.out_json))}")
+    return rc
 
 
 if __name__ == "__main__":

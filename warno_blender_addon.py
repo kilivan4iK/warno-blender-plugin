@@ -1270,19 +1270,11 @@ def _dat_signature_for_cache(
     warno_root: Path,
     game: "str | None" = None,
 ) -> tuple[tuple[str, int, int], ...]:
-    rows: List[tuple[str, int, int]] = []
     try:
         dat_files = extractor_mod.find_warno_texture_dat_files(warno_root, game=game)
     except Exception:
         dat_files = []
-    for p in dat_files:
-        try:
-            st = p.stat()
-            rows.append((str(Path(p).resolve()).lower(), int(st.st_mtime_ns), int(st.st_size)))
-        except Exception:
-            continue
-    rows.sort(key=lambda x: x[0])
-    return tuple(rows)
+    return extractor_mod.zz_dat_signature(dat_files)
 
 
 def _candidate_tgv_converter_from_modding_suite(settings: "WARNOImporterSettings") -> Path | None:
@@ -1355,6 +1347,8 @@ def _prepare_zz_runtime_sources(
     )
     info["runtime_root"] = str(runtime_root)
     info["source_policy"] = "zz_runtime_only"
+    for err in info.get("zz_errors", []) or []:
+        _warno_log(settings, f"ZZ pack problem (its files are missing from the index): {err}", level="WARNING", stage="zz_runtime")
 
     try:
         resolver = extractor_mod.get_zz_runtime_resolver(warno_root, game=game)
@@ -5623,6 +5617,8 @@ def _resolve_material_maps(
                         force_rebuild=False,
                         timeout_sec=max(5, int(settings.atlas_cli_timeout_sec)),
                         game=_normalize_game_id(getattr(settings, "game_preset", "WARNO")),
+                        zz_resolver=zz_resolver,
+                        zz_runtime_root=Path(zz_runtime_root_text) if zz_runtime_root_text else None,
                     )
                     atlas_map_path_text = str(atlas_map_info.get("atlas_map_path", "")).strip()
                     atlas_map_path = Path(atlas_map_path_text) if atlas_map_path_text else None

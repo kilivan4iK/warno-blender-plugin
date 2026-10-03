@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack
+import importlib.util
 from dataclasses import dataclass, field
 import json
 import math
@@ -406,7 +407,8 @@ PNG_SIG = b"\x89PNG\r\n\x1a\n"
 
 def normalize_asset_path(path: str) -> str:
     path = path.replace("\\", "/")
-    path = re.sub(r"/+", "/", path)
+    if "//" in path:
+        path = re.sub(r"/+", "/", path)
     if path.startswith("./"):
         path = path[2:]
     return path.strip("/")
@@ -8513,96 +8515,70 @@ def _zz_dat_sort_key(path: Path) -> tuple:
     return (patch_ver, -2)
 
 
-def find_warno_zz_dat_files(warno_root: Path, *, game: "str | None" = None) -> List[Path]:
-    profile = get_game_profile(game)
+def _scan_root_for_dat_files(warno_root: Path, profile: Dict[str, Any]) -> Path | None:
     root = Path(warno_root)
-    if not root.exists() or not root.is_dir():
-        return []
+    if not root.is_dir():
+        return None
     scan_root = root / profile["zz_scan_subdir"]
-    if not scan_root.exists() or not scan_root.is_dir():
-        scan_root = root
+    return scan_root if scan_root.is_dir() else root
+
+
+_LETTERED_ZZ_RX = re.compile(r"^zz_\d+[a-z]+$", re.IGNORECASE)
+
+
+def _walk_dat_files(scan_root: Path) -> List[Path]:
     out: List[Path] = []
-    for p in scan_root.rglob(profile["zz_dat_glob"]):
-        try:
-            if p.is_file() and _is_numbered_zz_dat_name(p.name):
-                out.append(p)
-        except Exception:
-            continue
+    for dirpath, _dirnames, filenames in os.walk(scan_root):
+        for fn in filenames:
+            if fn.lower().endswith(".dat"):
+                out.append(Path(dirpath) / fn)
+    return out
+
+
+def find_warno_zz_dat_files(warno_root: Path, *, game: "str | None" = None) -> List[Path]:
+    scan_root = _scan_root_for_dat_files(warno_root, get_game_profile(game))
+    if scan_root is None:
+        return []
+    out = [p for p in _walk_dat_files(scan_root) if _is_numbered_zz_dat_name(p.name)]
     out.sort(key=lambda p: (_zz_dat_sort_key(p), str(p).lower()))
     return out
 
 
 def find_warno_texture_dat_files(warno_root: Path, *, game: "str | None" = None) -> List[Path]:
-    profile = get_game_profile(game)
-    root = Path(warno_root)
-    if not root.exists() or not root.is_dir():
+    """Every EDAT pack under the install: numbered ZZ packs (patch order), then the
+    lettered texture packs Wargame RD / SD2 use (ZZ_3a.dat ...), then *_Assets.dat.
+    One directory walk instead of three recursive globs per call."""
+    scan_root = _scan_root_for_dat_files(warno_root, get_game_profile(game))
+    if scan_root is None:
         return []
-    scan_root = root / profile["zz_scan_subdir"]
-    if not scan_root.exists() or not scan_root.is_dir():
-        scan_root = root
-
+    all_dats = _walk_dat_files(scan_root)
+    numbered = sorted(
+        (p for p in all_dats if _is_numbered_zz_dat_name(p.name)),
+        key=lambda p: (_zz_dat_sort_key(p), str(p).lower()),
+    )
+    lettered = sorted(
+        (p for p in all_dats if _LETTERED_ZZ_RX.match(Path(p.name).stem)),
+        key=lambda p: str(p).lower(),
+    )
+    assets_dats = sorted(
+        (p for p in all_dats if p.name.lower().endswith("_assets.dat")),
+        key=lambda p: str(p).lower(),
+    )
     ordered: List[Path] = []
     seen: set[str] = set()
-
-    def _push(path: Path) -> None:
+    for path in [*numbered, *lettered, *assets_dats]:
         try:
-            if not path.exists() or not path.is_file():
-                return
             key = str(path.resolve()).lower()
-        except Exception:
-            return
-        if key in seen:
-            return
-        seen.add(key)
-        ordered.append(path)
-
-    for p in find_warno_zz_dat_files(root, game=game):
-        _push(p)
-
-    # Wargame RD / SD2 keep the bulk TEXTURE .tgv in lettered-suffix packs
-    # (ZZ_3a.dat / ZZ_3b.dat) which `_is_numbered_zz_dat_name` rejects (not pure
-    # digits) — so they are missing from the mesh scan above. Add them here for
-    # texture discovery only (mesh discovery is unchanged). Matches zz_<digits><letters>.dat.
-    _lettered_zz = re.compile(r"^zz_\d+[a-z]+$", re.IGNORECASE)
-    lettered: List[Path] = []
-    for p in scan_root.rglob(profile["zz_dat_glob"]):
-        try:
-            if p.is_file() and _lettered_zz.match(Path(p.name).stem):
-                lettered.append(p)
-        except Exception:
+        except OSError:
             continue
-    lettered.sort(key=lambda p: str(p).lower())
-    for p in lettered:
-        _push(p)
-
-    assets_dats: List[Path] = []
-    for p in scan_root.rglob("*_Assets.dat"):
-        try:
-            if p.is_file() and p.name.lower().endswith("_assets.dat"):
-                assets_dats.append(p)
-        except Exception:
-            continue
-    assets_dats.sort(key=lambda p: str(p).lower())
-    for p in assets_dats:
-        _push(p)
-
+        if key not in seen:
+            seen.add(key)
+            ordered.append(path)
     return ordered
 
 
 def _read_u32_le(buf: bytes, offset: int) -> int:
     return int(struct.unpack_from("<I", buf, offset)[0])
-
-
-def _read_cstring_in_dict(fh, dict_end: int) -> str:
-    parts: List[bytes] = []
-    while fh.tell() < dict_end:
-        b = fh.read(1)
-        if not b:
-            raise EOFError("Unexpected EOF while reading EDAT dictionary string")
-        if b == b"\x00":
-            return b"".join(parts).decode("ascii", errors="ignore")
-        parts.append(b)
-    raise ValueError("Unterminated string in EDAT dictionary")
 
 
 def _parse_zz_dat_header(dat_path: Path) -> Dict[str, int]:
@@ -8617,7 +8593,7 @@ def _parse_zz_dat_header(dat_path: Path) -> Dict[str, int]:
         # WARNO 2026 update (build 197351/201602) repacked EDAT as v3: the header fields
         # were realigned to 4-byte boundaries and the file-region offset/length widened to
         # 64-bit (ZZ_3.dat is >4 GiB). The dictionary/entry layout is otherwise identical
-        # to v2 (see _parse_zz_dat_v2_entries), just without the legacy odd-length padding.
+        # to v2, just without the legacy odd-length padding.
         dict_offset = _read_u32_le(head, 8)
         dict_length = _read_u32_le(head, 12)
         file_offset = int(struct.unpack_from("<Q", head, 16)[0])
@@ -8638,163 +8614,220 @@ def _parse_zz_dat_header(dat_path: Path) -> Dict[str, int]:
     }
 
 
-def _parse_zz_dat_v2_entries(dat_path: Path, header: Dict[str, int], legacy_padding: bool) -> List[Dict[str, Any]]:
-    entries: List[Dict[str, Any]] = []
-    dirs: List[str] = []
-    endings: List[int] = []
+_EDAT_I32 = struct.Struct("<i")
+_EDAT_U32 = struct.Struct("<I")
+# v2/v3 file entry after the group id: fileEntrySize, offset, size, MD5 of the payload.
+_EDAT_V2_FILE = struct.Struct("<Iqq16s")
+# v1 file entry after the group id: fileEntrySize, offset, size, then one unused byte.
+_EDAT_V1_FILE = struct.Struct("<III")
+
+# One dictionary row: (path, offset, size, abs_offset, md5 bytes or b"" for v1).
+ZZDictRow = Tuple[str, int, int, int, bytes]
+
+
+def _parse_zz_dat_dictionary(dat_path: Path, header: Dict[str, int], legacy_padding: bool) -> List[ZZDictRow]:
+    """Walk an EDAT dictionary trie exactly like moddingSuite's EdataManager does.
+
+    The dictionary is read in one call and walked in memory. The previous walk
+    read every name one byte at a time through the file object, which made
+    indexing the game's ZZ packs cost seconds per session (and again inside every
+    Atlas CLI wrapper process).
+    """
+    version = int(header["version"])
     dict_offset = int(header["dict_offset"])
     dict_length = int(header["dict_length"])
     file_offset = int(header["file_offset"])
-    dict_end = dict_offset + dict_length
     package_len = dat_path.stat().st_size
-
     with dat_path.open("rb") as fh:
         fh.seek(dict_offset)
-        while fh.tell() < dict_end:
-            block_start = fh.tell()
-            raw = fh.read(4)
-            if len(raw) != 4:
-                raise EOFError("Unexpected EOF while reading V2 fileGroupId")
-            file_group_id = int(struct.unpack("<i", raw)[0])
+        buf = fh.read(dict_length)
+    if len(buf) != dict_length:
+        raise EOFError(f"EDAT dictionary truncated in {dat_path}")
 
-            if file_group_id == 0:
-                file_entry_size = _read_u32_le(fh.read(4), 0)
-                raw_offset = int(struct.unpack("<q", fh.read(8))[0])
-                raw_size = int(struct.unpack("<q", fh.read(8))[0])
-                checksum = fh.read(16)
-                if len(checksum) != 16:
-                    raise EOFError("Unexpected EOF while reading V2 checksum")
-                name = _read_cstring_in_dict(fh, dict_end)
-                path = "".join(dirs) + name
-
-                if legacy_padding and len(name) % 2 == 0:
-                    if fh.tell() >= dict_end:
-                        raise ValueError("Expected legacy V2 padding byte but reached dictionary end")
-                    fh.seek(1, os.SEEK_CUR)
-
-                abs_offset = int(file_offset) + int(raw_offset)
-                if raw_offset < 0 or raw_size < 0:
-                    raise ValueError(f"Invalid V2 file entry (offset/size < 0) in {dat_path}: {path}")
-                if abs_offset < 0 or abs_offset > package_len:
-                    raise ValueError(f"Invalid V2 file offset in {dat_path}: {path}")
-                if raw_size > package_len - abs_offset:
-                    raise ValueError(f"Invalid V2 file size in {dat_path}: {path}")
-                entries.append(
-                    {
-                        "path": normalize_asset_path(path),
-                        "offset": int(raw_offset),
-                        "size": int(raw_size),
-                        "abs_offset": int(abs_offset),
-                        "file_entry_size": int(file_entry_size),
-                    }
-                )
-
-                while endings and fh.tell() == endings[-1]:
-                    dirs.pop()
-                    endings.pop()
-            elif file_group_id > 0:
-                file_entry_size = _read_u32_le(fh.read(4), 0)
-                if file_entry_size != 0:
-                    endings.append(int(block_start + file_entry_size))
-                elif endings:
-                    endings.append(endings[-1])
-                name = _read_cstring_in_dict(fh, dict_end)
-                if legacy_padding and len(name) % 2 == 0:
-                    if fh.tell() >= dict_end:
-                        raise ValueError("Expected legacy V2 dir padding byte but reached dictionary end")
-                    fh.seek(1, os.SEEK_CUR)
-                dirs.append(name)
-            else:
-                raise ValueError(f"Invalid V2 fileGroupId {file_group_id} in {dat_path}")
-    return entries
-
-
-def _parse_zz_dat_v1_entries(dat_path: Path, header: Dict[str, int]) -> List[Dict[str, Any]]:
-    entries: List[Dict[str, Any]] = []
+    is_v1 = version == 1
+    end = len(buf)
+    pos = 0
     dirs: List[str] = []
     endings: List[int] = []
-    dict_offset = int(header["dict_offset"])
-    dict_length = int(header["dict_length"])
-    file_offset = int(header["file_offset"])
-    dict_end = dict_offset + dict_length
-    package_len = dat_path.stat().st_size
-
-    with dat_path.open("rb") as fh:
-        fh.seek(dict_offset)
-        while fh.tell() < dict_end:
-            block_start = fh.tell()
-            raw = fh.read(4)
-            if len(raw) != 4:
-                raise EOFError("Unexpected EOF while reading V1 fileGroupId")
-            file_group_id = int(struct.unpack("<i", raw)[0])
-
-            if file_group_id == 0:
-                file_entry_size = _read_u32_le(fh.read(4), 0)
-                raw_offset = _read_u32_le(fh.read(4), 0)
-                raw_size = _read_u32_le(fh.read(4), 0)
-                fh.seek(1, os.SEEK_CUR)
-                name = _read_cstring_in_dict(fh, dict_end)
-                path = "".join(dirs) + name
-                if (len(name) + 1) % 2 == 0:
-                    if fh.tell() < dict_end:
-                        fh.seek(1, os.SEEK_CUR)
-
-                abs_offset = int(file_offset) + int(raw_offset)
-                if abs_offset < 0 or abs_offset > package_len:
-                    continue
-                if raw_size > package_len - abs_offset:
-                    continue
-                entries.append(
-                    {
-                        "path": normalize_asset_path(path),
-                        "offset": int(raw_offset),
-                        "size": int(raw_size),
-                        "abs_offset": int(abs_offset),
-                        "file_entry_size": int(file_entry_size),
-                    }
-                )
-                while endings and fh.tell() == endings[-1]:
-                    dirs.pop()
-                    endings.pop()
-            elif file_group_id > 0:
-                file_entry_size = _read_u32_le(fh.read(4), 0)
-                if file_entry_size != 0:
-                    endings.append(int(block_start + file_entry_size))
-                elif endings:
-                    endings.append(endings[-1])
-                name = _read_cstring_in_dict(fh, dict_end)
-                if (len(name) + 1) % 2 == 1 and fh.tell() < dict_end:
-                    fh.seek(1, os.SEEK_CUR)
-                dirs.append(name)
+    rows: List[ZZDictRow] = []
+    while pos < end:
+        block_start = pos
+        if pos + 4 > end:
+            raise EOFError(f"Unexpected EOF while reading EDAT fileGroupId in {dat_path}")
+        group = _EDAT_I32.unpack_from(buf, pos)[0]
+        pos += 4
+        if group == 0:
+            if is_v1:
+                if pos + 13 > end:
+                    raise EOFError(f"Unexpected EOF in EDAT v1 file entry in {dat_path}")
+                _entry_size, raw_offset, raw_size = _EDAT_V1_FILE.unpack_from(buf, pos)
+                checksum = b""
+                pos += 13
             else:
+                if pos + 36 > end:
+                    raise EOFError(f"Unexpected EOF in EDAT v2 file entry in {dat_path}")
+                _entry_size, raw_offset, raw_size, checksum = _EDAT_V2_FILE.unpack_from(buf, pos)
+                pos += 36
+            nul = buf.find(b"\x00", pos, end)
+            if nul < 0:
+                raise ValueError(f"Unterminated name in EDAT dictionary of {dat_path}")
+            name_len = nul - pos
+            name = buf[pos:nul].decode("ascii", "replace")
+            pos = nul + 1
+            if is_v1:
+                if (name_len + 1) % 2 == 0 and pos < end:
+                    pos += 1
+            elif legacy_padding and name_len % 2 == 0:
+                if pos >= end:
+                    raise ValueError("Expected legacy V2 padding byte but reached dictionary end")
+                pos += 1
+            path = "".join(dirs) + name
+            abs_offset = file_offset + raw_offset
+            in_range = (
+                raw_offset >= 0
+                and raw_size >= 0
+                and abs_offset <= package_len
+                and raw_size <= package_len - abs_offset
+            )
+            if in_range:
+                rows.append((path, int(raw_offset), int(raw_size), int(abs_offset), checksum))
+            elif not is_v1:
+                raise ValueError(f"Invalid EDAT v2 file entry (offset/size out of range) in {dat_path}: {path}")
+            # A dropped v1 entry must still close its directories, otherwise every
+            # following path in the pack inherits the wrong prefix.
+            while endings and pos == endings[-1]:
+                dirs.pop()
+                endings.pop()
+        elif group > 0:
+            if pos + 4 > end:
+                raise EOFError(f"Unexpected EOF in EDAT dir entry in {dat_path}")
+            entry_size = _EDAT_U32.unpack_from(buf, pos)[0]
+            pos += 4
+            if entry_size != 0:
+                endings.append(block_start + entry_size)
+            elif endings:
+                endings.append(endings[-1])
+            nul = buf.find(b"\x00", pos, end)
+            if nul < 0:
+                raise ValueError(f"Unterminated name in EDAT dictionary of {dat_path}")
+            name_len = nul - pos
+            dirs.append(buf[pos:nul].decode("ascii", "replace"))
+            pos = nul + 1
+            if is_v1:
+                if (name_len + 1) % 2 == 1 and pos < end:
+                    pos += 1
+            elif legacy_padding and name_len % 2 == 0:
+                if pos >= end:
+                    raise ValueError("Expected legacy V2 dir padding byte but reached dictionary end")
+                pos += 1
+        else:
+            if is_v1:
                 break
-    return entries
+            raise ValueError(f"Invalid EDAT fileGroupId {group} in {dat_path}")
+    return rows
 
 
-def _scan_zz_dat_entries(dat_path: Path) -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
+def _scan_zz_dat_rows(dat_path: Path) -> Tuple[Dict[str, int], List[ZZDictRow]]:
     header = _parse_zz_dat_header(dat_path)
     version = int(header["version"])
     if version == 1:
-        return header, _parse_zz_dat_v1_entries(dat_path, header)
+        return header, _parse_zz_dat_dictionary(dat_path, header, legacy_padding=False)
     if version == 3:
-        # v3 shares the v2 dictionary/entry layout but never uses the legacy odd-length
-        # name padding, so parse it directly with padding disabled.
-        return header, _parse_zz_dat_v2_entries(dat_path, header, legacy_padding=False)
-
+        # v3 never uses the legacy odd-length name padding.
+        return header, _parse_zz_dat_dictionary(dat_path, header, legacy_padding=False)
+    # v2 exists in two flavours (Wargame-era padded names, WARNO unpadded); like
+    # moddingSuite, try the legacy layout first and fall back to the WARNO one.
     try:
-        return header, _parse_zz_dat_v2_entries(dat_path, header, legacy_padding=True)
-    except Exception:
-        return header, _parse_zz_dat_v2_entries(dat_path, header, legacy_padding=False)
+        return header, _parse_zz_dat_dictionary(dat_path, header, legacy_padding=True)
+    except (ValueError, EOFError):
+        return header, _parse_zz_dat_dictionary(dat_path, header, legacy_padding=False)
+
+
+def _scan_zz_dat_entries(dat_path: Path) -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
+    """Dict-shaped view of the dictionary rows (kept for scripts that inspect a pack)."""
+    header, rows = _scan_zz_dat_rows(dat_path)
+    return header, [
+        {
+            "path": normalize_asset_path(path),
+            "offset": offset,
+            "size": size,
+            "abs_offset": abs_offset,
+            "checksum": checksum.hex(),
+        }
+        for path, offset, size, abs_offset, checksum in rows
+    ]
+
+
+_ZZ_EXTRACT_MANIFEST_NAME = ".zz_extract_manifest.tsv"
+
+
+class _ZZExtractManifest:
+    """Records which archive entry each extracted runtime file came from.
+
+    The archive dictionary carries an MD5 per entry (v2/v3), so a file extracted
+    before a game patch is detected as stale even when its size did not change.
+    The old check compared sizes only and kept pre-patch SPK/TGV files forever.
+    Stored as an append-only TSV (last line for a path wins) so recording an
+    extraction is O(1).
+    """
+
+    def __init__(self, runtime_root: Path):
+        self.path = Path(runtime_root) / _ZZ_EXTRACT_MANIFEST_NAME
+        self._rows: Dict[str, str] = {}
+        self._lines = 0
+        try:
+            text = self.path.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        for line in text.splitlines():
+            rel, sep, ident = line.partition("\t")
+            if sep and rel:
+                self._rows[rel] = ident
+                self._lines += 1
+        if self._lines > 2 * len(self._rows) + 256:
+            self._compact()
+
+    def _compact(self) -> None:
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        try:
+            tmp.write_text("".join(f"{k}\t{v}\n" for k, v in self._rows.items()), encoding="utf-8")
+            os.replace(tmp, self.path)
+            self._lines = len(self._rows)
+        except OSError:
+            pass
+
+    def get(self, rel_key: str) -> str:
+        return self._rows.get(rel_key, "")
+
+    def record(self, rel_key: str, ident: str) -> None:
+        if self._rows.get(rel_key) == ident:
+            return
+        self._rows[rel_key] = ident
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8") as fh:
+                fh.write(f"{rel_key}\t{ident}\n")
+            self._lines += 1
+        except OSError:
+            pass
 
 
 class ZZDatResolver:
+    """Index of every file in the game's EDAT packs; newest patch layer wins."""
+
     def __init__(self, dat_files: Sequence[Path]):
         self.dat_files = [Path(p) for p in dat_files if Path(p).exists() and Path(p).is_file()]
         self._index_ready = False
-        self._assets: Dict[str, Dict[str, Any]] = {}
+        # norm path -> (dat index, path, offset, size, abs_offset, checksum)
+        self._assets: Dict[str, Tuple[int, str, int, int, int, bytes]] = {}
         self._basename_to_keys: Dict[str, List[str]] = {}
         self._header_by_dat: Dict[str, Dict[str, int]] = {}
-        self._generic_parent_hint: Dict[str, str] = {}
+        self._dat_ident: List[str] = []
+        self._dat_list: List[Path] = []
+        self._manifests: Dict[str, _ZZExtractManifest] = {}
+        # Packs that could not be read; surfaced to the caller instead of silently
+        # dropping a whole patch layer (that is how the EDAT v3 DLC content vanished).
+        self.errors: List[str] = []
 
     def _build_index(self) -> None:
         if self._index_ready:
@@ -8803,46 +8836,63 @@ class ZZDatResolver:
         for dat in ordered:
             dat_key = str(dat.resolve())
             try:
-                header, entries = _scan_zz_dat_entries(dat)
-            except Exception:
+                header, rows = _scan_zz_dat_rows(dat)
+                st = dat.stat()
+            except Exception as exc:
+                self.errors.append(f"{dat}: {exc}")
                 continue
             self._header_by_dat[dat_key] = header
-            for entry in entries:
-                path_raw = str(entry.get("path", "")).strip()
-                if not path_raw:
+            dat_idx = len(self._dat_list)
+            self._dat_list.append(dat)
+            self._dat_ident.append(f"{dat_key.lower()}|{int(st.st_mtime_ns)}|{int(st.st_size)}")
+            assets = self._assets
+            by_base = self._basename_to_keys
+            for path, offset, size, abs_offset, checksum in rows:
+                clean = normalize_asset_path(path)
+                norm = clean.lower()
+                if not norm or norm in assets:
                     continue
-                norm = normalize_asset_path(path_raw).lower()
-                if norm and norm not in self._assets:
-                    payload = dict(entry)
-                    payload["dat_path"] = dat
-                    self._assets[norm] = payload
-                    base = Path(norm).name.lower()
-                    if base:
-                        self._basename_to_keys.setdefault(base, []).append(norm)
+                assets[norm] = (dat_idx, clean, offset, size, abs_offset, checksum)
+                by_base.setdefault(norm.rsplit("/", 1)[-1], []).append(norm)
         self._index_ready = True
+
+    def _hit(self, norm: str) -> Dict[str, Any] | None:
+        row = self._assets.get(norm)
+        if row is None:
+            return None
+        dat_idx, path, offset, size, abs_offset, checksum = row
+        return {
+            "path": path,
+            "offset": offset,
+            "size": size,
+            "abs_offset": abs_offset,
+            "checksum": checksum.hex(),
+            "dat_path": self._dat_list[dat_idx],
+            # Identity of the bytes: the archive MD5 when the pack has one (v2/v3),
+            # otherwise the pack file identity plus the entry location (v1).
+            "ident": checksum.hex() if checksum else f"{self._dat_ident[dat_idx]}|{abs_offset}|{size}",
+        }
 
     def all_asset_keys(self) -> List[str]:
         self._build_index()
         return list(self._assets.keys())
 
+    @staticmethod
+    def _exact_variants(norm: str) -> List[str]:
+        # Atlas refs come as Assets/... while the packs store PC/Atlas/Assets/... (and back).
+        out = [norm]
+        if norm.startswith("assets/"):
+            out.append("pc/atlas/" + norm)
+        elif norm.startswith("pc/atlas/assets/"):
+            out.append(norm[len("pc/atlas/"):])
+        return out
+
     def _find_exact_norm(self, norm: str) -> Dict[str, Any] | None:
         if not norm:
             return None
-        hit = self._assets.get(norm)
-        if hit is not None:
-            return hit
-
-        # Atlas refs can come as Assets/... or PC/Atlas/Assets/...
-        if norm.startswith("assets/"):
-            alt = normalize_asset_path(f"PC/Atlas/{norm}").lower()
-            hit = self._assets.get(alt)
-            if hit is not None:
-                return hit
-        if norm.startswith("pc/atlas/assets/"):
-            alt = normalize_asset_path(norm[len("pc/atlas/") :]).lower()
-            hit = self._assets.get(alt)
-            if hit is not None:
-                return hit
+        for key in self._exact_variants(norm):
+            if key in self._assets:
+                return self._hit(key)
         return None
 
     def find_exact(self, asset_path: str) -> Dict[str, Any] | None:
@@ -8851,227 +8901,54 @@ class ZZDatResolver:
         return self._find_exact_norm(norm)
 
     def find(self, asset_path: str) -> Dict[str, Any] | None:
+        """Exact lookup, then the longest matching path tail.
+
+        A material ref names a full relative path, but the pack may store the file
+        under another mount root (Wargame RD refs say "PC/TextureGroup/..." while
+        the pack holds "pc/texture/...") and as .tgv instead of .png. The archive
+        path that shares the longest tail with the request wins; the tail must
+        include at least the parent folder, so a bare file-name match is never
+        accepted. Ties go to the newest patch layer. This replaces a scored guess
+        (size penalties, decors/units bonuses and a per-session "parent hint" that
+        made the result depend on which asset was imported first).
+        """
         self._build_index()
         norm = normalize_asset_path(str(asset_path or "")).lower()
         hit = self._find_exact_norm(norm)
-        if hit is not None:
+        if hit is not None or not norm:
             return hit
-
-        base = Path(norm).name.lower()
-        if base:
-            generic_marks = (
-                "tsccolor_diffusetexturenoalpha",
-                "tscnm_normaltexture",
-                "tscorm_combinedrmtexture",
-                "tscorm_combinedormtexture",
-                "tsccoloralpha_combineddatexture",
-            )
-            is_generic_base = any(mark in base for mark in generic_marks)
-            cands = self._basename_to_keys.get(base, [])
-            req_low_for_score = norm
-            # Common atlas refs often request .png while payload is only .tgv (or reverse).
+        variants = [norm]
+        if norm.endswith(".png"):
+            variants.append(norm[:-4] + ".tgv")
+        elif norm.endswith(".tgv"):
+            variants.append(norm[:-4] + ".png")
+        best_key = ""
+        best_len = 1  # number of path components that must match: > 1 (folder + name)
+        for req in variants:
+            parts = req.split("/")
+            cands = self._basename_to_keys.get(parts[-1], [])
             if not cands:
-                if base.endswith(".png"):
-                    cands = self._basename_to_keys.get(base[:-4] + ".tgv", [])
-                    if cands:
-                        req_low_for_score = norm[:-4] + ".tgv"
-                elif base.endswith(".tgv"):
-                    cands = self._basename_to_keys.get(base[:-4] + ".png", [])
-                    if cands:
-                        req_low_for_score = norm[:-4] + ".png"
-
-            # ORM alias support: some assets use CombinedRM in refs while payload is CombinedORM (or reverse).
-            orm_alt_bases: List[str] = []
-            if "combinedrmtexture" in base:
-                orm_alt_bases.append(base.replace("combinedrmtexture", "combinedormtexture"))
-            if "combinedormtexture" in base:
-                orm_alt_bases.append(base.replace("combinedormtexture", "combinedrmtexture"))
-            if orm_alt_bases:
-                merged = list(cands)
-                for alt_base in orm_alt_bases:
-                    alt = self._basename_to_keys.get(alt_base, [])
-                    if not alt and alt_base.endswith(".png"):
-                        alt = self._basename_to_keys.get(alt_base[:-4] + ".tgv", [])
-                    elif not alt and alt_base.endswith(".tgv"):
-                        alt = self._basename_to_keys.get(alt_base[:-4] + ".png", [])
-                    if alt:
-                        merged.extend(alt)
-                if merged:
-                    # Preserve order while removing duplicates.
-                    cands = list(dict.fromkeys(merged))
-            req_dir_key = normalize_asset_path(str(PurePosixPath(req_low_for_score).parent)).lower()
-            hint_parent = self._generic_parent_hint.get(req_dir_key, "") if is_generic_base else ""
-            if len(cands) == 1:
-                if is_generic_base and req_dir_key:
-                    only_key = cands[0]
-                    only_parent = normalize_asset_path(str(PurePosixPath(only_key).parent)).lower()
-                    req_is_decors = "/decors/" in req_low_for_score
-                    if only_parent and (not req_is_decors or "/decors/" in only_parent):
-                        self._generic_parent_hint[req_dir_key] = only_parent
-                return self._assets.get(cands[0])
-            if cands:
-                req_low = req_low_for_score
-                req_parent = normalize_asset_path(str(PurePosixPath(req_low).parent)).lower()
-                req_parts = [p for p in PurePosixPath(req_parent).parts if p]
-                generic = {"pc", "atlas", "assets", "3d", "2d", "output", "mods", "moddata", "base"}
-                req_tokens = [p.lower() for p in req_parts if p.lower() not in generic]
-                req_base = Path(req_low).name.lower()
-
-                def _score_candidate(key: str) -> float:
-                    key_low = str(key).lower()
-                    score = float(shared_suffix_score(key_low, req_low) * 100)
-                    key_parent = normalize_asset_path(str(PurePosixPath(key_low).parent)).lower()
-                    if req_parent and key_parent.endswith(req_parent):
-                        score += 160.0
-                    for tok in req_tokens:
-                        if tok and f"/{tok}/" in f"/{key_low}/":
-                            score += 12.0
-                    if "/decors/" in req_low and "/decors/" not in key_low:
-                        score -= 45.0
-                    if "/units/" in req_low and "/units/" not in key_low:
-                        score -= 45.0
-                    if "/decors/" in req_low and "/units/" in key_low:
-                        score -= 20.0
-                    if "/fx/" in key_low and "/fx/" not in req_low:
-                        score -= 35.0
-                    if "/units_tests/" in key_low:
-                        score -= 90.0
-                    if "/units_tests_autos/" in key_low:
-                        score -= 110.0
-                    if "/tests/" in key_low:
-                        score -= 18.0
-                    if "/editor/" in key_low:
-                        score -= 18.0
-
-                    if hint_parent:
-                        if key_parent == hint_parent:
-                            score += 220.0
-                        elif key_parent.startswith(hint_parent + "/"):
-                            score += 48.0
-
-                    # Generic TSC* atlas refs are often ambiguous across many folders.
-                    # Prefer candidate folders that provide a coherent D/NM/ORM set.
-                    if "tsc" in req_base and "texture01" in req_base:
-                        has_diff = (
-                            f"{key_parent}/tsccolor_diffusetexturenoalpha01.tgv" in self._assets
-                            or f"{key_parent}/tsccolor_diffusetexturenoalpha01.png" in self._assets
-                        )
-                        has_nm = (
-                            f"{key_parent}/tscnm_normaltexture01.tgv" in self._assets
-                            or f"{key_parent}/tscnm_normaltexture01.png" in self._assets
-                        )
-                        has_orm = (
-                            f"{key_parent}/tscorm_combinedrmtexture01.tgv" in self._assets
-                            or f"{key_parent}/tscorm_combinedrmtexture01.png" in self._assets
-                            or f"{key_parent}/tscorm_combinedormtexture01.tgv" in self._assets
-                            or f"{key_parent}/tscorm_combinedormtexture01.png" in self._assets
-                        )
-                        if "tsccolor_diffusetexturenoalpha" in req_base:
-                            if has_nm:
-                                score += 18.0
-                            if has_orm:
-                                score += 18.0
-                        elif "tscnm_normaltexture" in req_base:
-                            if has_diff:
-                                score += 18.0
-                            if has_orm:
-                                score += 14.0
-                        elif "tscorm_combinedrmtexture" in req_base or "tscorm_combinedormtexture" in req_base:
-                            if has_diff:
-                                score += 26.0
-                            if has_nm:
-                                score += 16.0
-
-                    try:
-                        size_bytes = int(self._assets.get(key_low, {}).get("size", 0) or 0)
-                    except Exception:
-                        size_bytes = 0
-                    # Avoid tiny placeholder atlas textures when resolving ambiguous generic names.
-                    if size_bytes > 0:
-                        if size_bytes <= 256:
-                            score -= 120.0
-                        elif size_bytes <= 1024:
-                            score -= 60.0
-                        elif size_bytes <= 4096:
-                            score -= 24.0
-                        elif size_bytes >= 1_000_000:
-                            score += 14.0
-                        elif size_bytes >= 200_000:
-                            score += 8.0
-
-                    score -= min(20.0, float(len(key_low)) * 0.01)
-                    return score
-
-                scored = sorted(((_score_candidate(k), k) for k in cands), reverse=True)
-                req_is_decors = "/decors/" in req_low
-                if is_generic_base and req_is_decors:
-                    decors_scored_strict = [pair for pair in scored if "/decors/" in pair[1]]
-                    if decors_scored_strict:
-                        if req_dir_key:
-                            top_parent = normalize_asset_path(str(PurePosixPath(decors_scored_strict[0][1]).parent)).lower()
-                            if top_parent:
-                                self._generic_parent_hint[req_dir_key] = top_parent
-                        return self._assets.get(decors_scored_strict[0][1])
-                    # Guardrail: for decors refs, never fallback to units-style generic TSC textures.
-                    return None
-                if scored and scored[0][0] >= 90.0:
-                    if is_generic_base and req_dir_key:
-                        top_parent = normalize_asset_path(str(PurePosixPath(scored[0][1]).parent)).lower()
-                        req_is_decors = "/decors/" in req_low
-                        if top_parent and (not req_is_decors or "/decors/" in top_parent):
-                            self._generic_parent_hint[req_dir_key] = top_parent
-                    return self._assets.get(scored[0][1])
-                if scored:
-                    req_is_decors = "/decors/" in req_low
-                    # Soft fallback for generic shared texture names where strict path
-                    # similarity cannot work (e.g. decors refs mapped to atlas templates).
-                    is_generic = is_generic_base
-                    if is_generic:
-                        # Prefer non-test candidates for generic TSC* texture names.
-                        non_test_scored = [
-                            pair
-                            for pair in scored
-                            if "/units_tests/" not in pair[1] and "/units_tests_autos/" not in pair[1]
-                        ]
-                        if req_is_decors:
-                            decors_scored = [pair for pair in non_test_scored if "/decors/" in pair[1]]
-                            if decors_scored:
-                                if req_dir_key:
-                                    top_parent = normalize_asset_path(str(PurePosixPath(decors_scored[0][1]).parent)).lower()
-                                    if top_parent:
-                                        self._generic_parent_hint[req_dir_key] = top_parent
-                                return self._assets.get(decors_scored[0][1])
-                            # Guardrail: for decors refs, never fallback to units-style generic TSC textures.
-                            return None
-                        if non_test_scored and non_test_scored[0][0] >= 35.0:
-                            if req_dir_key:
-                                top_parent = normalize_asset_path(str(PurePosixPath(non_test_scored[0][1]).parent)).lower()
-                                if top_parent:
-                                    self._generic_parent_hint[req_dir_key] = top_parent
-                            return self._assets.get(non_test_scored[0][1])
-                        if scored[0][0] >= 40.0:
-                            if req_dir_key:
-                                top_parent = normalize_asset_path(str(PurePosixPath(scored[0][1]).parent)).lower()
-                                if top_parent:
-                                    self._generic_parent_hint[req_dir_key] = top_parent
-                            return self._assets.get(scored[0][1])
-                    # Non-generic fallback: still allow strong-but-not-perfect match.
-                    if scored[0][0] >= 70.0:
-                        return self._assets.get(scored[0][1])
-        return None
+                continue
+            for start in range(0, len(parts) - best_len):
+                rel = "/".join(parts[start:])
+                match = next((k for k in cands if k == rel or k.endswith("/" + rel)), "")
+                if match:
+                    best_key, best_len = match, len(parts) - start
+                    break
+        return self._hit(best_key) if best_key else None
 
     def find_first_by_suffix(self, suffixes: Sequence[str], must_contain: Sequence[str] | None = None) -> Dict[str, Any] | None:
         self._build_index()
-        clean_suffixes = [str(s).strip().lower().lstrip("/") for s in suffixes if str(s).strip()]
+        clean_suffixes = tuple(str(s).strip().lower() for s in suffixes if str(s).strip())
         if not clean_suffixes:
             return None
         contains = [str(s).strip().lower() for s in (must_contain or []) if str(s).strip()]
-
-        for key, payload in self._assets.items():
+        for key in self._assets:
+            if not key.endswith(clean_suffixes):
+                continue
             if contains and not all(tok in key for tok in contains):
                 continue
-            if any(key.endswith(suf) for suf in clean_suffixes):
-                return payload
+            return self._hit(key)
         return None
 
     def find_all_by_suffix(
@@ -9080,18 +8957,26 @@ class ZZDatResolver:
         must_contain: Sequence[str] | None = None,
     ) -> List[Dict[str, Any]]:
         self._build_index()
-        clean_suffixes = [str(s).strip().lower().lstrip("/") for s in suffixes if str(s).strip()]
+        clean_suffixes = tuple(str(s).strip().lower() for s in suffixes if str(s).strip())
         if not clean_suffixes:
             return []
         contains = [str(s).strip().lower() for s in (must_contain or []) if str(s).strip()]
-
         out: List[Dict[str, Any]] = []
-        for key in sorted(self._assets.keys()):
+        for key in sorted(k for k in self._assets if k.endswith(clean_suffixes)):
             if contains and not all(tok in key for tok in contains):
                 continue
-            if any(key.endswith(suf) for suf in clean_suffixes):
-                out.append(self._assets[key])
+            hit = self._hit(key)
+            if hit is not None:
+                out.append(hit)
         return out
+
+    def _manifest_for(self, runtime_root: Path) -> _ZZExtractManifest:
+        key = str(Path(runtime_root).resolve()).lower()
+        man = self._manifests.get(key)
+        if man is None:
+            man = _ZZExtractManifest(Path(runtime_root))
+            self._manifests[key] = man
+        return man
 
     def extract_hit_to_runtime(self, hit: Dict[str, Any], runtime_root: Path) -> Path:
         dat_path = Path(hit["dat_path"])
@@ -9099,23 +8984,42 @@ class ZZDatResolver:
         if not rel:
             raise ValueError("Cannot extract ZZ entry with empty path")
         out_path = Path(runtime_root) / Path(*rel.split("/"))
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        need_write = True
         size = int(hit.get("size", 0))
-        if out_path.exists() and out_path.is_file():
+        ident = str(hit.get("ident", "") or "")
+        manifest = self._manifest_for(runtime_root)
+        rel_key = rel.lower()
+        try:
+            up_to_date = (
+                bool(ident)
+                and manifest.get(rel_key) == ident
+                and out_path.is_file()
+                and out_path.stat().st_size == size
+            )
+        except OSError:
+            up_to_date = False
+        if up_to_date:
+            return out_path
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        part = out_path.with_name(out_path.name + ".part")
+        remaining = size
+        with dat_path.open("rb") as src, part.open("wb") as dst:
+            src.seek(int(hit["abs_offset"]))
+            while remaining > 0:
+                chunk = src.read(min(remaining, 8 << 20))
+                if not chunk:
+                    break
+                dst.write(chunk)
+                remaining -= len(chunk)
+        if remaining:
             try:
-                if size > 0 and out_path.stat().st_size == size:
-                    need_write = False
-            except Exception:
+                part.unlink()
+            except OSError:
                 pass
-        if need_write:
-            abs_offset = int(hit["abs_offset"])
-            with dat_path.open("rb") as fh:
-                fh.seek(abs_offset)
-                data = fh.read(size)
-            if len(data) != size:
-                raise IOError(f"Failed to read full ZZ entry: {rel} from {dat_path}")
-            out_path.write_bytes(data)
+            raise IOError(f"Failed to read full ZZ entry: {rel} from {dat_path}")
+        os.replace(part, out_path)
+        if ident:
+            manifest.record(rel_key, ident)
         return out_path
 
     def extract_asset_to_runtime(self, asset_path: str, runtime_root: Path, exact_only: bool = False) -> Path | None:
@@ -9130,16 +9034,25 @@ _ATLAS_JSON_CACHE: Dict[Tuple[str, str, int, int, str], Dict[str, Any]] = {}
 _GFX_JSON_CACHE: Dict[Tuple[str, str, int, int, str], Dict[str, Any]] = {}
 
 
+def zz_dat_signature(dat_files: Sequence[Path]) -> Tuple[Tuple[str, int, int], ...]:
+    """(resolved path, mtime_ns, size) of every pack; changes whenever Steam patches the game."""
+    rows: List[Tuple[str, int, int]] = []
+    for p in dat_files:
+        try:
+            st = Path(p).stat()
+            rows.append((str(Path(p).resolve()).lower(), int(st.st_mtime_ns), int(st.st_size)))
+        except OSError:
+            continue
+    rows.sort(key=lambda r: r[0])
+    return tuple(rows)
+
+
 def get_zz_runtime_resolver(warno_root: Path, *, game: "str | None" = None) -> ZZDatResolver:
     dat_files = find_warno_texture_dat_files(warno_root, game=game)
     if not dat_files:
         raise FileNotFoundError(f"No texture DAT packages found under WARNO folder: {warno_root}")
 
-    key_rows: List[Tuple[str, int, int]] = []
-    for p in dat_files:
-        st = p.stat()
-        key_rows.append((str(p.resolve()).lower(), int(st.st_mtime_ns), int(st.st_size)))
-    key = tuple(key_rows)
+    key = zz_dat_signature(dat_files)
     cached = _ZZ_RESOLVER_CACHE.get(key)
     if cached is not None:
         return cached
@@ -9294,15 +9207,6 @@ def _atlas_map_signature(path: Path) -> Tuple[str, int, int]:
     return (str(p.resolve()).lower(), int(st.st_mtime_ns), int(st.st_size))
 
 
-def _python_cmd_candidates_for_wrapper() -> List[List[str]]:
-    if sys.executable:
-        return [[sys.executable]]
-    env_py = os.environ.get("PYTHON", "").strip()
-    if env_py:
-        return [[env_py]]
-    return []
-
-
 def _resolve_atlas_wrapper(wrapper_path: Path) -> Path:
     p = Path(wrapper_path)
     if p.exists() and p.is_file():
@@ -9323,6 +9227,61 @@ def _resolve_gfx_wrapper(wrapper_path: Path) -> Path:
     return p
 
 
+_WRAPPER_MODULES: Dict[str, Any] = {}
+
+
+def _load_wrapper_module(path: Path, entry_point: str):
+    """Import a moddingSuite wrapper script in-process (cached per file version).
+
+    The wrappers used to run as separate Python processes per asset; the Atlas one
+    then re-imported this whole module and re-indexed every game pack just to pull
+    one TextureSmall.atlas, on every first import of a unit."""
+    p = Path(path).resolve()
+    st = p.stat()
+    key = f"{str(p).lower()}|{int(st.st_mtime_ns)}|{int(st.st_size)}"
+    mod = _WRAPPER_MODULES.get(key)
+    if mod is None:
+        spec = importlib.util.spec_from_file_location(f"warno_ms_wrapper_{len(_WRAPPER_MODULES)}", str(p))
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Cannot load wrapper module: {p}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _WRAPPER_MODULES[key] = mod
+    if not callable(getattr(mod, entry_point, None)):
+        raise RuntimeError(f"Wrapper {p} has no {entry_point}(); it is older than this add-on")
+    return mod
+
+
+def _file_ident(path: "Path | None") -> List[Any]:
+    if path is None:
+        return ["", 0, -1]
+    try:
+        st = Path(path).stat()
+        return [str(path).lower(), int(st.st_mtime_ns), int(st.st_size)]
+    except OSError:
+        return [str(path).lower(), 0, -1]
+
+
+def _sidecar_path(out_json: Path, tag: str) -> Path:
+    name = out_json.name[: -len(".json")] if out_json.name.endswith(".json") else out_json.name
+    return out_json.with_name(f"{name}.{tag}.json")
+
+
+def _read_sidecar(path: Path) -> Dict[str, Any] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_sidecar(path: Path, data: Dict[str, Any]) -> None:
+    try:
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def build_or_load_atlas_texture_map(
     warno_root: Path,
     modding_suite_root: Path,
@@ -9333,8 +9292,15 @@ def build_or_load_atlas_texture_map(
     force_rebuild: bool = False,
     timeout_sec: int = 45,
     game: "str | None" = None,
+    zz_resolver: "ZZDatResolver | None" = None,
+    zz_runtime_root: "Path | None" = None,
 ) -> Dict[str, Any]:
-    profile = get_game_profile(game)
+    """Atlas JSON for one asset, exported by moddingSuite's Atlas CLI and cached.
+
+    The cache is keyed on the identity of the asset's TextureSmall.atlas (its MD5 in
+    the game packs) and of the CLI binary, so a game patch or a new CLI build
+    re-exports it. Previously an exported JSON was reused forever.
+    """
     asset_norm = normalize_asset_path(str(asset_path or "")).strip()
     if not asset_norm:
         raise RuntimeError("Atlas JSON build failed: empty asset path")
@@ -9344,59 +9310,69 @@ def build_or_load_atlas_texture_map(
     rel = Path(*PurePosixPath(asset_norm).parts).with_suffix(".atlas_map.json")
     out_json = cache_root / rel
     out_json.parent.mkdir(parents=True, exist_ok=True)
+    sig_path = _sidecar_path(out_json, "sig")
 
     wrapper = _resolve_atlas_wrapper(wrapper_path)
     if not wrapper.exists() or not wrapper.is_file():
         raise RuntimeError(f"Atlas JSON wrapper not found: {wrapper}")
+    mod = _load_wrapper_module(wrapper, "export_atlas_json")
 
-    need_export = force_rebuild or not out_json.exists()
+    # The CLI reads <lookup>/PC/Atlas/<asset folder>/TextureSmall.atlas and nothing else
+    # from the packs; put the current game's copy there first.
+    lookup_root = Path(zz_runtime_root) if zz_runtime_root is not None else cache_root
+    atlas_rel = mod.atlas_rel_for_asset(asset_norm)
+    resolver = zz_resolver
+    if resolver is None:
+        try:
+            resolver = get_zz_runtime_resolver(Path(warno_root), game=game)
+        except Exception:
+            resolver = None
+    atlas_ident: Any = None
+    if resolver is not None and atlas_rel:
+        hit = resolver.find_exact(atlas_rel)
+        if hit is not None:
+            resolver.extract_hit_to_runtime(hit, lookup_root)
+            atlas_ident = "zz:" + str(hit.get("ident", ""))
+    if atlas_ident is None and atlas_rel:
+        # Not in the packs: the CLI falls back to the mod / Output copies.
+        rel_parts = atlas_rel.split("/")
+        atlas_ident = [
+            _file_ident(lookup_root.joinpath(*rel_parts)),
+            _file_ident(Path(warno_root).joinpath("Mods", "ModData", "base", *rel_parts)),
+            _file_ident(Path(warno_root).joinpath("Output", *rel_parts)),
+        ]
+    cli_exe, _tried = mod._resolve_cli_exe(Path(modding_suite_root), str(atlas_cli_path or ""))
+    sig = {"atlas": atlas_ident, "cli": _file_ident(cli_exe), "lookup": str(lookup_root).lower()}
+
+    prev = _read_sidecar(sig_path)
+    if not force_rebuild and prev is not None and prev.get("sig") == sig and prev.get("no_entries"):
+        raise RuntimeError(
+            f"Atlas JSON export failed: rc=2: atlas data has no entries for asset {asset_norm} (cached)"
+        )
+    need_export = force_rebuild or not out_json.exists() or prev is None or prev.get("sig") != sig
     if need_export:
         temp_out = out_json.with_suffix(".tmp.json")
-        cmd_tail = [
-            str(wrapper),
-            "--warno-root",
-            str(warno_root),
-            "--modding-suite-root",
-            str(modding_suite_root),
-            "--asset-path",
-            asset_norm,
-            "--out-json",
-            str(temp_out),
-            "--cache-dir",
-            str(cache_root),
-            "--timeout-sec",
-            str(max(5, int(timeout_sec))),
-            "--game",
-            str(profile["id"]),
-        ]
-        if atlas_cli_path is not None and str(atlas_cli_path).strip():
-            cmd_tail.extend(["--atlas-cli", str(atlas_cli_path)])
-        errors: List[str] = []
-        for py_cmd in _python_cmd_candidates_for_wrapper():
-            cmd = [*py_cmd, *cmd_tail]
+        rc, log = mod.export_atlas_json(
+            warno_root=Path(warno_root),
+            modding_suite_root=Path(modding_suite_root),
+            asset_path=asset_norm,
+            out_json=temp_out,
+            lookup_cache_dir=lookup_root,
+            atlas_cli_override=str(atlas_cli_path or ""),
+            timeout_sec=max(5, int(timeout_sec)),
+        )
+        if rc == 0 and temp_out.exists():
+            temp_out.replace(out_json)
+            _write_sidecar(sig_path, {"sig": sig})
+        else:
             try:
-                proc = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=max(10, int(timeout_sec) + 10),
-                )
-            except subprocess.TimeoutExpired:
-                errors.append(f"[{' '.join(py_cmd)}] timeout>{int(timeout_sec) + 10}s")
-                continue
-            if proc.returncode == 0 and temp_out.exists():
-                temp_out.replace(out_json)
-                errors = []
-                break
-            msg = (proc.stderr or proc.stdout or "").strip()
-            if proc.returncode == 2:
-                errors.append(f"[{' '.join(py_cmd)}] rc=2: atlas data has no entries for asset {asset_norm}")
-                continue
-            errors.append(f"[{' '.join(py_cmd)}] rc={proc.returncode}: {msg}")
-        if errors:
-            raise RuntimeError(
-                "Atlas JSON export failed: " + " | ".join(errors[:2])
-            )
+                temp_out.unlink()
+            except OSError:
+                pass
+            if rc == 2:
+                _write_sidecar(sig_path, {"sig": sig, "no_entries": True})
+                raise RuntimeError(f"Atlas JSON export failed: rc=2: atlas data has no entries for asset {asset_norm}")
+            raise RuntimeError(f"Atlas JSON export failed: rc={rc}: {log[-1500:]}")
 
     sig = _atlas_map_signature(out_json)
     try:
@@ -9437,30 +9413,21 @@ def build_or_load_atlas_texture_map(
 
 
 def _gfx_sources_signature(warno_root: Path, gfx_cli_path: "Path | None") -> List[List[Any]]:
-    """Identity of everything the GFX CLI reads, so a negative result can be cached safely.
+    """Identity of everything the GFX CLI reads.
 
-    The CLI builds its manifest from <warnoRoot>/Output/AllPlatforms/NDF/GFX/*.ndfbin -- a
-    dump the USER produces with the game's own export. When that dump is missing or older
-    than the unit being imported, the CLI scans it for ~3 minutes and then fails, and the
-    importer silently falls back to the legacy manifest. Paying that on every import is
-    pure waste, so the failure is remembered against this signature and retried only once
-    the dump (or the CLI itself) actually changes.
+    The CLI builds its manifest from <warnoRoot>/Output/AllPlatforms/NDF/GFX/*.ndfbin --
+    a dump the USER produces with the game's own export. A manifest (or a remembered
+    failure) is valid exactly as long as these files and the CLI binary are unchanged;
+    previously a manifest, once written, was reused even after the dump was refreshed.
     """
-    out: List[List[Any]] = []
     gfx_root = Path(warno_root) / "Output" / "AllPlatforms" / "NDF" / "GFX"
+    out: List[List[Any]] = []
     for name in ("Unit.ndfbin", "Weapon.ndfbin", "Depiction.ndfbin", "DepictionResources.ndfbin"):
-        f = gfx_root / name
-        try:
-            st = f.stat()
-            out.append([name, int(st.st_mtime_ns), int(st.st_size)])
-        except Exception:
-            out.append([name, 0, -1])
-    try:
-        if gfx_cli_path is not None and str(gfx_cli_path).strip():
-            st = Path(str(gfx_cli_path)).stat()
-            out.append(["cli", int(st.st_mtime_ns), int(st.st_size)])
-    except Exception:
-        out.append(["cli", 0, -1])
+        ident = _file_ident(gfx_root / name)
+        out.append([name, ident[1], ident[2]])
+    if gfx_cli_path is not None and str(gfx_cli_path).strip():
+        ident = _file_ident(Path(str(gfx_cli_path)))
+        out.append(["cli", ident[1], ident[2]])
     return out
 
 
@@ -9475,7 +9442,6 @@ def build_or_load_gfx_manifest(
     timeout_sec: int = 180,
     game: "str | None" = None,
 ) -> Dict[str, Any]:
-    profile = get_game_profile(game)
     asset_norm = normalize_asset_path(str(asset_path or "")).strip()
     if not asset_norm:
         raise RuntimeError("GFX manifest build failed: empty asset path")
@@ -9489,75 +9455,53 @@ def build_or_load_gfx_manifest(
     wrapper = _resolve_gfx_wrapper(wrapper_path)
     if not wrapper.exists() or not wrapper.is_file():
         raise RuntimeError(f"GFX manifest wrapper not found: {wrapper}")
+    mod = _load_wrapper_module(wrapper, "export_gfx_json")
+    cli_exe, _tried = mod._resolve_cli_exe(Path(modding_suite_root), str(gfx_cli_path or ""))
+    gfx_sig = _gfx_sources_signature(warno_root, cli_exe)
 
-    need_export = force_rebuild or not out_json.exists()
-    miss_path = out_json.with_name(out_json.name[: -len(".json")] + ".miss.json")
-    gfx_sig = _gfx_sources_signature(warno_root, gfx_cli_path)
-    if need_export and not force_rebuild and miss_path.exists():
-        try:
-            _prev = json.loads(miss_path.read_text(encoding="utf-8-sig"))
-        except Exception:
-            _prev = None
-        if isinstance(_prev, dict) and _prev.get("sources_signature") == gfx_sig:
+    miss_path = _sidecar_path(out_json, "miss")
+    sig_path = _sidecar_path(out_json, "sig")
+    if not force_rebuild:
+        prev_miss = _read_sidecar(miss_path)
+        if prev_miss is not None and prev_miss.get("sources_signature") == gfx_sig:
             raise RuntimeError(
                 "GFX manifest unavailable for this asset (remembered from the previous "
                 "attempt; the Output/AllPlatforms/NDF/GFX dump has not changed since): "
-                + str(_prev.get("error", ""))[:300]
+                + str(prev_miss.get("error", ""))[:300]
             )
+    prev_ok = _read_sidecar(sig_path)
+    need_export = (
+        force_rebuild
+        or not out_json.exists()
+        or prev_ok is None
+        or prev_ok.get("sources_signature") != gfx_sig
+    )
     if need_export:
         temp_out = out_json.with_suffix(".tmp.json")
-        cmd_tail = [
-            str(wrapper),
-            "--warno-root",
-            str(warno_root),
-            "--modding-suite-root",
-            str(modding_suite_root),
-            "--asset-path",
-            asset_norm,
-            "--out-json",
-            str(temp_out),
-            "--cache-dir",
-            str(cache_root),
-            "--timeout-sec",
-            str(max(5, int(timeout_sec))),
-            "--game",
-            str(profile["id"]),
-        ]
-        if gfx_cli_path is not None and str(gfx_cli_path).strip():
-            cmd_tail.extend(["--gfx-cli", str(gfx_cli_path)])
-        errors: List[str] = []
-        for py_cmd in _python_cmd_candidates_for_wrapper():
-            cmd = [*py_cmd, *cmd_tail]
+        rc, log = mod.export_gfx_json(
+            warno_root=Path(warno_root),
+            modding_suite_root=Path(modding_suite_root),
+            asset_path=asset_norm,
+            out_json=temp_out,
+            cache_dir=cache_root,
+            gfx_cli_override=str(gfx_cli_path or ""),
+            timeout_sec=max(5, int(timeout_sec)),
+        )
+        if rc == 0 and temp_out.exists():
+            temp_out.replace(out_json)
+            _write_sidecar(sig_path, {"asset_path": asset_norm, "sources_signature": gfx_sig})
             try:
-                proc = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=max(10, int(timeout_sec) + 10),
-                )
-            except subprocess.TimeoutExpired:
-                errors.append(f"[{' '.join(py_cmd)}] timeout>{int(timeout_sec) + 10}s")
-                continue
-            if proc.returncode == 0 and temp_out.exists():
-                temp_out.replace(out_json)
-                errors = []
-                break
-            msg = (proc.stderr or proc.stdout or "").strip()
-            errors.append(f"[{' '.join(py_cmd)}] rc={proc.returncode}: {msg}")
-        if errors:
-            joined = " | ".join(errors[:2])
-            try:
-                miss_path.write_text(
-                    json.dumps(
-                        {"asset_path": asset_norm, "sources_signature": gfx_sig, "error": joined},
-                        ensure_ascii=False,
-                        indent=1,
-                    ),
-                    encoding="utf-8",
-                )
-            except Exception:
+                miss_path.unlink()
+            except OSError:
                 pass
-            raise RuntimeError("GFX manifest export failed: " + joined)
+        else:
+            try:
+                temp_out.unlink()
+            except OSError:
+                pass
+            error = f"rc={rc}: {log[-1500:]}"
+            _write_sidecar(miss_path, {"asset_path": asset_norm, "sources_signature": gfx_sig, "error": error})
+            raise RuntimeError("GFX manifest export failed: " + error)
 
     sig = _atlas_map_signature(out_json)
     try:
@@ -9668,13 +9612,16 @@ def prepare_runtime_sources_from_zz(
         )
 
     extracted_spk_paths: List[Path] = []
+    extract_errors: List[str] = []
     for hit in all_pack_spk_hits:
         try:
             extracted_spk_paths.append(resolver.extract_hit_to_runtime(hit, runtime))
-        except Exception:
-            continue
+        except Exception as exc:
+            extract_errors.append(f"{hit.get('path', '')}: {exc}")
     if not extracted_spk_paths:
-        raise FileNotFoundError("Failed to extract any SPK files from WARNO ZZ.dat")
+        raise FileNotFoundError(
+            "Failed to extract any SPK files from WARNO ZZ.dat: " + " | ".join(extract_errors[:3])
+        )
 
     def _pick_preferred(paths: Sequence[Path], preferred_tokens: Sequence[str]) -> Path | None:
         if not paths:
@@ -9715,12 +9662,13 @@ def prepare_runtime_sources_from_zz(
         mesh_spk_dir = mesh_spk.parent if mesh_spk is not None else runtime
     skeleton_spk_dir = skeleton_spk.parent if skeleton_spk is not None else mesh_spk_dir
 
+    # Whole file names: a bare "unit.ndfbin" suffix also matched e.g. "...subunit.ndfbin".
     unit_ndfbin_hit = resolver.find_first_by_suffix(
-        suffixes=["unit.ndfbin"],
+        suffixes=["/unit.ndfbin"],
         must_contain=["gfx"],
     )
     unite_desc_hit = resolver.find_first_by_suffix(
-        suffixes=["unitedescriptor.ndf"],
+        suffixes=["/unitedescriptor.ndf"],
         must_contain=["gamedata", "gameplay", "gfx"],
     )
     unit_ndfbin_path = resolver.extract_hit_to_runtime(unit_ndfbin_hit, runtime) if unit_ndfbin_hit is not None else None
@@ -9746,6 +9694,9 @@ def prepare_runtime_sources_from_zz(
         "unite_descriptor": str(unite_desc_path) if unite_desc_path is not None else "",
         "ndf_hint_source": str(ndf_hint_source) if ndf_hint_source is not None else "",
         "zz_dat_files": [str(p) for p in resolver.dat_files],
+        # Packs that failed to parse and SPKs that failed to extract. A failure here
+        # means a whole patch layer (new DLC units/textures) is missing.
+        "zz_errors": list(resolver.errors) + extract_errors,
     }
 
 
@@ -9829,30 +9780,17 @@ def _python_cmd_key(py_cmd: Sequence[str]) -> str:
     return " ".join(str(x).strip().lower() for x in py_cmd if str(x).strip())
 
 
-def _is_missing_py_dependency_error(stderr_text: str) -> set[str]:
-    low = str(stderr_text or "").lower()
-    found: set[str] = set()
-    if ("no module named" not in low) and ("modulenotfounderror" not in low):
-        return found
-    if "pil" in low:
-        found.add("Pillow")
-    if "zstandard" in low:
-        found.add("zstandard")
-    return found
-
-
-def _converter_env_with_deps(target_dir: Path) -> Dict[str, str]:
-    env = os.environ.copy()
-    deps = str(target_dir)
-    cur = str(env.get("PYTHONPATH", "") or "").strip()
-    env["PYTHONPATH"] = deps if not cur else deps + os.pathsep + cur
-    return env
-
-
 def _scoped_deps_dir(base_dir: Path) -> Path:
     major = int(getattr(sys.version_info, "major", 3))
     minor = int(getattr(sys.version_info, "minor", 0))
     return Path(base_dir) / f"py{major}{minor}"
+
+
+def _deps_present(target_dir: Path) -> bool:
+    """Pillow + zstandard already sit in the add-on's private deps folder."""
+    return (Path(target_dir) / "PIL" / "__init__.py").is_file() and (
+        Path(target_dir) / "zstandard" / "__init__.py"
+    ).is_file()
 
 
 def _ensure_converter_python_deps(py_cmd: Sequence[str], target_dir: Path) -> Tuple[bool, str]:
@@ -9860,6 +9798,12 @@ def _ensure_converter_python_deps(py_cmd: Sequence[str], target_dir: Path) -> Tu
     key = (_python_cmd_key(py_cmd), _safe_resolved_str(target_dir))
     if _DEPS_READY_CACHE.get(key):
         return True, f"deps already ready in {target_dir}"
+    # The ready flag above only lives for one session, so this used to run ensurepip
+    # and a full pip install on the first texture of EVERY Blender session -- seconds
+    # of work, and offline it failed and took texture conversion down with it.
+    if _deps_present(target_dir):
+        _DEPS_READY_CACHE[key] = True
+        return True, f"deps already installed in {target_dir}"
 
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -9919,6 +9863,27 @@ def install_tgv_converter_deps(converter: Path, deps_dir: Path | None = None) ->
     return False, f"[{' '.join(py_cmd)}] {msg}"
 
 
+_CONVERTER_MODULES: Dict[str, Any] = {}
+
+
+def _load_converter_module(converter: Path, deps_target: Path):
+    """Import tgv_to_png.py into this process (once per file version)."""
+    if deps_target.is_dir() and str(deps_target) not in sys.path:
+        sys.path.append(str(deps_target))
+    p = Path(converter).resolve()
+    st = p.stat()
+    key = f"{str(p).lower()}|{int(st.st_mtime_ns)}|{int(st.st_size)}"
+    mod = _CONVERTER_MODULES.get(key)
+    if mod is None:
+        spec = importlib.util.spec_from_file_location(f"warno_tgv_converter_{len(_CONVERTER_MODULES)}", str(p))
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"converter_failed_other: cannot load converter {p}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _CONVERTER_MODULES[key] = mod
+    return mod
+
+
 def run_tgv_converter(
     converter: Path,
     src_tgv: Path,
@@ -9931,90 +9896,52 @@ def run_tgv_converter(
     atlas_out_dir: Path | None = None,
     only_logical_ref: str | None = None,
 ) -> None:
+    """Convert one atlas texture with tgv_to_png.convert_from_atlas_map.
+
+    Runs in this process. It used to start a fresh Python per texture (interpreter
+    start-up plus Pillow/zstandard imports, 10-20 times per unit), which was the
+    bulk of a first import. ``subprocess_timeout_sec`` is kept for API
+    compatibility and no longer used.
+    """
     atlas_mode = atlas_map_path is not None and str(atlas_asset_path or "").strip()
     if not atlas_mode:
         raise RuntimeError("converter_failed_other: legacy converter mode removed; atlas-map mode is required")
     if converter.suffix.lower() != ".py":
         raise RuntimeError("converter_failed_other: atlas-map mode requires python converter script")
 
-    timeout_value: int | None
-    try:
-        timeout_value = int(subprocess_timeout_sec)
-    except Exception:
-        timeout_value = 120
-    if timeout_value is not None and timeout_value <= 0:
-        timeout_value = None
-
-    if not sys.executable:
-        raise RuntimeError("converter_failed_other: Python runtime not available (sys.executable is empty)")
-    py_cmd: List[str] = [sys.executable]
-    who = " ".join(py_cmd)
     base_deps_target = Path(deps_dir) if deps_dir is not None else (converter.parent / ".warno_pydeps")
     deps_target = _scoped_deps_dir(base_deps_target)
-    runtime_env: Dict[str, str] | None = None
-
-    if auto_install_deps:
-        ok, dep_msg = _ensure_converter_python_deps(py_cmd, deps_target)
+    if auto_install_deps and sys.executable:
+        ok, dep_msg = _ensure_converter_python_deps([sys.executable], deps_target)
         if not ok:
             raise RuntimeError(
                 "converter_failed_missing_dep: "
-                f"Failed to prepare converter deps for {src_tgv.name}: [{who}] {dep_msg}"
+                f"Failed to prepare converter deps for {src_tgv.name}: {dep_msg}"
             )
-        runtime_env = _converter_env_with_deps(deps_target)
+    try:
+        mod = _load_converter_module(converter, deps_target)
+    except ImportError as exc:
+        raise RuntimeError(
+            f"converter_failed_missing_dep: TGV converter cannot import its dependencies ({exc}). "
+            "Install Pillow/zstandard (First Setup -> Install / Check TGV deps)."
+        ) from exc
 
     out_dir = Path(atlas_out_dir) if atlas_out_dir is not None else dst_png.parent
-    manifest_out = out_dir / "conversion_manifest.json"
-    cmd = [
-        *py_cmd,
-        str(converter),
-        "--atlas-map",
-        str(Path(atlas_map_path)),
-        "--asset-path",
-        str(atlas_asset_path),
-        "--out-dir",
-        str(out_dir),
-        "--manifest-out",
-        str(manifest_out),
-    ]
-    if only_logical_ref:
-        cmd.extend(["--only-logical-ref", str(only_logical_ref)])
-    # Pin the exact source we already resolved (possibly extracted out of the ZZ archives).
-    # Without this the converter searches for the .tgv again with its own root order, which
-    # probes the game's Output/PC/Atlas folder first -- on an updated install that folder
-    # still holds pre-patch textures, so the conversion could silently use a stale source.
+    # Pin the exact source already resolved (possibly extracted out of the ZZ archives);
+    # the converter's own search probes the game's Output folder, which keeps pre-patch
+    # textures.
+    source_pin = Path(src_tgv) if src_tgv is not None and Path(src_tgv).is_file() else None
     try:
-        if src_tgv is not None and Path(src_tgv).is_file():
-            cmd.extend(["--source-tgv", str(Path(src_tgv))])
-    except Exception:
-        pass
-
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            env=runtime_env,
-            timeout=timeout_value,
+        mod.convert_from_atlas_map(
+            atlas_map_path=Path(atlas_map_path),
+            asset_path=str(atlas_asset_path),
+            out_dir=out_dir,
+            only_logical_ref=str(only_logical_ref).strip() if only_logical_ref else None,
+            manifest_out=out_dir / "conversion_manifest.json",
+            source_tgv=source_pin,
         )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(
-            f"converter_timeout: TGV converter timed out after {timeout_value}s "
-            f"for {src_tgv.name}"
-        )
-
-    if proc.returncode == 0:
-        return
-
-    msg = (proc.stderr or proc.stdout or "").strip()
-    missing = _is_missing_py_dependency_error(msg)
-    if missing:
-        modules = ",".join(sorted(missing))
-        raise RuntimeError(
-            "converter_failed_missing_dep: "
-            f"TGV converter failed for {src_tgv.name} (missing {modules}): [{who}] {msg}. "
-            "Install Pillow/zstandard for Blender Python runtime."
-        )
-    raise RuntimeError(f"converter_failed_other: TGV converter failed for {src_tgv.name}: [{who}] {msg}")
+    except Exception as exc:
+        raise RuntimeError(f"converter_failed_other: TGV converter failed for {src_tgv.name}: {exc}") from exc
 
 
 def _atlas_map_lookup_entries(
@@ -10037,6 +9964,15 @@ def _resolve_source_from_atlas_entry(
     zz_resolver: ZZDatResolver | None,
     zz_runtime_root: Path | None,
 ) -> Tuple[Path, Path, str]:
+    """Locate the source texture an atlas entry points at.
+
+    The game archive is asked first: it is the only source guaranteed to match the
+    installed build, and the extraction is checksum-validated so a patched texture
+    replaces the old copy. Loose files (an already-prepared runtime folder, the
+    game's Output/ or Mods/ModData/base/ trees) are only used for files the archive
+    does not contain -- those trees keep pre-patch textures forever, and searching
+    them first is how updated units ended up with old textures.
+    """
     source_rel_norm = _normalize_logical_ref(str(entry.get("source_tgv_rel", "")))
     if not source_rel_norm:
         raise FileNotFoundError("missing_source: atlas map entry has empty source_tgv_rel")
@@ -10046,48 +9982,52 @@ def _resolve_source_from_atlas_entry(
         rel_under_assets = rel_under_assets[len("assets/") :]
     rel_path = Path(*PurePosixPath(rel_under_assets).parts)
 
-    src_png = atlas_assets_root / rel_path.with_suffix(".png")
-    src_tgv = atlas_assets_root / rel_path.with_suffix(".tgv")
-    atlas_source = "manual_path"
-
-    if not src_tgv.exists() and not src_png.exists():
-        for alt_root in extra_roots:
-            alt_png = alt_root / rel_path.with_suffix(".png")
-            alt_tgv = alt_root / rel_path.with_suffix(".tgv")
-            if alt_tgv.exists() or alt_png.exists():
-                src_tgv = alt_tgv
-                src_png = alt_png
-                atlas_source = "fallback"
-                break
-
-    if not src_tgv.exists() and not src_png.exists() and zz_resolver is not None:
+    if zz_resolver is not None:
         runtime_root = Path(zz_runtime_root) if zz_runtime_root is not None else None
         if runtime_root is None:
             runtime_root = atlas_assets_root
             for _ in range(3):
                 runtime_root = runtime_root.parent
-        candidates = [
-            normalize_asset_path(f"PC/Atlas/Assets/{rel_path.with_suffix('.tgv').as_posix()}"),
-            normalize_asset_path(f"PC/Atlas/Assets/{rel_path.with_suffix('.png').as_posix()}"),
-            normalize_asset_path(f"Assets/{rel_path.with_suffix('.tgv').as_posix()}"),
-            normalize_asset_path(f"Assets/{rel_path.with_suffix('.png').as_posix()}"),
-        ]
-        for cand in candidates:
-            try:
-                extracted = zz_resolver.extract_asset_to_runtime(cand, runtime_root, exact_only=True)
-            except Exception:
-                extracted = None
-            if extracted is None:
+        for cand in (
+            f"PC/Atlas/Assets/{rel_path.with_suffix('.tgv').as_posix()}",
+            f"PC/Atlas/Assets/{rel_path.with_suffix('.png').as_posix()}",
+        ):
+            hit = zz_resolver.find_exact(cand)
+            if hit is None:
                 continue
+            extracted = zz_resolver.extract_hit_to_runtime(hit, runtime_root)
             if extracted.suffix.lower() == ".tgv":
-                src_tgv = extracted
-                src_png = extracted.with_suffix(".png")
-            else:
-                src_png = extracted
-                src_tgv = extracted.with_suffix(".tgv")
-            atlas_source = "zz_runtime"
-            break
-    return src_tgv, src_png, atlas_source
+                return extracted, extracted.with_suffix(".png"), "zz_runtime"
+            return extracted.with_suffix(".tgv"), extracted, "zz_runtime"
+
+    for root, label in [(atlas_assets_root, "manual_path"), *[(r, "fallback") for r in extra_roots]]:
+        src_png = root / rel_path.with_suffix(".png")
+        src_tgv = root / rel_path.with_suffix(".tgv")
+        if src_tgv.exists() or src_png.exists():
+            return src_tgv, src_png, label
+    return (
+        atlas_assets_root / rel_path.with_suffix(".tgv"),
+        atlas_assets_root / rel_path.with_suffix(".png"),
+        "manual_path",
+    )
+
+
+def _png_is_current(out_png: Path, src_tgv: Path, src_png: Path) -> bool:
+    """A converted PNG is reusable only while it is newer than its source texture.
+    Re-extraction after a game patch rewrites the source, which invalidates it."""
+    try:
+        out_st = out_png.stat()
+    except OSError:
+        return False
+    if out_st.st_size <= 0:
+        return False
+    for src in (src_tgv, src_png):
+        try:
+            return out_st.st_mtime_ns >= src.stat().st_mtime_ns
+        except OSError:
+            continue
+    # No source on disk at all: the cached PNG is all there is.
+    return True
 
 
 def resolve_texture_from_atlas_ref(
@@ -10162,9 +10102,18 @@ def resolve_texture_from_atlas_ref(
     if atlas_entry is None and bool(atlas_json_strict):
         raise FileNotFoundError(f"missing_source: atlas_json_strict no mapping for ref {ref}")
 
-    # Deterministic cache hit: if target texture already exists, reuse it and skip converter.
+    if atlas_entry is not None:
+        src_tgv, src_png, atlas_source = _resolve_source_from_atlas_entry(
+            atlas_entry,
+            atlas_assets_root=atlas_assets_root,
+            extra_roots=extra_roots,
+            zz_resolver=zz_resolver,
+            zz_runtime_root=Path(zz_runtime_root) if zz_runtime_root is not None else None,
+        )
+
+    # Cache hit: the PNG was converted from the current source (see _png_is_current).
     try:
-        if out_png.exists() and out_png.is_file() and out_png.stat().st_size > 0:
+        if _png_is_current(out_png, src_tgv, src_png):
             extras = find_generated_extra_maps(
                 out_png,
                 strict_atlas=bool(atlas_entry is not None and atlas_json_strict),
@@ -10187,15 +10136,6 @@ def resolve_texture_from_atlas_ref(
             }
     except OSError:
         pass
-
-    if atlas_entry is not None:
-        src_tgv, src_png, atlas_source = _resolve_source_from_atlas_entry(
-            atlas_entry,
-            atlas_assets_root=atlas_assets_root,
-            extra_roots=extra_roots,
-            zz_resolver=zz_resolver,
-            zz_runtime_root=Path(zz_runtime_root) if zz_runtime_root is not None else None,
-        )
 
     if src_tgv.exists():
         deps_before = get_tgv_deps_auto_install_count()

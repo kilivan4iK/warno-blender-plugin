@@ -103,25 +103,23 @@ def _load_and_validate(path: Path, asset_path: str) -> Dict[str, Any]:
 def _resolve_cli_exe(modding_suite_root: Path, gfx_cli_override: str) -> tuple[Path | None, List[Path]]:
     script_root = Path(__file__).resolve().parent
     sibling_modding_suite = script_root.parent / "moddingSuite"
-    override = Path(gfx_cli_override).expanduser() if gfx_cli_override.strip() else None
-    candidates: List[Path] = [
-        # Preferred: unified single-exe (subcommand routes the call).
+    candidates: List[Path] = []
+    # An explicit path from the settings wins (it used to be tried last).
+    if gfx_cli_override.strip():
+        override = Path(gfx_cli_override).expanduser()
+        candidates.append(override if override.is_absolute() else (script_root / override))
+    candidates += [
+        # Unified single exe (the subcommand routes the call).
         script_root / "moddingSuite" / "moddingSuite.exe",
         sibling_modding_suite / "moddingSuite.exe",
         modding_suite_root / "moddingSuite.exe",
-        # Legacy: dedicated GfxCli.exe (kept for backwards compatibility).
+        # Dedicated GfxCli.exe from older moddingSuite builds.
         script_root / "moddingSuite" / "gfx_cli" / "moddingSuite.GfxCli.exe",
         script_root / "moddingSuite" / "moddingSuite.GfxCli.exe",
         sibling_modding_suite / "gfx_cli" / "moddingSuite.GfxCli.exe",
         modding_suite_root / "gfx_cli" / "moddingSuite.GfxCli.exe",
         modding_suite_root / "moddingSuite.GfxCli.exe",
-        sibling_modding_suite / "moddingSuite.GfxCli" / "bin" / "Release" / "net9.0-windows10.0.19041" / "moddingSuite.GfxCli.exe",
-        sibling_modding_suite / "moddingSuite.GfxCli" / "bin" / "Debug" / "net9.0-windows10.0.19041" / "moddingSuite.GfxCli.exe",
-        modding_suite_root / "moddingSuite.GfxCli" / "bin" / "Release" / "net9.0-windows10.0.19041" / "moddingSuite.GfxCli.exe",
-        modding_suite_root / "moddingSuite.GfxCli" / "bin" / "Debug" / "net9.0-windows10.0.19041" / "moddingSuite.GfxCli.exe",
     ]
-    if override is not None:
-        candidates.append(override if override.is_absolute() else (script_root / override))
 
     seen: set[str] = set()
     uniq: List[Path] = []
@@ -136,15 +134,6 @@ def _resolve_cli_exe(modding_suite_root: Path, gfx_cli_override: str) -> tuple[P
         if p.exists() and p.is_file():
             return p, uniq
     return None, uniq
-
-
-def _resolve_cli_project(modding_suite_root: Path) -> Path | None:
-    script_root = Path(__file__).resolve().parent
-    for root in (modding_suite_root, script_root.parent / "moddingSuite"):
-        project = root / "moddingSuite.GfxCli" / "moddingSuite.GfxCli.csproj"
-        if project.exists() and project.is_file():
-            return project
-    return None
 
 
 def _build_cli_exec_cmd(cli_exe: Path) -> List[str]:
@@ -171,15 +160,82 @@ def _run_cli(cmd: List[str], timeout_sec: int) -> tuple[int, str, str, float, bo
             cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=max(5, int(timeout_sec)),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         elapsed = time.monotonic() - t0
         return int(proc.returncode), str(proc.stdout or ""), str(proc.stderr or ""), elapsed, False
     except subprocess.TimeoutExpired as exc:
         elapsed = time.monotonic() - t0
-        out = str(getattr(exc, "stdout", "") or "")
-        err = str(getattr(exc, "stderr", "") or "")
+        out = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else str(exc.stdout or "")
+        err = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else str(exc.stderr or "")
         return 124, out, err, elapsed, True
+    except OSError as exc:
+        return 127, "", f"cannot start {cmd[0]}: {exc}", time.monotonic() - t0, False
+
+
+def export_gfx_json(
+    *,
+    warno_root: Path,
+    modding_suite_root: Path,
+    asset_path: str,
+    out_json: Path,
+    cache_dir: Path,
+    gfx_cli_override: str = "",
+    timeout_sec: int = 180,
+    verbose: bool = False,
+) -> tuple[int, str]:
+    """Run the GFX CLI for one asset and validate its manifest. Returns (exit code, log)."""
+    log: List[str] = []
+    asset_path = _norm_asset(asset_path)
+    out_json = _resolve_output(Path(out_json))
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    if not Path(warno_root).is_dir():
+        return 3, f"GFX export failed: WARNO root not found: {warno_root}"
+
+    cli_exe, tried = _resolve_cli_exe(modding_suite_root=Path(modding_suite_root), gfx_cli_override=str(gfx_cli_override or ""))
+    if cli_exe is None:
+        return 3, "GFX export failed: headless Gfx CLI was not found. Tried: " + ", ".join(str(p) for p in tried)
+    cmd = [
+        *_build_cli_exec_cmd(cli_exe),
+        "--warno-root",
+        str(warno_root),
+        "--asset-path",
+        asset_path,
+        "--out-json",
+        str(out_json),
+        "--cache-dir",
+        str(cache_dir),
+    ]
+    if verbose:
+        cmd.append("--verbose")
+    log.append("[gfx] cmd: " + " ".join(shlex.quote(x) for x in cmd))
+    rc, out, err, elapsed, timed_out = _run_cli(cmd, timeout_sec=max(5, int(timeout_sec or 180)))
+    log.append(f"[gfx] exit_code={rc} elapsed={elapsed:.2f}s")
+    if _tail_text(out):
+        log.append(f"[gfx] stdout: {_tail_text(out)}")
+    if _tail_text(err):
+        log.append(f"[gfx] stderr: {_tail_text(err)}")
+    if timed_out:
+        log.append(f"gfx_cli_timeout: exceeded {int(timeout_sec or 180)}s")
+        return 3, "\n".join(log)
+    if rc != 0:
+        log.append("GFX export failed: headless Gfx CLI returned non-zero exit code.")
+        return 3, "\n".join(log)
+    if not out_json.is_file():
+        log.append(f"GFX export failed: output JSON missing: {out_json}")
+        return 3, "\n".join(log)
+    try:
+        data = _load_and_validate(out_json, asset_path=asset_path)
+    except Exception as exc:
+        log.append(f"GFX export validation failed: {exc}")
+        return 3, "\n".join(log)
+    out_json.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    log.append(f"[gfx] ok: asset={asset_path} matched_units={len(data.get('matched_units', []))}")
+    return 0, "\n".join(log)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -202,101 +258,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_arg_parser().parse_args()
-
-    warno_root = Path(args.warno_root)
-    modding_suite_root = Path(args.modding_suite_root)
-    asset_path = _norm_asset(args.asset_path)
-    print(f"[gfx-wrapper] game: {args.game}", file=sys.stderr)
-    out_json = _resolve_output(Path(args.out_json))
-    cache_dir = Path(args.cache_dir)
-    out_json.parent.mkdir(parents=True, exist_ok=True)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    if not warno_root.exists() or not warno_root.is_dir():
-        print(f"GFX export failed: WARNO root not found: {warno_root}", file=sys.stderr)
-        return 3
-
-    cli_exe, tried = _resolve_cli_exe(modding_suite_root=modding_suite_root, gfx_cli_override=str(args.gfx_cli or ""))
-    project = _resolve_cli_project(modding_suite_root)
-
-    cmd: List[str]
-    if cli_exe is not None:
-        cmd = [
-            *_build_cli_exec_cmd(cli_exe),
-            "--warno-root",
-            str(warno_root),
-            "--asset-path",
-            asset_path,
-            "--out-json",
-            str(out_json),
-            "--cache-dir",
-            str(cache_dir),
-        ]
-    elif project is not None:
-        cmd = [
-            "dotnet",
-            "run",
-            "--project",
-            str(project),
-            "--configuration",
-            "Release",
-            "--",
-            "--warno-root",
-            str(warno_root),
-            "--asset-path",
-            asset_path,
-            "--out-json",
-            str(out_json),
-            "--cache-dir",
-            str(cache_dir),
-        ]
-    else:
-        tried_text = ", ".join(str(p) for p in tried)
-        print(
-            "GFX export failed: headless Gfx CLI was not found. "
-            f"Tried: {tried_text}",
-            file=sys.stderr,
-        )
-        return 3
-
-    if bool(args.verbose):
-        cmd.append("--verbose")
-
-    quoted = " ".join(shlex.quote(x) for x in cmd)
-    print(f"[gfx-wrapper] cmd: {quoted}", file=sys.stderr)
-
-    rc, out, err, elapsed, timed_out = _run_cli(cmd, timeout_sec=max(5, int(args.timeout_sec or 45)))
-    print(f"[gfx-wrapper] elapsed: {elapsed:.2f}s", file=sys.stderr)
-    print(f"[gfx-wrapper] exit_code: {rc}", file=sys.stderr)
-    out_tail = _tail_text(out)
-    err_tail = _tail_text(err)
-    if out_tail:
-        print(f"[gfx-wrapper] stdout_tail: {out_tail}", file=sys.stderr)
-    if err_tail:
-        print(f"[gfx-wrapper] stderr_tail: {err_tail}", file=sys.stderr)
-
-    if timed_out:
-        print(f"gfx_cli_timeout: exceeded {int(args.timeout_sec or 45)}s", file=sys.stderr)
-        return 3
-    if rc != 0:
-        print("GFX export failed: headless Gfx CLI returned non-zero exit code.", file=sys.stderr)
-        return 3
-    if not out_json.exists() or not out_json.is_file():
-        print(f"GFX export failed: output JSON missing: {out_json}", file=sys.stderr)
-        return 3
-
-    try:
-        data = _load_and_validate(out_json, asset_path=asset_path)
-    except Exception as exc:
-        print(f"GFX export validation failed: {exc}", file=sys.stderr)
-        return 3
-
-    out_json.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(
-        f"[gfx-wrapper] ok: asset={asset_path} matched_units={len(data.get('matched_units', []))}",
-        file=sys.stderr,
+    rc, log = export_gfx_json(
+        warno_root=Path(args.warno_root),
+        modding_suite_root=Path(args.modding_suite_root),
+        asset_path=args.asset_path,
+        out_json=Path(args.out_json),
+        cache_dir=Path(args.cache_dir),
+        gfx_cli_override=str(args.gfx_cli or ""),
+        timeout_sec=int(args.timeout_sec or 180),
+        verbose=bool(args.verbose),
     )
-    return 0
+    if log:
+        print(log, file=sys.stderr)
+    return rc
 
 
 if __name__ == "__main__":
