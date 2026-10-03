@@ -20,7 +20,6 @@ import shutil
 import subprocess
 import struct
 import sys
-import tempfile
 import zlib
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Sequence, Tuple
@@ -60,7 +59,7 @@ GAME_PROFILES: Dict[str, Dict[str, Any]] = {
         "preferred_skeleton_tokens": ["skeleton_all.spk", "gfxdescriptor/skeleton_all.spk"],
         "mesh_spk_rel_dir": ["PC", "mesh", "pack"],
         "atlas_assets_rel": ["PC", "Atlas", "Assets"],
-        "default_install_path": r"F:\SteamLibrary\steamapps\common\WARNO",
+        "default_install_path": r"C:\Program Files (x86)\Steam\steamapps\common\WARNO",
         "mesh_format_version": "warno",
         "fat_entry_align": 1,
     },
@@ -541,18 +540,6 @@ def strip_lod_suffix(name: str) -> str:
             return out
         out = nxt
 
-
-def shared_suffix_score(a: str, b: str) -> int:
-    pa = [x.lower() for x in PurePosixPath(normalize_asset_path(a)).parts]
-    pb = [x.lower() for x in PurePosixPath(normalize_asset_path(b)).parts]
-    i = 1
-    score = 0
-    while i <= len(pa) and i <= len(pb):
-        if pa[-i] != pb[-i]:
-            break
-        score += 1
-        i += 1
-    return score
 
 
 def unique_keep_order(values: Sequence[str]) -> List[str]:
@@ -1797,27 +1784,6 @@ def detect_part_label(ref: str) -> str:
     return ""
 
 
-def extract_texture_small_hints(texture_small_path: Path) -> List[str]:
-    if not texture_small_path.exists():
-        return []
-    try:
-        data = texture_small_path.read_bytes().lower()
-    except Exception:
-        return []
-    hint_map = [
-        (b"track", "TRK"),
-        (b"chenille", "TRK"),
-        (b"chassis", "CHS"),
-        (b"hull", "HULL"),
-        (b"turret", "TURRET"),
-        (b"wheel", "WHL"),
-    ]
-    out: List[str] = []
-    for needle, label in hint_map:
-        if needle in data and label not in out:
-            out.append(label)
-    return out
-
 
 def copy_if_needed(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -2424,23 +2390,6 @@ def infer_missing_wheel_bone_names(
     return out
 
 
-def _top_level_child_bone_index(
-    bone_index: int,
-    bone_parent_by_index: Dict[int, int],
-) -> int:
-    cur = int(bone_index)
-    prev = cur
-    seen: set[int] = set()
-    while True:
-        if cur in seen:
-            return int(prev)
-        seen.add(cur)
-        parent = int(bone_parent_by_index.get(cur, -1))
-        if parent < 0:
-            return int(prev)
-        prev = cur
-        cur = parent
-
 
 _WHEEL_BONE_NAME_SHORT_RX = re.compile(r"^roue_(elev_)?([dg])([0-9]+)$", re.IGNORECASE)
 _WHEEL_BONE_NAME_WORD_RX = re.compile(
@@ -2677,116 +2626,6 @@ def classify_group_from_bone_name(name: str) -> str:
     return "Chassis"
 
 
-_RAW_GEOMETRY_PROMOTION_FIXTURES = {
-    "kokon_launcher",
-    "pods_internes",
-}
-
-
-def _raw_node_is_helper_like_for_geometry_promotion(name: str) -> bool:
-    low = _normalize_bone_name_for_tokens(name)
-    if not low:
-        return True
-    if low.startswith("fx_"):
-        return True
-    if low.startswith("bip01"):
-        return True
-    if low in {"armature", "papyrus", "fake"}:
-        return True
-    if low.startswith("armature_"):
-        return True
-    if re.fullmatch(r"empty(?:\.[0-9]+)?", low, flags=re.IGNORECASE):
-        return True
-    if low.startswith("cylinder."):
-        return True
-    return False
-
-
-def _geometry_promotion_group_name(raw_name: str) -> str:
-    return pretty_part_name(str(raw_name or "").strip())
-
-
-def _should_promote_raw_geometry_group(
-    raw_name: str,
-    tri_count: int,
-    total_triangles: int,
-) -> bool:
-    low = _normalize_bone_name_for_tokens(raw_name)
-    if not low:
-        return False
-    if _raw_node_is_helper_like_for_geometry_promotion(low):
-        return False
-    if low in {"chassis", "hull", "base", "chassisfake", "chassisarmaturefake"}:
-        return False
-    if low in _RAW_GEOMETRY_PROMOTION_FIXTURES:
-        return int(tri_count) >= 24
-    min_tris = max(96, int(max(1, int(total_triangles)) * 0.015))
-    return int(tri_count) >= int(min_tris)
-
-
-def _build_group_split_diagnostics(
-    tri_infos: Sequence[Dict[str, Any]],
-    material_role: str = "",
-    material_name: str = "",
-) -> Dict[str, Any]:
-    total = len(tri_infos)
-    raw_counts: Dict[str, int] = {}
-    raw_index_by_name: Dict[str, int] = {}
-    bone_counts: Dict[int, int] = {}
-    for info in tri_infos:
-        raw_name = str(info.get("raw_bone_name", "") or "").strip()
-        raw_low = _normalize_bone_name_for_tokens(raw_name)
-        raw_idx = int(info.get("raw_bone_index", -1))
-        if raw_low:
-            raw_counts[raw_low] = raw_counts.get(raw_low, 0) + 1
-            raw_index_by_name.setdefault(raw_low, raw_idx)
-        if raw_idx >= 0:
-            bone_counts[raw_idx] = bone_counts.get(raw_idx, 0) + 1
-
-    dominant_raw_name = ""
-    dominant_raw_triangles = 0
-    significant_raw_nodes: List[Dict[str, Any]] = []
-    if raw_counts:
-        dominant_raw_name = min(raw_counts.keys(), key=lambda key: (-raw_counts[key], key))
-        dominant_raw_triangles = int(raw_counts.get(dominant_raw_name, 0))
-        min_significant = max(24, int(max(1, total) * 0.10))
-        for raw_low in sorted(raw_counts.keys(), key=lambda key: (-raw_counts[key], key)):
-            count = int(raw_counts[raw_low])
-            if count < min_significant:
-                continue
-            significant_raw_nodes.append(
-                {
-                    "raw_node": str(raw_low),
-                    "raw_node_index": int(raw_index_by_name.get(raw_low, -1)),
-                    "triangles": int(count),
-                    "ratio": round(float(count) / float(max(1, total)), 6),
-                }
-            )
-
-    dominant_raw_ratio = round(float(dominant_raw_triangles) / float(max(1, total)), 6)
-    contamination_verdict = "clean"
-    if len(significant_raw_nodes) > 1 or (dominant_raw_ratio < 0.85 and total >= 48):
-        contamination_verdict = "mixed_raw_nodes"
-
-    dominant_bone_index = -1
-    dominant_bone_triangles = 0
-    if bone_counts:
-        dominant_bone_index = min(bone_counts.keys(), key=lambda idx: (-bone_counts[idx], int(idx)))
-        dominant_bone_triangles = int(bone_counts.get(dominant_bone_index, 0))
-
-    return {
-        "material_role": str(material_role or ""),
-        "material_name": str(material_name or ""),
-        "triangles": int(total),
-        "dominant_raw_node": str(dominant_raw_name),
-        "dominant_raw_node_index": int(raw_index_by_name.get(dominant_raw_name, -1)) if dominant_raw_name else -1,
-        "dominant_raw_node_ratio": float(dominant_raw_ratio),
-        "dominant_bone_index": int(dominant_bone_index),
-        "dominant_bone_ratio": round(float(dominant_bone_triangles) / float(max(1, total)), 6),
-        "significant_raw_nodes": significant_raw_nodes,
-        "contamination_verdict": str(contamination_verdict),
-    }
-
 
 def _floodfill_track_uv_seam(vertices: Dict[str, Any], indices: Sequence[int]) -> bool:
     """RD/SD2 track (chenille) ONLY: repair the tread UV V-seam universally, in-plugin.
@@ -2952,375 +2791,6 @@ def _try_apply_get_bake(vertices) -> bool:
         vertices["tread_full_uv"] = True
     return True
 
-
-def _bucket_face_components(
-    faces: Sequence[Sequence[int]],
-) -> List[List[int]]:
-    vert_to_faces: Dict[int, List[int]] = {}
-    for face_idx, face in enumerate(faces):
-        for vi in face:
-            vert_to_faces.setdefault(int(vi), []).append(int(face_idx))
-
-    components: List[List[int]] = []
-    visited: set[int] = set()
-    for face_idx in range(len(faces)):
-        if face_idx in visited:
-            continue
-        queue = [int(face_idx)]
-        visited.add(int(face_idx))
-        comp: List[int] = []
-        while queue:
-            cur = queue.pop()
-            comp.append(int(cur))
-            for vi in faces[cur]:
-                for nei in vert_to_faces.get(int(vi), []):
-                    if nei in visited:
-                        continue
-                    visited.add(int(nei))
-                    queue.append(int(nei))
-        if comp:
-            components.append(comp)
-    return components
-
-
-def _polygon_area_3d(vertices: Sequence[Tuple[float, float, float]], face: Sequence[int]) -> float:
-    if len(face) < 3:
-        return 0.0
-    try:
-        p0 = vertices[int(face[0])]
-    except Exception:
-        return 0.0
-    area = 0.0
-    for i in range(1, len(face) - 1):
-        try:
-            p1 = vertices[int(face[i])]
-            p2 = vertices[int(face[i + 1])]
-        except Exception:
-            return 0.0
-        ux = float(p1[0]) - float(p0[0])
-        uy = float(p1[1]) - float(p0[1])
-        uz = float(p1[2]) - float(p0[2])
-        vx = float(p2[0]) - float(p0[0])
-        vy = float(p2[1]) - float(p0[1])
-        vz = float(p2[2]) - float(p0[2])
-        cx = uy * vz - uz * vy
-        cy = uz * vx - ux * vz
-        cz = ux * vy - uy * vx
-        area += 0.5 * math.sqrt(cx * cx + cy * cy + cz * cz)
-    return float(area)
-
-
-def _conservative_quad_merge(
-    vertices: Sequence[Tuple[float, float, float]],
-    faces: Sequence[Sequence[int]],
-    face_mids: Sequence[int],
-) -> Tuple[List[List[int]], List[int], int]:
-    edge_to_faces: Dict[Tuple[int, int], List[int]] = {}
-    tri_faces: List[Tuple[int, int, int] | None] = []
-    for face_idx, face in enumerate(faces):
-        if len(face) != 3:
-            tri_faces.append(None)
-            continue
-        tri = (int(face[0]), int(face[1]), int(face[2]))
-        tri_faces.append(tri)
-        edges = (
-            tuple(sorted((tri[0], tri[1]))),
-            tuple(sorted((tri[1], tri[2]))),
-            tuple(sorted((tri[2], tri[0]))),
-        )
-        for edge in edges:
-            edge_to_faces.setdefault(edge, []).append(int(face_idx))
-
-    used: set[int] = set()
-    out_faces: List[List[int]] = []
-    out_mids: List[int] = []
-    merged_pairs = 0
-
-    def _sub(a: Sequence[float], b: Sequence[float]) -> Tuple[float, float, float]:
-        return (
-            float(a[0]) - float(b[0]),
-            float(a[1]) - float(b[1]),
-            float(a[2]) - float(b[2]),
-        )
-
-    def _cross(a: Sequence[float], b: Sequence[float]) -> Tuple[float, float, float]:
-        return (
-            float(a[1]) * float(b[2]) - float(a[2]) * float(b[1]),
-            float(a[2]) * float(b[0]) - float(a[0]) * float(b[2]),
-            float(a[0]) * float(b[1]) - float(a[1]) * float(b[0]),
-        )
-
-    def _dot(a: Sequence[float], b: Sequence[float]) -> float:
-        return float(a[0]) * float(b[0]) + float(a[1]) * float(b[1]) + float(a[2]) * float(b[2])
-
-    def _norm(v: Sequence[float]) -> float:
-        return math.sqrt(_dot(v, v))
-
-    def _ordered_quad(face_a: Tuple[int, int, int], face_b: Tuple[int, int, int]) -> List[int] | None:
-        verts = sorted({int(v) for v in [*face_a, *face_b]})
-        if len(verts) != 4:
-            return None
-        pts = [vertices[v] for v in verts]
-        centroid = (
-            sum(float(p[0]) for p in pts) / 4.0,
-            sum(float(p[1]) for p in pts) / 4.0,
-            sum(float(p[2]) for p in pts) / 4.0,
-        )
-        n0 = _cross(_sub(vertices[face_a[1]], vertices[face_a[0]]), _sub(vertices[face_a[2]], vertices[face_a[0]]))
-        n1 = _cross(_sub(vertices[face_b[1]], vertices[face_b[0]]), _sub(vertices[face_b[2]], vertices[face_b[0]]))
-        n = (
-            float(n0[0]) + float(n1[0]),
-            float(n0[1]) + float(n1[1]),
-            float(n0[2]) + float(n1[2]),
-        )
-        n_len = _norm(n)
-        if n_len <= 1.0e-12:
-            return None
-        n = (n[0] / n_len, n[1] / n_len, n[2] / n_len)
-
-        axis_u = _sub(vertices[verts[0]], centroid)
-        axis_u_len = _norm(axis_u)
-        if axis_u_len <= 1.0e-12:
-            return None
-        axis_u = (axis_u[0] / axis_u_len, axis_u[1] / axis_u_len, axis_u[2] / axis_u_len)
-        axis_v = _cross(n, axis_u)
-        axis_v_len = _norm(axis_v)
-        if axis_v_len <= 1.0e-12:
-            return None
-        axis_v = (axis_v[0] / axis_v_len, axis_v[1] / axis_v_len, axis_v[2] / axis_v_len)
-
-        polar: List[Tuple[float, int]] = []
-        for v in verts:
-            rel = _sub(vertices[v], centroid)
-            x = _dot(rel, axis_u)
-            y = _dot(rel, axis_v)
-            polar.append((math.atan2(y, x), int(v)))
-        ordered = [int(v) for _angle, v in sorted(polar, key=lambda item: item[0])]
-        if len(set(ordered)) != 4:
-            return None
-
-        boundary_counts: Dict[Tuple[int, int], int] = {}
-        for edge in (
-            tuple(sorted((face_a[0], face_a[1]))),
-            tuple(sorted((face_a[1], face_a[2]))),
-            tuple(sorted((face_a[2], face_a[0]))),
-            tuple(sorted((face_b[0], face_b[1]))),
-            tuple(sorted((face_b[1], face_b[2]))),
-            tuple(sorted((face_b[2], face_b[0]))),
-        ):
-            boundary_counts[edge] = boundary_counts.get(edge, 0) + 1
-        boundary_edges = {edge for edge, count in boundary_counts.items() if count == 1}
-        quad_edges = {
-            tuple(sorted((ordered[0], ordered[1]))),
-            tuple(sorted((ordered[1], ordered[2]))),
-            tuple(sorted((ordered[2], ordered[3]))),
-            tuple(sorted((ordered[3], ordered[0]))),
-        }
-        if quad_edges != boundary_edges:
-            return None
-
-        max_edge = 0.0
-        for i in range(4):
-            p0 = vertices[ordered[i]]
-            p1 = vertices[ordered[(i + 1) % 4]]
-            max_edge = max(max_edge, math.dist(p0, p1))
-        plane_eps = max(1.0e-5, max_edge * 1.0e-4)
-        for v in ordered:
-            rel = _sub(vertices[v], vertices[ordered[0]])
-            if abs(_dot(rel, n)) > plane_eps:
-                return None
-
-        sign = 0.0
-        for i in range(4):
-            p0 = vertices[ordered[i]]
-            p1 = vertices[ordered[(i + 1) % 4]]
-            p2 = vertices[ordered[(i + 2) % 4]]
-            c = _cross(_sub(p1, p0), _sub(p2, p1))
-            s = _dot(c, n)
-            if abs(s) <= 1.0e-10:
-                continue
-            if sign == 0.0:
-                sign = 1.0 if s > 0.0 else -1.0
-            elif s * sign < 0.0:
-                return None
-        return ordered
-
-    candidate_pairs: List[Tuple[float, int, int]] = []
-    for edge, face_ids in edge_to_faces.items():
-        if len(face_ids) != 2:
-            continue
-        fa, fb = int(face_ids[0]), int(face_ids[1])
-        tri_a = tri_faces[fa]
-        tri_b = tri_faces[fb]
-        if tri_a is None or tri_b is None:
-            continue
-        if int(face_mids[fa]) != int(face_mids[fb]):
-            continue
-        n0 = _cross(_sub(vertices[tri_a[1]], vertices[tri_a[0]]), _sub(vertices[tri_a[2]], vertices[tri_a[0]]))
-        n1 = _cross(_sub(vertices[tri_b[1]], vertices[tri_b[0]]), _sub(vertices[tri_b[2]], vertices[tri_b[0]]))
-        n0_len = _norm(n0)
-        n1_len = _norm(n1)
-        if n0_len <= 1.0e-12 or n1_len <= 1.0e-12:
-            continue
-        normal_dot = _dot(n0, n1) / max(1.0e-12, n0_len * n1_len)
-        if normal_dot < 0.9995:
-            continue
-        quad = _ordered_quad(tri_a, tri_b)
-        if quad is None:
-            continue
-        candidate_pairs.append((1.0 - normal_dot, fa, fb))
-
-    candidate_pairs.sort(key=lambda item: (item[0], item[1], item[2]))
-    pair_face_to_quad: Dict[int, List[int]] = {}
-    for _score, fa, fb in candidate_pairs:
-        if fa in used or fb in used:
-            continue
-        tri_a = tri_faces[fa]
-        tri_b = tri_faces[fb]
-        if tri_a is None or tri_b is None:
-            continue
-        quad = _ordered_quad(tri_a, tri_b)
-        if quad is None:
-            continue
-        used.add(int(fa))
-        used.add(int(fb))
-        pair_face_to_quad[int(fa)] = list(quad)
-        pair_face_to_quad[int(fb)] = list(quad)
-        merged_pairs += 1
-
-    emitted_pairs: set[int] = set()
-    for face_idx, face in enumerate(faces):
-        if face_idx in used:
-            if face_idx in emitted_pairs:
-                continue
-            quad = pair_face_to_quad.get(int(face_idx))
-            if quad is None:
-                continue
-            out_faces.append(list(quad))
-            out_mids.append(int(face_mids[face_idx]))
-            for peer_idx, peer_quad in pair_face_to_quad.items():
-                if peer_quad == quad:
-                    emitted_pairs.add(int(peer_idx))
-            continue
-        out_faces.append([int(v) for v in face])
-        out_mids.append(int(face_mids[face_idx]))
-
-    return out_faces, out_mids, int(merged_pairs)
-
-
-def conservative_cleanup_bucket_geometry(
-    bucket: Dict[str, Any],
-) -> Dict[str, Any]:
-    vertices_in = [tuple(map(float, row)) for row in list(bucket.get("vertices", []) or [])]
-    uvs_in = [tuple(map(float, row)) for row in list(bucket.get("uvs", []) or [])]
-    faces_in = [[int(v) for v in face] for face in list(bucket.get("faces", []) or [])]
-    mids_in = [int(mid) for mid in list(bucket.get("face_mids", []) or [])]
-    refs_in = list(bucket.get("source_refs", []) or [])
-
-    diagnostics = {
-        "cleanup_mode": "conservative",
-        "pre_vertex_count": int(len(vertices_in)),
-        "pre_polygon_count": int(len(faces_in)),
-        "pre_component_count": int(len(_bucket_face_components(faces_in))) if faces_in else 0,
-        "welded_vertices": 0,
-        "degenerate_faces_removed": 0,
-        "tiny_components_removed": 0,
-        "quad_pairs_merged": 0,
-    }
-    if not vertices_in or not faces_in:
-        diagnostics["post_vertex_count"] = int(len(vertices_in))
-        diagnostics["post_polygon_count"] = int(len(faces_in))
-        diagnostics["post_component_count"] = int(diagnostics["pre_component_count"])
-        return diagnostics
-
-    pos_eps = 1.0e-6
-    uv_eps = 1.0e-6
-    remap: Dict[int, int] = {}
-    new_vertices: List[Tuple[float, float, float]] = []
-    new_uvs: List[Tuple[float, float]] = []
-    new_refs: List[Any] = []
-    key_to_new: Dict[Tuple[int, int, int, int, int], int] = {}
-    for src_idx, pos in enumerate(vertices_in):
-        uv = uvs_in[src_idx] if src_idx < len(uvs_in) else (0.0, 0.0)
-        key = (
-            int(round(float(pos[0]) / pos_eps)),
-            int(round(float(pos[1]) / pos_eps)),
-            int(round(float(pos[2]) / pos_eps)),
-            int(round(float(uv[0]) / uv_eps)),
-            int(round(float(uv[1]) / uv_eps)),
-        )
-        mapped = key_to_new.get(key)
-        if mapped is None:
-            mapped = len(new_vertices)
-            key_to_new[key] = int(mapped)
-            new_vertices.append(tuple(pos))
-            new_uvs.append(tuple(uv))
-            new_refs.append(refs_in[src_idx] if src_idx < len(refs_in) else (-1, -1))
-        remap[int(src_idx)] = int(mapped)
-    diagnostics["welded_vertices"] = max(0, int(len(vertices_in) - len(new_vertices)))
-
-    cleaned_faces: List[List[int]] = []
-    cleaned_mids: List[int] = []
-    for face_idx, face in enumerate(faces_in):
-        mapped = [int(remap.get(int(vi), -1)) for vi in face]
-        if len(mapped) < 3 or any(int(vi) < 0 for vi in mapped):
-            diagnostics["degenerate_faces_removed"] += 1
-            continue
-        if len(set(mapped)) < 3:
-            diagnostics["degenerate_faces_removed"] += 1
-            continue
-        if _polygon_area_3d(new_vertices, mapped) <= 1.0e-12:
-            diagnostics["degenerate_faces_removed"] += 1
-            continue
-        cleaned_faces.append(list(mapped))
-        cleaned_mids.append(int(mids_in[face_idx]) if face_idx < len(mids_in) else -1)
-
-    kept_face_ids: set[int] = set()
-    components = _bucket_face_components(cleaned_faces)
-    for comp in components:
-        if len(comp) > 2:
-            kept_face_ids.update(int(idx) for idx in comp)
-            continue
-        comp_faces = [cleaned_faces[int(idx)] for idx in comp]
-        comp_verts = sorted({int(vi) for face in comp_faces for vi in face})
-        if len(comp_verts) < 3:
-            diagnostics["tiny_components_removed"] += len(comp)
-            continue
-        xs = [float(new_vertices[vi][0]) for vi in comp_verts]
-        ys = [float(new_vertices[vi][1]) for vi in comp_verts]
-        zs = [float(new_vertices[vi][2]) for vi in comp_verts]
-        bbox_diag = math.sqrt((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2 + (max(zs) - min(zs)) ** 2)
-        total_area = sum(_polygon_area_3d(new_vertices, face) for face in comp_faces)
-        if bbox_diag <= 1.0e-5 or total_area <= 1.0e-10:
-            diagnostics["tiny_components_removed"] += len(comp)
-            continue
-        kept_face_ids.update(int(idx) for idx in comp)
-
-    if len(kept_face_ids) != len(cleaned_faces):
-        next_faces: List[List[int]] = []
-        next_mids: List[int] = []
-        for idx, face in enumerate(cleaned_faces):
-            if idx not in kept_face_ids:
-                continue
-            next_faces.append(face)
-            next_mids.append(int(cleaned_mids[idx]))
-        cleaned_faces = next_faces
-        cleaned_mids = next_mids
-
-    quad_faces, quad_mids, quad_pairs = _conservative_quad_merge(new_vertices, cleaned_faces, cleaned_mids)
-    diagnostics["quad_pairs_merged"] = int(quad_pairs)
-
-    bucket["vertices"] = [tuple(v) for v in new_vertices]
-    bucket["uvs"] = [tuple(uv) for uv in new_uvs]
-    bucket["source_refs"] = list(new_refs)
-    bucket["faces"] = [list(face) for face in quad_faces]
-    bucket["face_mids"] = [int(mid) for mid in quad_mids]
-    bucket["map"] = {}
-
-    diagnostics["post_vertex_count"] = int(len(bucket["vertices"]))
-    diagnostics["post_polygon_count"] = int(len(bucket["faces"]))
-    diagnostics["post_component_count"] = int(len(_bucket_face_components(bucket["faces"]))) if bucket["faces"] else 0
-    return diagnostics
 
 
 def resolve_center_wheel_bone_index(
@@ -4063,108 +3533,6 @@ def cleanup_bucket_geometry(
         "diagnostics": diagnostics,
     }
 
-
-def split_faces_by_bone_top_level(
-    part: Dict[str, Any],
-    bone_name_by_index: Dict[int, str],
-    bone_parent_by_index: Dict[int, int],
-    material_role: str = "",
-    material_name: str = "",
-) -> List[Dict[str, Any]]:
-    idx = part.get("indices", [])
-    xyz = part.get("vertices", {}).get("xyz", [])
-    vertex_count = len(xyz) // 3
-
-    def all_tris() -> List[Tuple[int, int, int]]:
-        out: List[Tuple[int, int, int]] = []
-        for i in range(0, len(idx), 3):
-            if i + 2 >= len(idx):
-                break
-            out.append((int(idx[i + 0]), int(idx[i + 1]), int(idx[i + 2])))
-        return out
-
-    dominant = dominant_bone_indices(part.get("vertices", {}), vertex_count)
-    if not dominant:
-        return [{
-            "group_name_raw": "MainBody",
-            "group_name_sanitized": sanitize_material_name("MainBody"),
-            "group_bone_index": -1,
-            "tris": all_tris(),
-        }]
-
-    role = str(material_role or "").strip().lower()
-    mat_low = str(material_name or "").strip().lower()
-
-    top_cache: Dict[int, int] = {}
-
-    def top_level_for_bone(bidx: int) -> int:
-        key = int(bidx)
-        hit = top_cache.get(key)
-        if hit is not None:
-            return int(hit)
-        top = _top_level_child_bone_index(key, bone_parent_by_index)
-        top_cache[key] = int(top)
-        return int(top)
-
-    def representative_top_level_bone() -> int:
-        counts: Dict[int, int] = {}
-        for b in dominant:
-            bb = int(b)
-            counts[bb] = counts.get(bb, 0) + 1
-        if not counts:
-            return -1
-        dom_bone = min(counts.keys(), key=lambda x: (-counts[x], int(x)))
-        return top_level_for_bone(dom_bone)
-
-    if role == "track_left" or "chenille_gauche" in mat_low or "track_left" in mat_low:
-        return [{
-            "group_name_raw": "Chenille_Gauche",
-            "group_name_sanitized": sanitize_material_name("Chenille_Gauche"),
-            "group_bone_index": int(representative_top_level_bone()),
-            "tris": all_tris(),
-        }]
-    if role == "track_right" or "chenille_droite" in mat_low or "track_right" in mat_low:
-        return [{
-            "group_name_raw": "Chenille_Droite",
-            "group_name_sanitized": sanitize_material_name("Chenille_Droite"),
-            "group_bone_index": int(representative_top_level_bone()),
-            "tris": all_tris(),
-        }]
-
-    grouped: Dict[int, List[Tuple[int, int, int]]] = {}
-    for tri in all_tris():
-        a, b, c = tri
-        if min(a, b, c) < 0 or max(a, b, c) >= len(dominant):
-            continue
-        votes = [int(dominant[a]), int(dominant[b]), int(dominant[c])]
-        counts: Dict[int, int] = {}
-        for v in votes:
-            counts[v] = counts.get(v, 0) + 1
-        dom_bone = min(counts.keys(), key=lambda x: (-counts[x], int(x)))
-        top = top_level_for_bone(dom_bone)
-        grouped.setdefault(int(top), []).append(tri)
-
-    if not grouped:
-        return [{
-            "group_name_raw": "MainBody",
-            "group_name_sanitized": sanitize_material_name("MainBody"),
-            "group_bone_index": -1,
-            "tris": all_tris(),
-        }]
-
-    out: List[Dict[str, Any]] = []
-    for bidx in sorted(grouped.keys()):
-        tris = grouped.get(int(bidx), [])
-        if not tris:
-            continue
-        raw_name = str(bone_name_by_index.get(int(bidx), f"bone_{int(bidx):03d}") or f"bone_{int(bidx):03d}")
-        out.append({
-            "group_name_raw": raw_name,
-            "group_name_sanitized": sanitize_material_name(raw_name),
-            "group_bone_index": int(bidx),
-            "tris": tris,
-        })
-    return out
 
 
 def split_faces_by_bone(
@@ -7429,12 +6797,6 @@ class SpkMeshExtractor:
         self._node_exact_world_cache[node_index] = world
         return world
 
-    def parse_node_exact_world_positions(self, node_index: int) -> List[Tuple[float, float, float]] | None:
-        """Exact per-node world positions in game space (Y not yet mirrored)."""
-        world = self.parse_node_exact_world_matrices(node_index)
-        if world is None:
-            return None
-        return [(float(m[0][3]), float(m[1][3]), float(m[2][3])) for m in world]
 
     def parse_raw_scene_graph(self, node_index: int) -> RawSceneGraph | None:
         names = list(self.parse_node_names(node_index))
@@ -7688,15 +7050,6 @@ class SpkMeshExtractor:
             exact_transforms=bool(exact_transforms),
         )
 
-    def find_node_names_for_asset(self, asset_path: str) -> List[str]:
-        hit = self.find_best_fat_entry_for_asset(asset_path)
-        if hit is None:
-            return []
-        _, meta = hit
-        node_index = int(meta.get("nodeIndex", -1))
-        if node_index < 0:
-            return []
-        return self.parse_node_names(node_index)
 
     def _parse_meshes(self) -> None:
         info = self.header["mesh"]
@@ -8753,13 +8106,6 @@ def get_zz_runtime_resolver(warno_root: Path, *, game: "str | None" = None) -> Z
     _ZZ_RESOLVER_CACHE[key] = resolver
     return resolver
 
-
-def clear_atlas_json_cache() -> None:
-    _ATLAS_JSON_CACHE.clear()
-
-
-def clear_gfx_json_cache() -> None:
-    _GFX_JSON_CACHE.clear()
 
 
 def _normalize_logical_ref(path: str) -> str:
