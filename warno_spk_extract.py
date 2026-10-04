@@ -8665,15 +8665,26 @@ def find_warno_ndf_dat_entries(warno_root: Path, *, game: "str | None" = None) -
     return [row for row in _walk_dat_entries(scan_root) if not _is_zz_resolver_pack_name(row[0].name)]
 
 
-def _pack_holds_gfx_ndfbins(dat: Path) -> bool:
+def _pack_holds_gfx_ndfbins(dat: Path) -> "bool | None":
     """Whether the pack's dictionary lists one of GFX_NDFBIN_NAMES under a folder path
-    with a "gfx" segment (the rule find_gfx_ndfbins_in_zz applies). Unreadable or
-    non-EDAT files hold nothing."""
+    with a "gfx" segment (the rule find_gfx_ndfbins_in_zz applies).
+
+    False also for a file that is not an EDAT pack at all. None when it could not be
+    read (a lock right after a game update, an I/O error, an EDAT layout this parser
+    does not know): unknown, not "no", so the caller keeps the pack as a candidate
+    instead of silently falling back to an older patch layer."""
     wanted = {name.lower() for name in GFX_NDFBIN_NAMES}
+    try:
+        with open(dat, "rb") as fh:
+            magic = fh.read(4)
+    except OSError:
+        return None
+    if magic != b"edat":
+        return False
     try:
         _header, rows = _scan_zz_dat_rows(dat)
     except Exception:
-        return False
+        return None
     for row in rows:
         parent, _sep, base = normalize_asset_path(str(row[0])).lower().rpartition("/")
         if base in wanted and "gfx" in parent.split("/"):
@@ -8682,7 +8693,8 @@ def _pack_holds_gfx_ndfbins(dat: Path) -> bool:
 
 
 _NDF_GFX_PACKS_CACHE_NAME = ".ndf_gfx_packs.json"
-_NDF_GFX_PACKS_CACHE_VERSION = 1
+# v2: also lists the packs that could not be read, which are re-read on the next call.
+_NDF_GFX_PACKS_CACHE_VERSION = 2
 _NDF_GFX_RESOLVER_CACHE: Dict[str, Tuple[str, "ZZDatResolver | None"]] = {}
 
 
@@ -8700,6 +8712,10 @@ def get_ndf_gfx_resolver(
     them per-map) and the answer is kept in <cache_root>/.ndf_gfx_packs.json under a
     signature of all those packs' paths, sizes and dates. A game update adds or changes
     packs, which changes the signature and reruns the scan.
+
+    A pack that could not be read is kept as a candidate (the resolver retries it and
+    records the failure in .errors) and is listed as unreadable in the cache, so the
+    next call re-reads just those packs instead of trusting a "no".
     """
     entries = find_warno_ndf_dat_entries(warno_root, game=game)
     if not entries:
@@ -8715,6 +8731,9 @@ def get_ndf_gfx_resolver(
 
     cache_file = Path(cache_root) / _NDF_GFX_PACKS_CACHE_NAME if cache_root is not None else None
     packs: "List[Path] | None" = None
+    unreadable: List[Path] = []
+    scanned = len(entries)
+    write_cache = False
     if cache_file is not None:
         try:
             cached = json.loads(cache_file.read_text(encoding="utf-8"))
@@ -8723,36 +8742,50 @@ def get_ndf_gfx_resolver(
                 and cached.get("signature") == signature
             ):
                 packs = [Path(p) for p in cached.get("packs", [])]
+                unreadable = [Path(p) for p in cached.get("unreadable", [])]
         except (OSError, ValueError, TypeError, AttributeError):
             packs = None
+            unreadable = []
     if packs is None:
         dats = [e[0] for e in entries]
         workers = max(1, min(16, (os.cpu_count() or 4) * 2))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             flags = list(pool.map(_pack_holds_gfx_ndfbins, dats))
         packs = [dat for dat, has in zip(dats, flags) if has]
-        if cache_file is not None:
-            try:
-                cache_file.parent.mkdir(parents=True, exist_ok=True)
-                tmp = cache_file.with_name(cache_file.name + f".{os.getpid()}.tmp")
-                tmp.write_text(
-                    json.dumps(
-                        {
-                            "version": _NDF_GFX_PACKS_CACHE_VERSION,
-                            "signature": signature,
-                            "scanned": len(dats),
-                            "packs": [str(p) for p in packs],
-                        },
-                        indent=1,
-                    ),
-                    encoding="utf-8",
-                )
-                os.replace(tmp, cache_file)
-            except OSError:
-                pass
-    resolver = ZZDatResolver(packs) if packs else None
+        unreadable = [dat for dat, has in zip(dats, flags) if has is None]
+        write_cache = True
+    elif unreadable:
+        # Re-read only the packs that failed last time (a lock may have cleared).
+        retry = [(dat, _pack_holds_gfx_ndfbins(dat)) for dat in unreadable]
+        packs = packs + [dat for dat, has in retry if has]
+        unreadable = [dat for dat, has in retry if has is None]
+        write_cache = True
+    if write_cache and cache_file is not None:
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache_file.with_name(cache_file.name + f".{os.getpid()}.tmp")
+            tmp.write_text(
+                json.dumps(
+                    {
+                        "version": _NDF_GFX_PACKS_CACHE_VERSION,
+                        "signature": signature,
+                        "scanned": scanned,
+                        "packs": [str(p) for p in packs],
+                        "unreadable": [str(p) for p in unreadable],
+                    },
+                    indent=1,
+                ),
+                encoding="utf-8",
+            )
+            os.replace(tmp, cache_file)
+        except OSError:
+            pass
+    candidates = packs + unreadable
+    resolver = ZZDatResolver(candidates) if candidates else None
     _NDF_GFX_RESOLVER_CACHE.clear()
-    _NDF_GFX_RESOLVER_CACHE[memo_key] = (signature, resolver)
+    if not unreadable:
+        # Only a complete answer is reused for the rest of the session.
+        _NDF_GFX_RESOLVER_CACHE[memo_key] = (signature, resolver)
     return resolver
 
 
@@ -8874,24 +8907,32 @@ def build_or_load_gfx_manifest(
             # AllPlatforms/NDF/GFX in Glad.dat, which the ZZ resolver does not read.
             zz_in = None
             pack_errors: List[str] = []
+            unread_packs: List[str] = []
             for get_resolver in (
                 lambda: zz_resolver,
                 lambda: get_ndf_gfx_resolver(warno_root, game=game, cache_root=Path(zz_runtime_root)),
             ):
+                resolver = None
                 try:
                     resolver = get_resolver()
                     zz_in = _gfx_inputs_from_zz(resolver, Path(zz_runtime_root)) if resolver is not None else None
                 except Exception as exc:
                     pack_errors.append(str(exc))
                     zz_in = None
+                # Packs the resolver could not read may hold a newer copy than the one used.
+                resolver_errors = [str(e) for e in (getattr(resolver, "errors", None) or [])]
                 if zz_in is not None:
+                    unread_packs = resolver_errors
                     break
+                unread_packs.extend(resolver_errors)
             if zz_in is None:
                 gfx_input["note"] = (
                     "GFX ndfbins could not be extracted from the game packs: " + "; ".join(pack_errors)
                     if pack_errors
                     else "the game packs hold no gfx folder with all four GFX ndfbins"
                 )
+                if unread_packs:
+                    gfx_input["note"] += "; unreadable packs: " + "; ".join(unread_packs[:3])
             if zz_in is not None:
                 gfx_root_arg = Path(zz_in["dir"])
                 gfx_input = {
@@ -8902,11 +8943,19 @@ def build_or_load_gfx_manifest(
                     "layer": zz_in["layer"],
                     "alternatives": zz_in["alternatives"],
                 }
+                notes: List[str] = []
                 if zz_in.get("assembled"):
-                    gfx_input["note"] = (
+                    notes.append(
                         "the four GFX ndfbins sit in pack folders differing only by case; "
                         "extracted side by side into " + str(gfx_root_arg)
                     )
+                if unread_packs:
+                    notes.append(
+                        "some packs could not be read, so an older copy may be in use: "
+                        + "; ".join(unread_packs[:3])
+                    )
+                if notes:
+                    gfx_input["note"] = " | ".join(notes)
                 zz_sig = (
                     list(zz_in["idents"])
                     + [["gfx_root", str(gfx_root_arg).lower()]]
@@ -9008,6 +9057,11 @@ def build_or_load_gfx_manifest(
                         dump_out.unlink()
                     except OSError:
                         pass
+        if exported is not None and store_sig is zz_sig and not list(exported.get("matched_units", []) or []):
+            # An empty match from the pack files must not outlive a change to the Output
+            # dump: one created or refreshed later may match (the retry above ran only if
+            # the dump was complete at this export).
+            store_sig = conservative_sig
         if exported is not None and temp_out.exists():
             temp_out.replace(out_json)
             payload: Dict[str, Any] = {"asset_path": asset_norm, "sources_signature": store_sig}
