@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import io
 import json
 import re
@@ -78,14 +78,24 @@ def parse_tgv(path: Path) -> TGVInfo:
         raise RuntimeError(f"{path.name}: file too small to be valid TGV")
 
     version, unk, width, height = struct.unpack_from("<4I", data, 0)
-    mip_count = struct.unpack_from("<H", data, 0x18)[0]
-    fmt = normalize_format(data[0x1C : 0x1C + 16])
+    # Header as moddingSuite's TgvReader reads it: ImageWidth/ImageHeight (the pixel
+    # size the full-res mip is decoded with), mip count, then the pixel-format string
+    # with its own length, padded to 4 bytes, a 16-byte checksum and the mip tables.
+    image_w, image_h = struct.unpack_from("<2I", data, 0x10)
+    if image_w > 0 and image_h > 0:
+        width, height = image_w, image_h
+    mip_count, fmt_len = struct.unpack_from("<2H", data, 0x18)
+    fmt_len = min(int(fmt_len), max(0, len(data) - 0x1C)) if 0 < fmt_len <= 64 else 16
+    fmt = normalize_format(data[0x1C : 0x1C + fmt_len])
 
     best = (0, None, None, None)
-    for table_start in TABLE_CANDIDATES:
+    exact_start = 0x1C + ((fmt_len + 3) // 4) * 4 + 16
+    for table_start in (exact_start, *[c for c in TABLE_CANDIDATES if c != exact_start]):
         valid, offsets, sizes = try_table(data, table_start, mip_count)
         if valid > best[0]:
             best = (valid, table_start, offsets, sizes)
+        if table_start == exact_start and valid == mip_count and valid > 0:
+            break  # the declared layout checks out; no need to probe others
 
     valid, table_start, offsets, sizes = best
     if valid == 0 or table_start is None or offsets is None or sizes is None:
@@ -229,7 +239,7 @@ def build_dds_header_compressed(
     return out
 
 
-def decode_block_compressed(raw: bytes, width: int, height: int, fmt: str) -> Image.Image:
+def decode_block_compressed(raw: bytes, width: int, height: int, fmt: str, bc1_opaque: bool = False) -> Image.Image:
     fmt_up = fmt.upper()
     if "BC1" in fmt_up:
         fourcc = b"DXT1"
@@ -251,6 +261,11 @@ def decode_block_compressed(raw: bytes, width: int, height: int, fmt: str) -> Im
     image.load()
     if "BC5" in fmt_up:
         return image.convert("RGB")
+    if bc1_opaque and "BC1" in fmt_up:
+        # WARNO's BC1 pages are opaque. DXT1's 3-colour block mode decodes its 4th index
+        # as alpha 0, which punched holes into diffuse maps and produced bogus _A maps
+        # (moddingSuite's TgvDecoder forces BC1 opaque for the same reason).
+        return image.convert("RGB").convert("RGBA")
     return image.convert("RGBA")
 
 
@@ -269,9 +284,9 @@ def decode_uncompressed(raw: bytes, width: int, height: int, fmt: str) -> Image.
     raise RuntimeError(f"Unsupported uncompressed format: {fmt}")
 
 
-def decode_tgv_image(info: TGVInfo, raw: bytes) -> Image.Image:
+def decode_tgv_image(info: TGVInfo, raw: bytes, bc1_opaque: bool = False) -> Image.Image:
     if "BC" in info.fmt.upper():
-        return decode_block_compressed(raw, info.width, info.height, info.fmt)
+        return decode_block_compressed(raw, info.width, info.height, info.fmt, bc1_opaque=bc1_opaque)
     return decode_uncompressed(raw, info.width, info.height, info.fmt)
 
 
@@ -410,11 +425,13 @@ def _load_atlas_map_entries(atlas_map_path: Path, asset_path: str) -> tuple[list
     if not isinstance(textures, list):
         raise RuntimeError(f"atlas map missing textures[]: {atlas_map_path}")
 
-    asset_norm = _norm_logical_ref(asset_path)
-    data_asset = _norm_logical_ref(str(data.get("asset_path", "")))
-    if asset_norm and data_asset and data_asset != asset_norm:
+    # The Atlas CLI runs with --include-sibling-assets, so a map covers the asset's whole
+    # folder and is shared by every asset in it; only the folder has to match.
+    asset_dir = str(PurePosixPath(_norm_logical_ref(asset_path)).parent)
+    data_dir = str(PurePosixPath(_norm_logical_ref(str(data.get("asset_path", "")))).parent)
+    if asset_dir not in ("", ".") and data_dir not in ("", ".") and data_dir != asset_dir:
         raise RuntimeError(
-            f"atlas map asset mismatch: map={data.get('asset_path','')} requested={asset_path}"
+            f"atlas map folder mismatch: map={data.get('asset_path','')} requested={asset_path}"
         )
 
     out: list[dict[str, Any]] = []
@@ -478,6 +495,13 @@ def _clamp_rect_to_image(rect: dict[str, int], size: tuple[int, int]) -> tuple[i
     h = max(1, int(rect.get("h", 1)))
     x2 = x + w
     y2 = y + h
+    # The Atlas CLI rounds AbsPos/SizeInPixels away from zero, so a part touching the
+    # page edge can end 1 px past it; clamp that (moddingSuite does the same) and only
+    # reject crops that genuinely leave the page.
+    if x2 == w_img + 1:
+        x2 = w_img
+    if y2 == h_img + 1:
+        y2 = h_img
     if x >= w_img or y >= h_img or x2 > w_img or y2 > h_img or x2 <= x or y2 <= y:
         raise RuntimeError(
             f"atlas crop is outside source image: rect=({x},{y},{w},{h}) image={w_img}x{h_img}"
@@ -642,10 +666,16 @@ def convert_from_atlas_map(
     only_logical_ref: str | None = None,
     manifest_out: Path | None = None,
     source_tgv: Path | None = None,
+    only_source_tgv_rel: str | None = None,
 ) -> None:
     entries, atlas_payload = _load_atlas_map_entries(atlas_map_path, asset_path)
     if only_logical_ref:
         entries = [e for e in entries if _logical_ref_matches(e.get("target_logical_rel", ""), str(only_logical_ref))]
+    if only_source_tgv_rel:
+        # Two atlas pages may declare the same target; both used to be written to the
+        # same file and the last one won, whatever source the caller had resolved.
+        wanted = _norm_logical_ref(only_source_tgv_rel)
+        entries = [e for e in entries if _norm_logical_ref(str(e.get("source_tgv_rel", ""))) == wanted]
     if not entries:
         raise RuntimeError("atlas map has no entries for selected asset/ref")
 
@@ -725,7 +755,7 @@ def convert_from_atlas_map(
             info = parse_tgv(src_tgv)
             mip_idx, offset, size, raw_size = pick_fullres_mip(info)
             raw = decompress_mip(info, offset, size, raw_size)
-            decoded = decode_tgv_image(info, raw)
+            decoded = decode_tgv_image(info, raw, bc1_opaque=True)
             src_role = detect_texture_role(src_tgv, info.fmt)
         except Exception as exc:
             # One unusable source must not sink the others. The same logical target is often
@@ -856,6 +886,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--only-logical-ref", default="", help="Optional exact logical texture ref to convert")
     parser.add_argument("--manifest-out", default="", help="Optional output path for conversion_manifest.json")
     parser.add_argument("--source-tgv", default="", help="Exact source .tgv the caller already resolved (skips the local search)")
+    parser.add_argument("--only-source-tgv-rel", default="", help="Convert only entries backed by this atlas source_tgv_rel")
     return parser
 
 
@@ -873,6 +904,7 @@ def main() -> int:
             only_logical_ref=only_logical_ref,
             manifest_out=Path(manifest_out) if manifest_out else None,
             source_tgv=Path(src_pin) if (src_pin := str(getattr(args, "source_tgv", "") or "").strip()) else None,
+            only_source_tgv_rel=str(args.only_source_tgv_rel or "").strip() or None,
         )
     except Exception as exc:
         print(f"[ERROR] {exc}")

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+# runtime caches the add-on creates next to itself
+out_blender_runtime/
+output_blender/
+warno_import.log
+config.json

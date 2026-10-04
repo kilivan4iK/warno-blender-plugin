@@ -71,7 +71,7 @@
   shipped for `win-x64`.
 - **WARNO** installed via Steam (the importer reads directly from
   `<Steam>\steamapps\common\WARNO\Data\PC\...\ZZ_*.dat`).
-- **.NET 8 runtime** (https://builds.dotnet.microsoft.com/dotnet/WindowsDesktop/9.0.14/windowsdesktop-runtime-9.0.14-win-x64.exe).
+- **.NET 9 Desktop Runtime** for the moddingSuite CLIs (https://builds.dotnet.microsoft.com/dotnet/WindowsDesktop/9.0.14/windowsdesktop-runtime-9.0.14-win-x64.exe).
 
 ### Step-by-step
 
@@ -137,17 +137,30 @@ current settings out, **Load My config** to restore them. Key fields:
 |---|---|
 | `warno_root` | Absolute path to your WARNO Steam folder. |
 | `modding_suite_root` | moddingSuite checkout (sibling `..\moddingSuite\` works). |
-| `modding_suite_atlas_cli` | Atlas CLI executable (auto-detected). |
-| `modding_suite_gfx_cli` | GFX manifest CLI executable (auto-detected). |
+| `modding_suite_atlas_cli` | Atlas CLI executable (auto-detected). An explicit path wins over the bundled `moddingSuite.exe`. |
+| `modding_suite_gfx_cli` | GFX manifest CLI executable (auto-detected). An explicit path wins over the bundled `moddingSuite.exe`. |
 | `zz_runtime_dir` | Where extracted SPK / atlas live (`out_blender_runtime/zz_runtime` by default). |
 | `cache_dir` | Asset index + atlas JSON cache (`output_blender` by default). |
 | `auto_textures` | Master toggle for texture extraction. |
-| `use_atlas_json_mapping` / `atlas_json_strict` | Use atlas JSON (recommended) and reject ambiguous mappings (recommended). |
-| `fast_exact_texture_resolve` | Take the cheap exact-name path before scanning all atlas roots. |
+| `use_atlas_json_mapping` / `atlas_json_strict` / `fast_exact_texture_resolve` | Always on (forced at runtime); kept in the file for compatibility. Textures always come from the atlas JSON. |
 | `tgv_deps_dir` / `auto_install_tgv_deps` | Where to install Pillow/zstandard, and whether to do it automatically. |
 | `auto_pull_bones`, `auto_split_main_parts`, `auto_name_materials` | Default checkbox states. |
 | `fbx_auto_smooth_mode` | `MODIFIER` / `OFF` / `APPLY`. |
 | `import_semantic_mode` | `REFERENCE` matches the developer reference `.blend` layout. |
+
+**Where the GFX manifest and atlas data come from.** The plugin extracts each
+asset's `TextureSmall.atlas` and the four GFX ndfbins (`Unit`, `Weapon`, `Depiction`,
+`DepictionResources`) from the game packs and passes them to the CLIs with
+`--atlas-file` / `--gfx-root`. On WARNO the atlases sit in the ZZ packs and the GFX
+ndfbins in `AllPlatforms/NDF/GFX` of `Data/PC/<version>/Glad.dat`. The plugin finds
+that pack by reading the dictionaries of all non-ZZ packs once per game update and
+caches the answer in `zz_runtime/.ndf_gfx_packs.json`. Only a moddingSuite build that has these options
+(branch `blender-plugin-interop`) reads them; older builds skip them. For atlases that
+changes little, since every build looks in the extracted copy first. The GFX CLI of an
+older build, however, reads `<WARNO>/Output/AllPlatforms/NDF/GFX/*.ndfbin`, a dump you
+make with the game's own export and must refresh yourself after every game patch. The
+plugin also falls back to that dump when the packs have no complete `gfx` folder, or
+when the CLI rejects the pack files or finds no unit in them.
 
 ---
 
@@ -208,8 +221,9 @@ of the SPK/FBX pipeline; others are open work.
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `ZZ runtime prepare failed: No texture DAT packages found under WARNO folder` | WARNO folder path wrong, or Steam is mid-update. | Verify `<WARNO>/Data/PC/.../ZZ_*.dat` exists; wait for Steam if downloading. |
-| `Asset not found in SPK` after WARNO updated | Cache stale. | Click **Prepare ZZ Runtime** then **Scan ALL Assets**. |
+| `Asset not found in SPK` after WARNO updated | Asset index from before the update. | Click **Scan ALL Assets** (extracted files, atlas JSON and converted PNGs refresh on their own: they are checked against the MD5 each `ZZ_*.dat` stores per file). GFX manifests refresh the same way with a moddingSuite build that has `--gfx-root`; with an older build, or when the packs have no complete `gfx` folder, they come from `<WARNO>/Output/AllPlatforms/NDF/GFX`, so redo that dump after the update (see Configuration). |
 | Newly added DLC unit doesn't appear in Browse | Asset index cache from before the update. | Same as above. |
+| `ZZ pack problem (its files are missing from the index)` in the log | A `ZZ_*.dat` could not be parsed (e.g. a new EDAT version). | Report it with the log line; every file of that patch layer is missing until it is supported. |
 | Window glass shows the wrong unit's texture | Two units in the scene; latest import owns `Vitre`. | Delete the older unit, or rename `<old>__Vitre` back to `Vitre` before exporting. |
 | Wheel cylinders lying on their side | Affects some tanks where SPK off_mat carries non-identity rotation. Should be auto-fixed for `Roue_*`. | If you still see it: open an issue with the unit name. |
 

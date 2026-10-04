@@ -12,14 +12,14 @@ import importlib.util
 import json
 import math
 import re
-import subprocess
+import os
 import sys
 import threading
 import time
 from collections import defaultdict
 from contextlib import ExitStack
 from datetime import datetime
-from itertools import combinations, permutations, product
+from itertools import combinations, product
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Sequence, Tuple
 
@@ -620,6 +620,13 @@ def _raw_scene_looks_vehicle_like(raw_name_values: Sequence[str]) -> bool:
 
 
 def _pretty_character_bip_name(raw_name: str) -> str:
+    """Display name of a Biped node, used for BOTH the armature bone and the vertex group.
+
+    The Armature modifier binds groups to bones by exact name, so the two must come from
+    one function. They used to differ ("Bip01 HeadNub" -> bone "HeadNub", group "Headnub";
+    the same for ForeArm/Toe0Nub/Finger0Nub), and those groups did not deform. The source
+    casing inside a token is kept.
+    """
     tokens = [tok for tok in re.split(r"[\s_]+", str(raw_name or "").strip()) if tok]
     if not tokens:
         return str(raw_name or "").strip()
@@ -633,12 +640,9 @@ def _pretty_character_bip_name(raw_name: str) -> str:
         elif low == "upperarm":
             pretty_tokens.append("UpperArm")
         else:
-            pretty_tokens.append(low.capitalize())
+            pretty_tokens.append(token[:1].upper() + token[1:])
     return " ".join(pretty_tokens)
 
-
-def _needs_named_auto_smooth(low_name: str) -> bool:
-    return bool(re.fullmatch(r"canon_0[23]", str(low_name or "")))
 
 
 def _has_lod_suffix(stem: str) -> bool:
@@ -704,29 +708,6 @@ def _asset_context_token(asset: str) -> str:
     return token or "ctx"
 
 
-def _unique_asset_labels(assets: Sequence[str]) -> Dict[str, str]:
-    by_name: Dict[str, List[str]] = defaultdict(list)
-    for a in assets:
-        by_name[_asset_display_name(a)].append(a)
-
-    out: Dict[str, str] = {}
-    for name, vals in by_name.items():
-        if len(vals) == 1:
-            out[vals[0]] = name
-            continue
-
-        by_ctx: Dict[str, List[str]] = defaultdict(list)
-        for a in vals:
-            by_ctx[_asset_context_token(a)].append(a)
-
-        for ctx, ctx_vals in by_ctx.items():
-            if len(ctx_vals) == 1:
-                out[ctx_vals[0]] = f"{name} · {ctx}"
-                continue
-            for i, a in enumerate(ctx_vals, start=1):
-                out[a] = f"{name} · {ctx} #{i}"
-    return out
-
 
 def _model_valid_face_stats(model: Dict[str, Any]) -> tuple[int, int, float]:
     good_faces = 0
@@ -751,119 +732,6 @@ def _model_valid_face_stats(model: Dict[str, Any]) -> tuple[int, int, float]:
     return good_faces, total_faces, ratio
 
 
-def _choose_asset_variant_for_import(extractor_mod, spk, requested_asset: str) -> tuple[str, str]:
-    req_norm = extractor_mod.normalize_asset_path(str(requested_asset or ""))
-    if not req_norm:
-        return requested_asset, ""
-    req_path = PurePosixPath(req_norm)
-    req_stem = str(req_path.stem or "")
-    req_base = _strip_lod_suffix_local(extractor_mod, req_stem).lower()
-    req_ext = str(req_path.suffix or "").lower()
-    req_low = req_norm.lower()
-    req_dest = "dest" in req_low
-    requested_is_lod = _has_lod_suffix(req_stem) or "/lods/" in req_low
-    # If user explicitly picked an LOD variant, keep it as-is.
-    # This avoids expensive candidate probing and prevents accidental fallback to base mesh.
-    if requested_is_lod:
-        return req_norm, "explicit_lod_selected"
-    prefer_non_lod = not requested_is_lod
-
-    candidates: List[str] = []
-    try:
-        entries = spk.list_entries()
-    except Exception:
-        entries = []
-    for path, _meta in entries:
-        pnorm = extractor_mod.normalize_asset_path(str(path or ""))
-        if not pnorm:
-            continue
-        pp = PurePosixPath(pnorm)
-        if req_ext and str(pp.suffix).lower() != req_ext:
-            continue
-        base = _strip_lod_suffix_local(extractor_mod, str(pp.stem)).lower()
-        if base != req_base:
-            continue
-        candidates.append(pnorm)
-
-    candidates = list(dict.fromkeys(candidates))
-    if req_norm not in candidates:
-        candidates.append(req_norm)
-    if len(candidates) <= 1:
-        return req_norm, ""
-    try:
-        requested_model = spk.get_model_geometry(req_norm)
-    except Exception:
-        requested_model = None
-    if isinstance(requested_model, dict):
-        req_good, req_total, req_ratio = _model_valid_face_stats(requested_model)
-        if req_good > 0:
-            # The requested asset decodes to real geometry: ALWAYS honour it. Never
-            # substitute a LOD sibling for an explicitly requested mesh -- that silently
-            # downgraded a HIGH import to _MID, and with it the texture atlas the whole
-            # material chain is keyed on (T-55AMV -> T55AMV_MID -> 1024px instead of 4096).
-            # A decode defect must surface as a warning, not as a quiet quality drop.
-            note = f"requested_exact good={req_good} total={req_total} ratio={req_ratio:.3f}"
-            if req_ratio < 0.98:
-                note += " WARNING partial_decode importing_requested_anyway"
-            return req_norm, note
-
-    # Only reached when the requested asset yields NO usable geometry at all. Even then a
-    # non-LOD request may never resolve to a LOD/LODS variant.
-    if prefer_non_lod:
-        candidates = [
-            c
-            for c in candidates
-            if not _has_lod_suffix(PurePosixPath(c).stem) and "/lods/" not in c.lower()
-        ]
-        if not candidates:
-            return req_norm, "requested_empty no_non_lod_alternative"
-
-    best_asset = req_norm
-    best_score = -1.0e18
-    best_note = ""
-    for cand in candidates:
-        try:
-            model = spk.get_model_geometry(cand)
-        except Exception:
-            continue
-        good, total, ratio = _model_valid_face_stats(model)
-        if good <= 0:
-            continue
-        low = cand.lower()
-        stem = PurePosixPath(cand).stem
-        has_lod = _has_lod_suffix(stem)
-        in_lods = "/lods/" in low
-        has_dest = "dest" in low
-        has_anim = "anim" in low
-
-        score = float(good) + ratio * 1200.0
-        if has_lod:
-            score -= 350.0
-        if in_lods:
-            score -= 280.0
-        if has_anim:
-            score -= 220.0
-        if req_dest == has_dest:
-            score += 100.0
-        else:
-            score -= 140.0
-        if "staticmesh" in low:
-            score += 90.0
-        if not has_dest:
-            score += 50.0
-        if prefer_non_lod and (not has_lod) and (not in_lods):
-            score += 240.0
-        if cand == req_norm:
-            score += 60.0
-
-        if score > best_score:
-            best_score = score
-            best_asset = cand
-            best_note = f"good={good} total={total} ratio={ratio:.3f}"
-
-    return best_asset, best_note
-
-
 def _resolve_path(project_root: Path, raw: str) -> Path:
     txt = str(raw or "").strip().strip('"')
     if not txt:
@@ -872,22 +740,6 @@ def _resolve_path(project_root: Path, raw: str) -> Path:
     if not p.is_absolute():
         p = project_root / p
     return p
-
-
-def _dedupe_paths(paths: Sequence[Path]) -> List[Path]:
-    out: List[Path] = []
-    seen: set[str] = set()
-    for raw in paths:
-        try:
-            p = Path(raw)
-        except Exception:
-            continue
-        key = str(p).strip().lower()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        out.append(p)
-    return out
 
 
 def _candidate_paths_from_raw(project_root: Path, raw: str) -> List[Path]:
@@ -1162,6 +1014,18 @@ def _restore_project_root_and_auto_config(settings: "WARNOImporterSettings") -> 
     _enforce_fixed_runtime_defaults(settings)
 
 
+_LOG_HANDLES: Dict[str, Any] = {}
+
+
+def _close_log_handles() -> None:
+    for fh in list(_LOG_HANDLES.values()):
+        try:
+            fh.close()
+        except Exception:
+            pass
+    _LOG_HANDLES.clear()
+
+
 def _warno_log(settings: Any, message: str, level: str = "INFO", stage: str = "") -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lvl = str(level or "INFO").upper().strip() or "INFO"
@@ -1174,10 +1038,16 @@ def _warno_log(settings: Any, message: str, level: str = "INFO", stage: str = ""
     if settings is None or not bool(getattr(settings, "log_to_file", False)):
         return
     try:
+        # One line-buffered handle per log file instead of open/append/close for every
+        # line (an import writes thousands of lines).
         path = _log_file_path(settings)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+        key = str(path)
+        fh = _LOG_HANDLES.get(key)
+        if fh is None or fh.closed:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fh = path.open("a", encoding="utf-8", buffering=1)
+            _LOG_HANDLES[key] = fh
+        fh.write(line + "\n")
     except Exception:
         pass
 
@@ -1270,40 +1140,12 @@ def _dat_signature_for_cache(
     warno_root: Path,
     game: "str | None" = None,
 ) -> tuple[tuple[str, int, int], ...]:
-    rows: List[tuple[str, int, int]] = []
     try:
         dat_files = extractor_mod.find_warno_texture_dat_files(warno_root, game=game)
     except Exception:
         dat_files = []
-    for p in dat_files:
-        try:
-            st = p.stat()
-            rows.append((str(Path(p).resolve()).lower(), int(st.st_mtime_ns), int(st.st_size)))
-        except Exception:
-            continue
-    rows.sort(key=lambda x: x[0])
-    return tuple(rows)
+    return extractor_mod.zz_dat_signature(dat_files)
 
-
-def _candidate_tgv_converter_from_modding_suite(settings: "WARNOImporterSettings") -> Path | None:
-    project_root = _project_root(settings)
-    mod_root = _autodetect_modding_suite_root(project_root, str(settings.modding_suite_root or "").strip())
-    if mod_root is None:
-        return None
-    root = Path(mod_root)
-    if not root.exists():
-        return None
-
-    cands = [root / "tgv_to_png.py"]
-    try:
-        for p in root.rglob("tgv_to_png.py"):
-            cands.append(p)
-    except Exception:
-        pass
-    for c in cands:
-        if c.exists() and c.is_file():
-            return c
-    return None
 
 
 def _iter_scenes_safe() -> List[Any]:
@@ -1355,6 +1197,8 @@ def _prepare_zz_runtime_sources(
     )
     info["runtime_root"] = str(runtime_root)
     info["source_policy"] = "zz_runtime_only"
+    for err in info.get("zz_errors", []) or []:
+        _warno_log(settings, f"ZZ pack problem (its files are missing from the index): {err}", level="WARNING", stage="zz_runtime")
 
     try:
         resolver = extractor_mod.get_zz_runtime_resolver(warno_root, game=game)
@@ -1364,6 +1208,27 @@ def _prepare_zz_runtime_sources(
         info["zz_resolver"] = resolver
     ZZ_RUNTIME_SESSION_CACHE[cache_key] = dict(info)
     return dict(info)
+
+
+def _gfx_input_log_text(gfx_input: Any) -> str:
+    """Where the GFX manifest's ndfbins came from, for the import log."""
+    if not isinstance(gfx_input, dict) or not gfx_input:
+        return ""
+    kind = str(gfx_input.get("kind", "") or "")
+    text = f" input={kind}"
+    if kind == "zz":
+        text += f" archive_dir={gfx_input.get('archive_dir', '')} pack={Path(str(gfx_input.get('pack', '') or '')).name}"
+        alternatives = gfx_input.get("alternatives") or []
+        if alternatives:
+            text += f" (not chosen: {', '.join(str(a) for a in alternatives)})"
+    else:
+        text += f" dir={gfx_input.get('dir', '')}"
+    cli_read = gfx_input.get("cli_read")
+    if isinstance(cli_read, dict) and cli_read.get("kind"):
+        text += f" cli_read={cli_read.get('kind')}"
+    if gfx_input.get("note"):
+        text += f" note={gfx_input.get('note')}"
+    return text
 
 
 def _dedupe_paths(paths: Sequence[Path]) -> List[Path]:
@@ -1380,24 +1245,6 @@ def _dedupe_paths(paths: Sequence[Path]) -> List[Path]:
         out.append(p)
     return out
 
-
-def _expand_spk_source_paths(project_root: Path, raw: str) -> List[Path]:
-    src = _resolve_path(project_root, raw)
-    if not src.exists():
-        return []
-    if src.is_file():
-        if src.suffix.lower() == ".spk":
-            return [src]
-        return []
-    if not src.is_dir():
-        return []
-
-    files: List[Path] = []
-    try:
-        files.extend(sorted(src.rglob("*.spk"), key=lambda p: str(p).lower()))
-    except Exception:
-        files = []
-    return [p for p in files if p.is_file()]
 
 
 def _spk_paths_from_runtime_info(runtime_info: Dict[str, Any], list_key: str, single_key: str, dir_key: str) -> List[Path]:
@@ -1461,49 +1308,48 @@ def _spk_scheme_rank(spk_path: Path) -> int:
     return 0
 
 
+_SPK_FAT_CACHE: Dict[Tuple[str, int, int], Dict[str, str]] = {}
+
+
+def _spk_fat_lookup(extractor_mod, spk_path: Path, game: "str | None") -> Dict[str, str]:
+    """lower-case asset path -> real path for one pack, cached per pack file version.
+    Reads only the pack header and asset table."""
+    st = Path(spk_path).stat()
+    key = (str(Path(spk_path).resolve()).lower(), int(st.st_mtime_ns), int(st.st_size))
+    cached = _SPK_FAT_CACHE.get(key)
+    if cached is None:
+        with extractor_mod.SpkMeshExtractor(Path(spk_path), game=game, fat_only=True) as spk:
+            cached = {path.lower(): path for path in spk.fat}
+        _SPK_FAT_CACHE[key] = cached
+    return cached
+
+
 def _pick_best_asset_spk_path(
     extractor_mod,
     spk_paths: Sequence[Path],
     asset: str,
     game: "str | None" = None,
 ) -> tuple[Path, str] | None:
+    """The pack that holds exactly this asset; the newer MeshPack layout wins a tie.
+
+    Used to open and fully parse every mesh pack (materials, meshes, buffers) on each
+    import and Apply Textures, then pick by a name-similarity score.
+    """
     target = extractor_mod.normalize_asset_path(str(asset or "")).lower()
-    best: tuple[int, int, str, int, str, Path, str] | None = None
+    best: tuple[int, str, Path, str] | None = None
     for spk_path in spk_paths:
         try:
-            with extractor_mod.SpkMeshExtractor(spk_path, game=game) as spk:
-                hit = spk.find_best_fat_entry_for_asset(asset)
+            real = _spk_fat_lookup(extractor_mod, Path(spk_path), game).get(target)
         except Exception:
             continue
-        if hit is None:
+        if real is None:
             continue
-        asset_real, _ = hit
-        asset_low = extractor_mod.normalize_asset_path(asset_real).lower()
-
-        score = 0
-        if asset_low == target:
-            score += 1_000_000
-        try:
-            score += int(extractor_mod.shared_suffix_score(asset_low, target) * 100)
-        except Exception:
-            pass
-        score -= len(asset_low)
-        key = (
-            score,
-            -len(asset_low),
-            asset_low,
-            _spk_scheme_rank(spk_path),
-            str(spk_path).lower(),
-            spk_path,
-            asset_real,
-        )
-        if best is None or key > best:
+        key = (_spk_scheme_rank(Path(spk_path)), str(spk_path).lower(), Path(spk_path), real)
+        if best is None or key[:2] > best[:2]:
             best = key
-
     if best is None:
         return None
-    out_path, out_asset = best[-2], best[-1]
-    return out_path, out_asset
+    return best[2], best[3]
 
 
 def _picker_view_cache_key(settings: "WARNOImporterSettings") -> str:
@@ -1541,13 +1387,6 @@ def _set_picker_view_cache(
     settings.asset_group_cache_json = "[]"
     settings.asset_folder_cache_json = "[]"
 
-
-def _enum_keys(items: Sequence[Any]) -> List[str]:
-    out: List[str] = []
-    for it in items:
-        if isinstance(it, (tuple, list)) and len(it) >= 1:
-            out.append(str(it[0]))
-    return out
 
 
 def _safe_set_selected_asset(settings: "WARNOImporterSettings", value: str) -> str:
@@ -1648,8 +1487,9 @@ def _load_asset_index_file(index_path: Path) -> Dict[str, Any] | None:
 
 def _save_asset_index_file(index_path: Path, payload: Dict[str, Any]) -> None:
     index_path.parent.mkdir(parents=True, exist_ok=True)
-    temp = index_path.with_suffix(index_path.suffix + ".tmp")
-    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Unique temp name: two builds (UI + background) must not write the same temp file.
+    temp = index_path.with_suffix(f"{index_path.suffix}.{os.getpid()}.{threading.get_ident()}.tmp")
+    temp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     temp.replace(index_path)
     try:
         st = index_path.stat()
@@ -1658,38 +1498,6 @@ def _save_asset_index_file(index_path: Path, payload: Dict[str, Any]) -> None:
     except Exception:
         pass
 
-
-def _asset_enum_items(self: "WARNOImporterSettings", _context):
-    view = _get_picker_view_cache(self)
-    assets = view.get("assets", []) if isinstance(view, dict) else []
-    if not isinstance(assets, list) or not assets:
-        raw = str(self.match_cache_json or "").strip()
-        if raw:
-            try:
-                assets = json.loads(raw)
-            except Exception:
-                assets = []
-    if not isinstance(assets, list) or not assets:
-        return [("__none__", "<no matches>", "No matches", 0)]
-
-    out_assets = [str(a) for a in assets if str(a).strip()]
-    selected = str(getattr(self, "selected_asset", "") or "").strip()
-    if selected and selected != "__none__" and selected not in out_assets:
-        out_assets.insert(0, selected)
-    labels = _unique_asset_labels(out_assets)
-    out = []
-    for i, asset in enumerate(out_assets):
-        asset_txt = str(asset)
-        label = labels.get(asset_txt, _asset_display_name(asset_txt))
-        out.append((asset_txt, label, asset_txt, i))
-    return out
-
-
-def _asset_popup_enum_items(self, context):
-    settings = getattr(getattr(context, "scene", None), "warno_import", None)
-    if settings is None:
-        return [("__none__", "<no scene settings>", "No settings", 0)]
-    return _asset_enum_items(settings, context)
 
 
 def _asset_groups_from_cache(settings: "WARNOImporterSettings") -> List[Dict[str, Any]]:
@@ -1798,134 +1606,6 @@ def _asset_folders_from_cache(settings: "WARNOImporterSettings") -> List[Dict[st
         out.append({"key": key, "label": label, "category": category, "models": models})
     return out
 
-
-def _browser_folder_items(self, context):
-    settings = getattr(getattr(context, "scene", None), "warno_import", None)
-    if settings is None:
-        return [("__none__", "<scan assets first>", "No folders", 0)]
-    folders = _asset_folders_from_cache(settings)
-    if not folders:
-        return [("__none__", "<scan assets first>", "No folders", 0)]
-    root_key = str(getattr(self, "root_key", "") or "").strip().lower()
-    category_key = str(getattr(self, "category_key", "") or "").strip().lower()
-    out = []
-    idx = 0
-    filtered = []
-    for folder in folders:
-        key = str(folder.get("key", "")).strip().lower()
-        if not key:
-            continue
-        if root_key and root_key != "__none__":
-            if key != root_key and not key.startswith(root_key + "/"):
-                continue
-        folder_cat = str(folder.get("category", "")).strip().lower() or _asset_category_from_folder_key(key).lower()
-        if category_key and category_key not in {"__all__", "__none__"} and folder_cat != category_key:
-            continue
-        filtered.append(folder)
-    filtered.sort(key=lambda f: str(f.get("key", "")).lower())
-    for folder in filtered:
-        key = str(folder.get("key", "")).strip()
-        key_low = key.lower()
-        if root_key and root_key != "__none__" and key_low.startswith(root_key):
-            rel = key_low[len(root_key) :].lstrip("/")
-        else:
-            rel = key_low
-        parts = [p for p in rel.split("/") if p]
-        if not parts:
-            label = _folder_root_label(root_key if root_key and root_key != "__none__" else key)
-        else:
-            indent = "  " * max(0, len(parts) - 1)
-            label = f"{indent}{parts[-1]}"
-        out.append((key, label, key, idx))
-        idx += 1
-    if not out:
-        return [("__none__", "<no folders>", "No folders for this root", 0)]
-    return out
-
-
-def _browser_model_items(self, context):
-    settings = getattr(getattr(context, "scene", None), "warno_import", None)
-    if settings is None:
-        return [("__none__", "<no models>", "No models", 0)]
-    folders = _asset_folders_from_cache(settings)
-    if not folders:
-        return [("__none__", "<scan assets first>", "No models", 0)]
-    folder_key = str(getattr(self, "folder_key", "") or "").strip()
-    root_key = str(getattr(self, "root_key", "") or "").strip().lower()
-    category_key = str(getattr(self, "category_key", "") or "").strip().lower()
-    filtered_folders: List[Dict[str, Any]] = []
-    for f in folders:
-        key = str(f.get("key", "")).strip().lower()
-        if not key:
-            continue
-        if root_key and root_key != "__none__":
-            if key != root_key and not key.startswith(root_key + "/"):
-                continue
-        folder_cat = str(f.get("category", "")).strip().lower() or _asset_category_from_folder_key(key).lower()
-        if category_key and category_key not in {"__all__", "__none__"} and folder_cat != category_key:
-            continue
-        filtered_folders.append(f)
-    if not filtered_folders:
-        filtered_folders = folders
-
-    target = None
-    for f in filtered_folders:
-        if str(f.get("key", "")).strip() == folder_key:
-            target = f
-            break
-    if target is None:
-        target = filtered_folders[0]
-    models = target.get("models", [])
-    if not isinstance(models, list):
-        models = []
-
-    tokens = _normalize_search_tokens(str(getattr(self, "search_text", "") or ""))
-    primaries: List[str] = []
-    for m in models:
-        p = str(m.get("primary", "")).strip()
-        if not p:
-            continue
-        blob = f"{p.lower()} {_asset_display_name(p).lower()}"
-        if tokens and not all(tok in blob for tok in tokens):
-            continue
-        primaries.append(p)
-    if not primaries:
-        return [("__none__", "<no models>", "No models for this folder/filter", 0)]
-    labels = _unique_asset_labels(primaries)
-    out = []
-    for i, p in enumerate(primaries):
-        out.append((p, labels.get(p, _asset_display_name(p)), p, i))
-    return out
-
-
-def _browser_lod_items(self, context):
-    settings = getattr(getattr(context, "scene", None), "warno_import", None)
-    if settings is None:
-        return [("__base__", "<base model>", "Use base model", 0)]
-    folders = _asset_folders_from_cache(settings)
-    if not folders:
-        return [("__base__", "<base model>", "Use base model", 0)]
-    model = str(getattr(self, "model_key", "") or "").strip()
-    target_lods: List[str] = []
-    for f in folders:
-        models = f.get("models", [])
-        if not isinstance(models, list):
-            continue
-        for m in models:
-            primary = str(m.get("primary", "")).strip()
-            if primary != model:
-                continue
-            lods_raw = m.get("lods", [])
-            if isinstance(lods_raw, list):
-                target_lods = [str(v).strip() for v in lods_raw if str(v).strip()]
-            break
-    out = [("__base__", "<base model>", "Use base model", 0)]
-    if not target_lods:
-        return out
-    labels = _unique_asset_labels(target_lods)
-    for i, lod in enumerate(target_lods, start=1):
-        out.append((lod, labels.get(lod, _asset_display_name(lod)), lod, i))
-    return out
 
 
 def _is_lod_asset_path(asset: str) -> bool:
@@ -2087,21 +1767,6 @@ def _asset_category_from_folder_key(folder_key: str) -> str:
     return domain.replace("_", " ").title() or "Other"
 
 
-def _asset_category_sort_key(name: str) -> tuple[int, str]:
-    low = str(name or "").strip().lower()
-    rank = {
-        "tanks & vehicles": 0,
-        "infantry": 1,
-        "air": 2,
-        "artillery": 3,
-        "decor": 4,
-        "props": 5,
-        "ammo": 6,
-        "fx": 7,
-        "units other": 8,
-    }.get(low, 50)
-    return (rank, low)
-
 
 def _build_asset_folders_cache(extractor_mod, groups: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     buckets: Dict[str, Dict[str, Any]] = {}
@@ -2218,7 +1883,8 @@ def _scan_assets_from_spk_paths(
     out: List[str] = []
     for spk_path in spk_paths:
         try:
-            with extractor_mod.SpkMeshExtractor(spk_path, game=game) as spk:
+            # Listing assets needs only the pack's asset table, not its materials/buffers.
+            with extractor_mod.SpkMeshExtractor(spk_path, game=game, fat_only=True) as spk:
                 for asset, _meta in spk.find_matches(query_for_scan, None):
                     txt = str(asset).strip()
                     key = txt.lower()
@@ -2398,153 +2064,6 @@ def _ensure_asset_index_sync(
     _save_asset_index_file(index_path, payload)
     return payload, "rebuilt", runtime_info, mesh_spk_paths
 
-
-def _folder_root_key(folder_key: str) -> str:
-    parts = [p for p in str(folder_key or "").strip().lower().split("/") if p]
-    if len(parts) >= 3 and parts[0] == "assets" and parts[1] == "3d":
-        return "/".join(parts[:3])
-    if parts:
-        return parts[0]
-    return "__none__"
-
-
-def _folder_root_label(root_key: str) -> str:
-    parts = [p for p in str(root_key or "").split("/") if p]
-    if not parts:
-        return "<root>"
-    tail = parts[-1]
-    return tail.replace("_", " ").title()
-
-
-def _browser_root_items(self, context):
-    settings = getattr(getattr(context, "scene", None), "warno_import", None)
-    if settings is None:
-        return [("__none__", "<scan assets first>", "No roots", 0)]
-    folders = _asset_folders_from_cache(settings)
-    if not folders:
-        return [("__none__", "<scan assets first>", "No roots", 0)]
-    roots: List[str] = []
-    seen: set[str] = set()
-    for f in folders:
-        key = _folder_root_key(str(f.get("key", "")).strip())
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        roots.append(key)
-    roots.sort()
-    out = []
-    for i, root in enumerate(roots):
-        out.append((root, _folder_root_label(root), root, i))
-    return out or [("__none__", "<scan assets first>", "No roots", 0)]
-
-
-def _browser_category_items(self, context):
-    settings = getattr(getattr(context, "scene", None), "warno_import", None)
-    if settings is None:
-        return [("__all__", "<all categories>", "No categories", 0)]
-    folders = _asset_folders_from_cache(settings)
-    if not folders:
-        return [("__all__", "<all categories>", "No categories", 0)]
-    root_key = str(getattr(self, "root_key", "") or "").strip().lower()
-    categories: List[str] = []
-    seen: set[str] = set()
-    for folder in folders:
-        key = str(folder.get("key", "")).strip().lower()
-        if not key:
-            continue
-        if root_key and root_key != "__none__":
-            if key != root_key and not key.startswith(root_key + "/"):
-                continue
-        cat = str(folder.get("category", "")).strip() or _asset_category_from_folder_key(key)
-        if not cat:
-            continue
-        cat_low = cat.lower()
-        if cat_low in seen:
-            continue
-        seen.add(cat_low)
-        categories.append(cat)
-    categories.sort(key=_asset_category_sort_key)
-    out = [("__all__", "<all categories>", "Show all categories", 0)]
-    for i, cat in enumerate(categories, start=1):
-        out.append((cat, cat, cat, i))
-    return out
-
-
-def _update_browser_root_key(self, context):
-    cat_items = _browser_category_items(self, context)
-    cat_valid = {str(it[0]) for it in cat_items if isinstance(it, (tuple, list)) and len(it) >= 1}
-    if str(getattr(self, "category_key", "") or "").strip() not in cat_valid:
-        self.category_key = "__all__"
-    items = _browser_folder_items(self, context)
-    if not items:
-        self.folder_key = "__none__"
-        return
-    valid = {str(it[0]) for it in items if isinstance(it, (tuple, list)) and len(it) >= 1}
-    if str(getattr(self, "folder_key", "") or "").strip() not in valid:
-        self.folder_key = str(items[0][0])
-
-
-def _update_browser_category_key(self, context):
-    items = _browser_folder_items(self, context)
-    if not items:
-        self.folder_key = "__none__"
-        return
-    valid = {str(it[0]) for it in items if isinstance(it, (tuple, list)) and len(it) >= 1}
-    if str(getattr(self, "folder_key", "") or "").strip() not in valid:
-        self.folder_key = str(items[0][0])
-
-
-def _update_browser_folder_key(self, context):
-    items = _browser_model_items(self, context)
-    if not items:
-        self.model_key = "__none__"
-        return
-    valid = {str(it[0]) for it in items if isinstance(it, (tuple, list)) and len(it) >= 1}
-    if str(getattr(self, "model_key", "") or "").strip() not in valid:
-        self.model_key = str(items[0][0])
-
-
-def _update_browser_search_text(self, context):
-    _update_browser_folder_key(self, context)
-
-
-def _asset_group_enum_items(self: "WARNOImporterSettings", _context):
-    groups = _asset_groups_from_cache(self)
-    if not groups:
-        return [("__none__", "<scan assets first>", "No scanned groups", 0)]
-    assets = [str(g.get("primary", "")).strip() for g in groups if str(g.get("primary", "")).strip()]
-    labels_map = _unique_asset_labels(assets)
-    out = []
-    for i, g in enumerate(groups):
-        primary = str(g.get("primary", "")).strip()
-        label = labels_map.get(primary, _asset_display_name(primary))
-        out.append((primary, label, primary, i))
-    return out
-
-
-def _asset_lod_enum_items(self: "WARNOImporterSettings", _context):
-    groups = _asset_groups_from_cache(self)
-    if not groups:
-        return [("__base__", "<no lods>", "No scanned LODs", 0)]
-    group_key = str(getattr(self, "selected_asset_group", "") or "").strip()
-    target = None
-    for g in groups:
-        if str(g.get("primary", "")).strip() == group_key:
-            target = g
-            break
-    if target is None:
-        target = groups[0]
-
-    lod_assets = [str(v).strip() for v in target.get("lods", []) if str(v).strip()]
-    labels_map = _unique_asset_labels(lod_assets)
-    out = [("__base__", "<base model>", "Use base model (not LOD)", 0)]
-    for i, lod in enumerate(lod_assets, start=1):
-        lod_txt = str(lod or "").strip()
-        if not lod_txt:
-            continue
-        label = labels_map.get(lod_txt, _asset_display_name(lod_txt))
-        out.append((lod_txt, label, lod_txt, i))
-    return out
 
 
 def _sync_group_lod_from_selected(settings: "WARNOImporterSettings"):
@@ -2890,7 +2409,7 @@ _PER_GAME_FIELDS = (
 
 # Known default install paths, used to pre-seed a game section on first switch.
 _BUILTIN_DEFAULT_INSTALL = {
-    "WARNO": r"F:\SteamLibrary\steamapps\common\WARNO",
+    "WARNO": r"C:\Program Files (x86)\Steam\steamapps\common\WARNO",
     "WARGAME_RD": r"C:\Program Files (x86)\Steam\steamapps\common\Wargame Red Dragon",
     "STEEL_DIVISION_2": r"C:\Program Files (x86)\Steam\steamapps\common\Steel Division 2",
 }
@@ -3428,7 +2947,12 @@ def _load_config_into_settings(settings: WARNOImporterSettings, path: Path) -> t
 
     settings.spk_path = get_text("spk_path", settings.spk_path)
     settings.skeleton_spk = get_text("skeleton_spk", settings.skeleton_spk)
-    settings.project_root = get_text("project_root", settings.project_root) or settings.project_root
+    # A config.json copied from another PC (or kept after moving the add-on folder) names a
+    # project root that no longer holds the add-on; taking it blindly broke every operator
+    # with "Missing module file". Only accept a root that actually contains the extractor.
+    _cfg_root = get_text("project_root", "")
+    if _cfg_root and (Path(_cfg_root) / "warno_spk_extract.py").is_file():
+        settings.project_root = _cfg_root
     settings.atlas_assets_dir = get_text("atlas_assets_dir", settings.atlas_assets_dir)
     settings.tgv_converter = get_text("tgv_converter", settings.tgv_converter) or "tgv_to_png.py"
     settings.modding_suite_atlas_wrapper = "modding_suite_atlas_export.py"
@@ -3748,7 +3272,9 @@ def _build_bone_payload(
         if sk_hit is not None:
             _, sk_meta = sk_hit
             _add_candidate(f"external_asset_match_{sk_i}", skeleton_spk, int(sk_meta.get("nodeIndex", -1)))
-        _add_candidate(f"external_same_index_{sk_i}", skeleton_spk, mesh_node_index)
+        # (No "same node index" candidate: node tables are per pack file, so reading the
+        # skeleton pack's node at the MESH pack's index injected an unrelated skeleton's
+        # names and parents.)
 
     if len(candidates) > 1:
         ext_vals: List[str] = []
@@ -3962,7 +3488,33 @@ def _build_bone_payload(
         if raw_name:
             register(raw_name, pos)
 
+    # Exact world translations from the pack's matrix stream win over the vertex
+    # centroids above and the legacy off_mat points below (that reader takes matrix
+    # 3i/3i+1/3i+2 of THREE different nodes, so roue_elev_* positions came from other
+    # nodes). An identity matrix is the pack's "unset" value (mesh carriers sit at the
+    # origin because their geometry is world-baked), so those keep the centroid.
+    exact_position_indices: set[int] = set()
+    if raw_scene_graph is not None and bool(getattr(raw_scene_graph, "exact_transforms", False)):
+        for record in list(getattr(raw_scene_graph, "records", []) or []):
+            rows = getattr(record, "exact_world_matrix", None)
+            if not isinstance(rows, (list, tuple)) or len(rows) < 3:
+                continue
+            try:
+                tx, ty, tz = float(rows[0][3]), float(rows[1][3]), float(rows[2][3])
+                if abs(tx) + abs(ty) + abs(tz) <= 1.0e-6:
+                    continue
+                pos = extractor_mod.apply_rotation(tx, ty, tz, rot)
+                bidx = int(getattr(record, "index", -1))
+            except Exception:
+                continue
+            for name in (bone_name_by_index.get(bidx), raw_bone_name_by_index.get(bidx)):
+                if name:
+                    register(name, pos, overwrite=True)
+            exact_position_indices.add(bidx)
+
     for bidx, pts in off_mat_points_by_index.items():
+        if int(bidx) in exact_position_indices:
+            continue
         if not isinstance(pts, (list, tuple)) or not pts:
             continue
         raw_pt = pts[0]
@@ -4045,24 +3597,6 @@ def _channel_hint_from_stem(stem: str) -> str | None:
     return None
 
 
-def _asset_atlas_ref_dir_candidates(extractor_mod, asset: str) -> List[str]:
-    norm = extractor_mod.normalize_asset_path(str(asset or ""))
-    if not norm:
-        return []
-    p = Path(norm)
-    parent = str(p.parent).replace("\\", "/").strip("/")
-    if not parent:
-        return []
-    out: List[str] = [parent]
-    last = p.parent.name
-    stem = p.stem
-    stem_no_lod = extractor_mod.strip_lod_suffix(stem) if hasattr(extractor_mod, "strip_lod_suffix") else stem
-    if stem_no_lod and last and stem_no_lod.lower() != last.lower():
-        parent2 = str(p.parent.parent / stem_no_lod).replace("\\", "/").strip("/")
-        if parent2:
-            out.append(parent2)
-    return list(dict.fromkeys(out))
-
 
 def _atlas_map_no_entries_error(text: str) -> bool:
     low = _norm_low(text)
@@ -4071,32 +3605,15 @@ def _atlas_map_no_entries_error(text: str) -> bool:
     return ("atlas_cli_no_entries" in low) or ("no entries for asset" in low)
 
 
-def _atlas_asset_variant_candidates(asset: str) -> List[str]:
-    raw = str(asset or "").replace("\\", "/").strip()
-    if not raw:
-        return []
-    p = PurePosixPath(raw)
-    parent = str(p.parent).strip("/")
-    stem = str(p.stem or "").strip()
-    suffix = str(p.suffix or ".fbx")
-    if not stem:
-        return [raw]
-    tokens = [t for t in stem.split("_") if t]
-    if not tokens:
-        return [raw]
-
-    candidates: List[str] = [raw]
-    known_tail = {"l", "r", "left", "right", "dest", "destroyed", "damaged", "wreck"}
-    cur = list(tokens)
-    while len(cur) > 1 and _norm_low(cur[-1]) in known_tail:
-        cur = cur[:-1]
-        cand_stem = "_".join(cur)
-        if parent:
-            candidates.append(f"{parent}/{cand_stem}{suffix}")
-        else:
-            candidates.append(f"{cand_stem}{suffix}")
-
-    return list(dict.fromkeys(candidates))
+_EXTRA_MAP_KEY_CHANNEL = {
+    "alpha": "alpha",
+    "diffuse": "diffuse",
+    "diffuse_d": "diffuse",
+    "occlusion": "occlusion",
+    "roughness": "roughness",
+    "metallic": "metallic",
+    "normal_reconstructed": "normal",
+}
 
 
 def _build_strict_grouped_maps(
@@ -4144,17 +3661,11 @@ def _build_strict_grouped_maps(
         extras = item.get("extras", {})
         if isinstance(extras, dict):
             for ek, ev in extras.items():
-                p = Path(ev)
-                token = f"{str(ek or '')} {p.stem}"
-                hint = _channel_hint_from_stem(token)
-                if hint is None and extractor_mod is not None and hasattr(extractor_mod, "channel_from_token"):
-                    try:
-                        ext_hint = extractor_mod.channel_from_token(token)
-                    except Exception:
-                        ext_hint = None
-                    hint = _canonical_map_channel_name(str(ext_hint)) if ext_hint else None
-                ch = _canonical_map_channel_name(str(hint or ""))
-                _add(group, ch, p, base_score - 5.0)
+                # The key IS the channel (find_generated_extra_maps names them). Parsing the
+                # file name instead let a unit name win: "Alpha_Jet_D" was filed as alpha and
+                # "Metallic_Box_D" as metallic, so those units lost their base colour.
+                ch = _EXTRA_MAP_KEY_CHANNEL.get(_norm_low(str(ek or ""))) or _canonical_map_channel_name(str(ek or ""))
+                _add(group, ch, Path(ev), base_score - 5.0)
 
     out: Dict[str, Dict[str, Any]] = {}
     for key, payload in groups.items():
@@ -4171,144 +3682,6 @@ def _build_strict_grouped_maps(
 def _norm_ref_like(ref: str) -> str:
     return str(ref or "").strip().replace("\\", "/").lower()
 
-
-def _score_guessed_ref(ref: str) -> int:
-    low = _norm_ref_like(ref)
-    score = 0
-    if "/tsccolor_diffusetexturenoalpha" in low:
-        score += 140
-    if "/tscnm_normaltexture" in low:
-        score += 120
-    if "/tscorm_combinedormtexture" in low:
-        score += 120
-    if "singlechannellinearmap_roughness" in low or "roughnesstexture" in low:
-        score += 116
-    if "singlechannellinearmap_metallic" in low or "metallictexture" in low:
-        score += 116
-    if "singlechannellinearmap_occlusion" in low or "occlusiontexture" in low:
-        score += 112
-    if "/tsccoloralpha_combineddatexture" in low:
-        score += 100
-    if "_trk" in low:
-        score += 40
-    if "/ui/" in low or "/icons/" in low:
-        score -= 80
-    if low.endswith(".png"):
-        score += 4
-    return score
-
-
-def _guess_texture_refs_for_asset(
-    extractor_mod,
-    asset: str,
-    atlas_assets_root: Path,
-    runtime_info: Dict[str, Any] | None = None,
-    max_refs: int = 24,
-    include_zz_scan: bool = True,
-) -> List[str]:
-    runtime_info = runtime_info or {}
-    out: List[str] = []
-    dirs = _asset_atlas_ref_dir_candidates(extractor_mod, asset)
-    if not dirs:
-        return out
-
-    zz_resolver = runtime_info.get("zz_resolver")
-    limit = max(1, int(max_refs))
-    if include_zz_scan and zz_resolver is not None:
-        try:
-            keys = zz_resolver.all_asset_keys()
-        except Exception:
-            keys = []
-        for d in dirs:
-            prefix = f"pc/atlas/{d.lower().strip('/')}/"
-            for key in keys:
-                low = _norm_ref_like(key)
-                if not (low.startswith(prefix) and (low.endswith(".tgv") or low.endswith(".png"))):
-                    continue
-                if low.endswith(".tgv"):
-                    low = low[:-4] + ".png"
-                out.append(low)
-                if len(out) >= limit:
-                    break
-            if len(out) >= limit:
-                break
-
-    for d in dirs:
-        rel_under_assets = d
-        if rel_under_assets.lower().startswith("assets/"):
-            rel_under_assets = rel_under_assets[7:]
-        folder = atlas_assets_root / Path(rel_under_assets)
-        if not folder.exists() or not folder.is_dir():
-            continue
-        try:
-            files = list(folder.glob("*.tgv")) + list(folder.glob("*.png"))
-        except Exception:
-            files = []
-        for fp in files:
-            try:
-                rel = fp.relative_to(atlas_assets_root).with_suffix(".png").as_posix()
-            except Exception:
-                continue
-            out.append(f"PC/Atlas/Assets/{rel}")
-            if len(out) >= limit:
-                break
-        if len(out) >= limit:
-            break
-
-    if not out:
-        return []
-    uniq = list(dict.fromkeys(_norm_ref_like(v) for v in out if str(v).strip()))
-    uniq.sort(key=lambda v: (-_score_guessed_ref(v), len(v), v))
-    return uniq[:limit]
-
-
-def _augment_maps_from_existing_files(
-    model_dir: Path,
-    asset: str,
-    chosen_maps: Dict[str, Path],
-) -> Dict[str, Path]:
-    out = dict(chosen_maps)
-    files = sorted(model_dir.rglob("*.png"))
-    if not files:
-        return out
-
-    wanted = {"diffuse", "normal", "roughness", "metallic", "occlusion", "alpha", "orm"}
-
-    asset_stem = _norm_low(Path(asset).stem)
-    best_by_channel: Dict[str, tuple[int, Path]] = {}
-    for p in files:
-        hint = _channel_hint_from_stem(p.stem)
-        if hint is None or hint not in wanted:
-            continue
-        score = 0
-        low_stem = _norm_low(p.stem)
-        if asset_stem and low_stem.startswith(f"{asset_stem}_"):
-            score += 40
-        if "_trk_" in low_stem:
-            score -= 8
-        if "part" in low_stem or "_mg" in low_stem:
-            score -= 10
-        if "diffuse" in low_stem and hint == "diffuse":
-            score += 8
-        if "normal_reconstructed" in low_stem and hint == "normal":
-            score += 8
-        if low_stem.endswith("_ao") and hint == "occlusion":
-            score += 8
-        if low_stem.endswith("_r") and hint == "roughness":
-            score += 6
-        if low_stem.endswith("_m") and hint == "metallic":
-            score += 6
-        if low_stem.endswith("_a") and hint == "alpha":
-            score += 6
-
-        current = best_by_channel.get(hint)
-        if current is None or score > current[0]:
-            best_by_channel[hint] = (score, p)
-
-    for channel, pair in best_by_channel.items():
-        if channel not in out:
-            out[channel] = pair[1]
-    return out
 
 
 def _cleanup_strict_legacy_alias_pngs(model_dir: Path, asset: str) -> int:
@@ -4374,6 +3747,9 @@ def _strict_atlas_item_is_track(item: Dict[str, Any], extractor_mod: Any | None 
 
 def _strict_atlas_item_channel(item: Dict[str, Any], extractor_mod: Any | None = None) -> str:
     channel = _canonical_map_channel_name(str(item.get("atlas_target_channel", "")))
+    if channel != "generic":
+        # The atlas JSON's channel is ground truth (see the note at the end).
+        return channel
     guesses: List[str] = []
     if channel == "generic":
         role_guess = _canonical_map_channel_name(str(item.get("role", "")))
@@ -4416,84 +3792,6 @@ def _strict_atlas_item_channel(item: Dict[str, Any], extractor_mod: Any | None =
     return channel
 
 
-def _pick_maps_for_material_strict_local(
-    resolved_items: Sequence[Dict[str, Any]],
-    material_role: str,
-    asset_stem: str,
-    extractor_mod: Any | None = None,
-) -> Dict[str, Path]:
-    wanted = {"diffuse", "normal", "roughness", "metallic", "occlusion", "alpha", "orm"}
-    role_low = _norm_low(material_role)
-    want_track = role_low.startswith("track")
-    stem_low = _norm_low(asset_stem)
-    best_explicit: Dict[str, tuple[float, Path]] = {}
-    best_extra: Dict[str, tuple[float, Path]] = {}
-
-    def _prefer_occlusion_short_o(path: Path) -> Path:
-        try:
-            p = Path(path)
-        except Exception:
-            return path
-        stem = p.stem
-        if stem.upper().endswith("_AO"):
-            alt = p.with_name(f"{stem[:-3]}_O{p.suffix}")
-            if alt.exists() and alt.is_file():
-                return alt
-        return p
-
-    def _add(bucket: Dict[str, tuple[float, Path]], channel: str, path: Path | None, score: float) -> None:
-        if path is None or channel not in wanted:
-            return
-        if channel == "occlusion":
-            path = _prefer_occlusion_short_o(path)
-        if not path.exists() or not path.is_file():
-            return
-        cur = bucket.get(channel)
-        if cur is None or float(score) > cur[0]:
-            bucket[channel] = (float(score), path)
-
-    for idx, item in enumerate(resolved_items):
-        out_raw = item.get("out_png")
-        out_png = Path(out_raw) if out_raw else None
-        if out_png is None:
-            continue
-        is_track = _strict_atlas_item_is_track(item, extractor_mod=extractor_mod)
-        if is_track != want_track:
-            continue
-        channel = _strict_atlas_item_channel(item, extractor_mod=extractor_mod)
-        if channel not in wanted:
-            continue
-        score = 1000.0 - float(idx)
-        base = _norm_low(str(item.get("atlas_target_basename", "") or ""))
-        if stem_low:
-            if base.startswith(f"{stem_low}_"):
-                score += 25.0
-            elif base == stem_low:
-                score += 20.0
-        _add(best_explicit, channel, out_png, score)
-
-        extras = item.get("extras", {})
-        if not isinstance(extras, dict):
-            continue
-        for ek, ev in extras.items():
-            p = Path(ev)
-            token = f"{str(ek or '')} {p.stem}"
-            hint = _channel_hint_from_stem(token)
-            if hint is None and extractor_mod is not None and hasattr(extractor_mod, "channel_from_token"):
-                try:
-                    ext_hint = extractor_mod.channel_from_token(token)
-                except Exception:
-                    ext_hint = None
-                hint = _canonical_map_channel_name(str(ext_hint)) if ext_hint else None
-            ch = _canonical_map_channel_name(str(hint or ""))
-            if ch in wanted:
-                _add(best_extra, ch, p, score - 5.0)
-
-    merged: Dict[str, Path] = {ch: src for ch, (_score, src) in best_explicit.items()}
-    for ch, (_score, src) in best_extra.items():
-        merged.setdefault(ch, src)
-    return merged
-
 
 def _ensure_occlusion_from_same_stem(maps: Dict[str, Path]) -> Dict[str, Path]:
     if not isinstance(maps, dict):
@@ -4520,251 +3818,11 @@ def _ensure_occlusion_from_same_stem(maps: Dict[str, Path]) -> Dict[str, Path]:
     return maps
 
 
-def _atlas_ref_exact_exists(
-    extractor_mod,
-    ref: str,
-    atlas_root: Path,
-    fallback_roots: Sequence[Path],
-    zz_resolver: Any | None,
-) -> bool:
-    try:
-        rel = extractor_mod.atlas_ref_to_rel_under_assets(ref)
-    except Exception:
-        return False
-    rel_png = rel.with_suffix(".png")
-    rel_tgv = rel.with_suffix(".tgv")
-
-    roots: List[Path] = [atlas_root]
-    for r in fallback_roots:
-        if r not in roots:
-            roots.append(r)
-    for root in roots:
-        try:
-            if (root / rel_png).exists() or (root / rel_tgv).exists():
-                return True
-        except Exception:
-            continue
-
-    if zz_resolver is None:
-        return False
-    candidates = [
-        f"PC/Atlas/Assets/{rel_png.as_posix()}",
-        f"PC/Atlas/Assets/{rel_tgv.as_posix()}",
-        f"Assets/{rel_png.as_posix()}",
-        f"Assets/{rel_tgv.as_posix()}",
-    ]
-    for cand in candidates:
-        try:
-            if zz_resolver.find_exact(cand) is not None:
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def _build_fast_companion_refs(extractor_mod, refs: Sequence[str], cap: int = 24) -> List[str]:
-    if not refs:
-        return []
-    tokens = [
-        "tsccolor_diffusetexturenoalpha",
-        "tscnm_normaltexture",
-        "tscorm_combinedormtexture",
-        "tscorm_combinedrmtexture",
-        "tsccoloralpha_combineddatexture",
-        "singlechannellinearmap_roughnesstexture",
-        "singlechannellinearmap_metallictexture",
-        "singlechannellinearmap_occlusiontexture",
-        "singlechannellinearmap_alphatexture",
-    ]
-    out: List[str] = []
-    max_refs = max(1, int(cap))
-    for ref in refs:
-        try:
-            rel = extractor_mod.atlas_ref_to_rel_under_assets(ref)
-        except Exception:
-            continue
-        stem = str(rel.stem or "")
-        stem_low = stem.lower()
-        source_token = ""
-        for tok in tokens:
-            if tok in stem_low:
-                source_token = tok
-                break
-        if not source_token:
-            continue
-        for target_token in tokens:
-            if target_token == source_token:
-                continue
-            cand_stem = re.sub(source_token, target_token, stem, flags=re.IGNORECASE)
-            cand_rel = rel.with_name(f"{cand_stem}.png")
-            out.append(f"PC/Atlas/Assets/{cand_rel.as_posix()}")
-            if len(out) >= max_refs * 3:
-                break
-        if len(out) >= max_refs * 3:
-            break
-    uniq = list(dict.fromkeys(out))
-    return uniq[: max_refs * 3]
-
-
-def _size_area(size: tuple[int, int] | None) -> float:
-    if size is None:
-        return 0.0
-    return float(size[0] * size[1])
-
-
-def _size_mismatch(size: tuple[int, int] | None, target: tuple[int, int] | None) -> float | None:
-    if size is None or target is None:
-        return None
-    tw, th = target
-    dw = abs(float(size[0] - tw)) / max(1.0, float(tw))
-    dh = abs(float(size[1] - th)) / max(1.0, float(th))
-    return max(dw, dh)
-
-
-def _pick_track_diffuse_override(
-    extractor_mod,
-    resolved_items: Sequence[Dict[str, Any]],
-    current_diffuse: Path | None,
-) -> Path | None:
-    size_fn = getattr(extractor_mod, "read_png_size", None)
-    if not callable(size_fn):
-        return None
-
-    def _sz(p: Path) -> tuple[int, int] | None:
-        try:
-            return size_fn(Path(p))
-        except Exception:
-            return None
-
-    ch_from_token = getattr(extractor_mod, "channel_from_token", None)
-    track_targets: List[tuple[int, int]] = []
-    all_targets: List[tuple[int, int]] = []
-    diffuse_candidates: List[tuple[Path, str, str, str]] = []
-
-    for item in resolved_items:
-        role = str(item.get("role", ""))
-        atlas_ref = str(item.get("atlas_ref", ""))
-        extras = item.get("extras", {})
-        out_png_raw = item.get("out_png")
-        out_png = Path(out_png_raw) if out_png_raw else None
-        if not isinstance(extras, dict):
-            extras = {}
-
-        if role == "diffuse" and out_png is not None:
-            diffuse_candidates.append((out_png, role, "", atlas_ref))
-        if role == "combined_da":
-            diff = extras.get("diffuse")
-            if diff:
-                diffuse_candidates.append((Path(diff), role, "diffuse", atlas_ref))
-            elif out_png is not None:
-                diffuse_candidates.append((out_png, role, "", atlas_ref))
-
-        for ek, ev in extras.items():
-            p = Path(ev)
-            token = f"{ek} {p.stem}"
-            ch = ch_from_token(token) if callable(ch_from_token) else _channel_hint_from_stem(token)
-            if ch == "diffuse":
-                diffuse_candidates.append((p, role, str(ek), atlas_ref))
-            if ch in {"normal", "roughness", "metallic", "occlusion"}:
-                s = _sz(p)
-                if s is not None:
-                    all_targets.append(s)
-                    low = _norm_low(token)
-                    if extractor_mod.is_track_token(low) or extractor_mod.is_track_token(_norm_low(atlas_ref)):
-                        track_targets.append(s)
-
-    if not diffuse_candidates:
-        return None
-
-    target = None
-    if track_targets:
-        target = max(track_targets, key=lambda t: t[0] * t[1])
-    elif all_targets:
-        target = max(all_targets, key=lambda t: t[0] * t[1])
-
-    cur = Path(current_diffuse) if current_diffuse else None
-    cur_key = _norm_ref_like(str(cur)) if cur is not None else ""
-
-    def _cand_score(path: Path, role: str, extra_key: str, atlas_ref: str) -> float:
-        low = _norm_low(path.stem)
-        low_ref = _norm_low(atlas_ref)
-        low_key = _norm_low(extra_key)
-        score = 0.0
-        if role == "combined_da":
-            score += 40.0
-        if "combinedda" in low or "coloralpha" in low:
-            score += 35.0
-        if "diffusetexturenoalpha" in low:
-            score += 22.0
-        if extractor_mod.is_track_token(low) or extractor_mod.is_track_token(low_ref) or extractor_mod.is_track_token(low_key):
-            score += 28.0
-        if low_key == "diffuse":
-            score += 8.0
-        sz = _sz(path)
-        mm = _size_mismatch(sz, target)
-        if mm is not None:
-            if mm > 0.38:
-                score -= 120.0
-            elif mm > 0.22:
-                score -= 36.0
-            else:
-                score += max(0.0, 34.0 - 70.0 * mm)
-        if cur is not None and _norm_ref_like(str(path)) == cur_key:
-            score += 12.0
-        try:
-            score += min(12.0, max(0.0, float(path.stat().st_size) / 65536.0))
-        except Exception:
-            pass
-        return score
-
-    ranked = sorted(
-        (( _cand_score(p, r, ek, ar), p) for p, r, ek, ar in diffuse_candidates),
-        key=lambda it: (it[0], _size_area(_sz(it[1]))),
-        reverse=True,
-    )
-    if not ranked:
-        return None
-    best_score, best_path = ranked[0]
-    if cur is None:
-        return best_path if best_score >= 0.0 else None
-
-    cur_score = None
-    for score, path in ranked:
-        if _norm_ref_like(str(path)) == cur_key:
-            cur_score = score
-            break
-    if cur_score is None:
-        cur_score = -10.0
-
-    # Replace only when candidate is clearly better.
-    if best_score >= cur_score + 8.0:
-        return best_path
-    return None
-
 
 def _material_key(name: str) -> str:
     low = _norm_low(name)
     return re.sub(r"\.[0-9]{3}$", "", low)
 
-
-def _collect_zz_candidates_for_ref(zz_resolver, ref: str) -> List[str]:
-    norm = str(ref or "").strip().replace("\\", "/").lower()
-    base = Path(norm).name.lower()
-    if not base:
-        return []
-    names = [base]
-    if base.endswith(".png"):
-        names.append(base[:-4] + ".tgv")
-    elif base.endswith(".tgv"):
-        names.append(base[:-4] + ".png")
-    if "combinedrmtexture" in base:
-        names.append(base.replace("combinedrmtexture", "combinedormtexture"))
-    if "combinedormtexture" in base:
-        names.append(base.replace("combinedormtexture", "combinedrmtexture"))
-    out: List[str] = []
-    for nm in names:
-        out.extend(zz_resolver._basename_to_keys.get(nm, []))
-    return list(dict.fromkeys(out))
 
 
 def _filter_atlas_targets_by_materials(
@@ -5118,170 +4176,6 @@ def _resolve_rd_textures(
     return maps_by_name, report
 
 
-def _repair_track_uv_seams(mesh, uv_layer, bucket_uvs, thresh=0.4):
-    """Un-stretch the few RD-track triangles that straddle the texture wrap, KEEPING the
-    exact decoded game UV on every other triangle (1:1). The codec's `& mask` collapses
-    the texture wrap edge to 0, so a handful of triangles get one corner on the opposite
-    side of the tile from the others; mapped onto the CombinedDAS sub-rect they smear the
-    texture diagonally across the triangle ("трикутники летять"). They can't be made
-    contiguous inside a single sub-rect copy (shifting a corner by a tile would leave the
-    rect and sample the chains). So collapse each such triangle's UV to its centroid: it
-    then samples ONE texel (flat) instead of a smear. The track diffuse is near-uniform
-    dark scaly, so a flat triangle is invisible — only the stretched artefact is removed.
-    Every non-straddling triangle keeps its exact decoded UV. RD/SD2 track only."""
-    n = len(bucket_uvs)
-    for poly in mesh.polygons:
-        loops = list(poly.loop_indices)
-        vis = [mesh.loops[li].vertex_index for li in loops]
-        us = [bucket_uvs[vi][0] if vi < n else 0.0 for vi in vis]
-        vs = [bucket_uvs[vi][1] if vi < n else 0.0 for vi in vis]
-        if (max(us) - min(us) > thresh) or (max(vs) - min(vs) > thresh):
-            cu = sum(us) / len(us); cv = sum(vs) / len(vs)
-            for li in loops:
-                uv_layer.data[li].uv = (cu, cv)
-        else:
-            for li, vi in zip(loops, vis):
-                uv_layer.data[li].uv = bucket_uvs[vi] if vi < n else (0.0, 0.0)
-
-
-def _crop_scaly_for_track(combined_png):
-    """Crop the scaly-armour chunk out of a unit's CombinedDAS for use as a TILING track
-    tread texture. CombinedDAS = scaly armour (image top-left) + sawtooth teeth (right
-    edge) + ball-chains (bottom); the track has no dedicated tread texture, so the scaly
-    armour is the closest usable one. Crop a clean inner chunk (no teeth, no chains) that
-    tiles under REPEAT along the tube-unwrapped belt. Returns a Path or None."""
-    try:
-        from PIL import Image
-        p = Path(str(combined_png))
-        im = Image.open(str(p)).convert("RGB")
-        W, H = im.size
-        crop = im.crop((int(0.06 * W), int(0.04 * H), int(0.62 * W), int(0.42 * H)))
-        out = p.with_name(p.stem + "_trackscaly.png")
-        crop.save(str(out))
-        return out
-    except Exception:
-        return None
-
-
-def _cube_project_track_uv(mesh, uv_layer, tiles=40.0):
-    """Per-face triplanar (cube) UV for an RD track (chenille) belt. The belt has faces in
-    several orientations — the radial TREAD faces AND the flat ±side faces you see from the
-    side. A single tube/cylindrical unwrap gives the side faces a DEGENERATE UV (constant
-    across one axis -> the chevron/herringbone smear). Triplanar projects EACH face onto
-    its own dominant-axis plane at a uniform world scale, so every face — tread or side —
-    gets a clean, non-stretched, tiling map. Paired with the REPEAT scaly-crop material.
-    `tiles` sets texel density (bbox span / tiles per repeat). RD/SD2 track only."""
-    verts = mesh.vertices
-    if len(verts) == 0:
-        return
-    xs = [v.co.x for v in verts]; ys = [v.co.y for v in verts]; zs = [v.co.z for v in verts]
-    span = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)) or 1.0
-    S = (span / float(tiles)) or 1.0
-    for poly in mesh.polygons:
-        nm = poly.normal
-        ax, ay, az = abs(nm.x), abs(nm.y), abs(nm.z)
-        if ax >= ay and ax >= az:
-            comp = 0
-        elif ay >= az:
-            comp = 1
-        else:
-            comp = 2
-        for li, vi in zip(poly.loop_indices, poly.vertices):
-            co = verts[vi].co
-            if comp == 0:
-                uu, vv = co.y, co.z
-            elif comp == 1:
-                uu, vv = co.x, co.z
-            else:
-                uu, vv = co.x, co.y
-            uv_layer.data[li].uv = (uu / S, vv / S)
-
-
-def _tube_unwrap_track(verts):
-    """Tube/cylindrical UV unwrap for an RD track (chenille) belt — fixes the texture
-    stretch at the CURVED ends that the decoded file UV has (the game regenerates a
-    per-link UV at runtime via IndexedChenilles; that runtime UV is not in the file, so
-    the file UV maps the belt as if flat and smears around the idler/sprocket).
-
-    The belt is a closed loop band. We unwrap it as a tube: U = arc length around the
-    loop, V = position across the belt width — giving uniform, square texels everywhere
-    INCLUDING the curves. Robust to the model's orientation and to the part holding BOTH
-    tracks (left+right): PCA finds the principal axes; the most BIMODAL axis is the
-    width/separation axis (the gap between the two tracks); the loop lies in the other
-    two axes. Each track is unwrapped independently around its own centre.
-
-    `verts` is a flat list of (x,y,z) in the SAME space the mesh is built in (bucket
-    space). Returns a per-vertex list of (u,v); U tiles along the belt (≈ perimeter/width
-    so texels stay square), V in [0,1] across the width. Caller folds V into the texture
-    sub-rect. RD/SD2 track only — never called for WARNO geometry."""
-    import numpy as np
-    import math as _m
-    P = np.asarray(verts, dtype=float).reshape(-1, 3)
-    n = len(P)
-    out = [(0.0, 0.0)] * n
-    if n < 6:
-        return out
-    c = P.mean(0)
-    Q = P - c
-    # PCA (eigh -> ascending eigenvalues; columns are axes)
-    try:
-        w, v = np.linalg.eigh(Q.T @ Q)
-    except Exception:
-        return out
-    A = Q @ v   # projections onto principal axes
-    # Width/separation axis = the most bimodal projection (largest empty central gap).
-    def _gap(vals):
-        if vals.max() - vals.min() < 1e-6:
-            return 0
-        h, _ = np.histogram(vals, bins=12)
-        return int((h[3:9] == 0).sum())
-    waxis = int(np.argmax([_gap(A[:, i]) for i in range(3)]))
-    other = [i for i in range(3) if i != waxis]
-    wv = A[:, waxis]
-    split = (wv.max() + wv.min()) / 2.0   # between the two track clusters
-    res = np.zeros((n, 2))
-    N = 240
-    for side in (0, 1):
-        mask = (wv < split) if side == 0 else (wv >= split)
-        idx = np.where(mask)[0]
-        if len(idx) < 3:
-            continue
-        a = A[idx][:, other[0]]
-        b = A[idx][:, other[1]]
-        ws = A[idx][:, waxis]
-        ca = a.mean(); cb = b.mean()
-        th = np.arctan2(b - cb, a - ca)               # angle around the loop
-        binix = (((th + _m.pi) / (2 * _m.pi)) * N).astype(int) % N
-        cent = np.zeros((N, 2)); cnt = np.zeros(N)
-        for k in range(len(idx)):
-            bi = binix[k]; cent[bi, 0] += a[k]; cent[bi, 1] += b[k]; cnt[bi] += 1
-        filled = [bi for bi in range(N) if cnt[bi] > 0]
-        if len(filled) < 3:
-            continue
-        for bi in filled:
-            cent[bi] /= cnt[bi]
-        # cumulative TRUE arc length around the ordered loop (not raw angle -> no end
-        # compression on the elongated stadium loop)
-        arclen = np.zeros(N); cum = 0.0
-        for i in range(1, len(filled)):
-            p = cent[filled[i]]; qq = cent[filled[i - 1]]
-            cum += _m.hypot(p[0] - qq[0], p[1] - qq[1]); arclen[filled[i]] = cum
-        p = cent[filled[0]]; qq = cent[filled[-1]]
-        perim = cum + _m.hypot(p[0] - qq[0], p[1] - qq[1])
-        if perim < 1e-6:
-            perim = 1.0
-        width = float(ws.max() - ws.min()) or 1.0
-        tiles = perim / width                          # square texels
-        wmin = float(ws.min())
-        for k in range(len(idx)):
-            bi = binix[k]
-            al = arclen[bi]
-            if cnt[bi] == 0:
-                bi = min(filled, key=lambda x: abs(x - bi)); al = arclen[bi]
-            res[idx[k], 0] = al / perim * tiles
-            res[idx[k], 1] = (ws[k] - wmin) / width
-    return [(float(res[i, 0]), float(res[i, 1])) for i in range(n)]
-
 
 def _split_track_chains_textures(model, material_name_by_id, maps_by_name):
     """RD/SD2: split the shared CombinedDAS atlas into a separate TRACKS texture (the tread
@@ -5335,11 +4229,15 @@ def _split_track_chains_textures(model, material_name_by_id, maps_by_name):
             _mm = (maps_by_name or {}).get(_nm)
             if _nm and _name_rx.match(_nm) and isinstance(_mm, dict) and _mm.get("rd_material"):
                 named_mids.add(int(_mid))
+        # Red Dragon only (rd_material marker), like named_mids above: a WARNO material
+        # whose name merely contains "chain" ("chaine") had its diffuse cropped in half.
         chain_mids = {
             int(p["material"]) for p in parts
             if p.get("material") is not None and int(p["material"]) not in track_mids
             and int(p["material"]) not in named_mids
             and "chain" in mname(p["material"]).lower()
+            and isinstance((maps_by_name or {}).get(mname(p["material"])), dict)
+            and (maps_by_name or {}).get(mname(p["material"])).get("rd_material")
         }
         # BODY materials mis-classified as cutout: the hull's CombinedDAS alpha can carry a small
         # genuine-cutout SUB-REGION, so alpha_cutout gets set for the whole material and the hull
@@ -5553,16 +4451,22 @@ def _resolve_material_maps(
     report["atlas_source"] = atlas_source
     bundled_converter = project_root / "tgv_to_png.py"
     converter = bundled_converter
-    converter_text = str(bundled_converter)
     converter_source = "bundled"
 
-    if not atlas_raw_text:
-        raise RuntimeError("Atlas Assets path is empty.")
-    atlas_raw = _resolve_path(project_root, atlas_raw_text)
-    if not atlas_raw.exists() or not atlas_raw.is_dir():
-        raise RuntimeError(f"Atlas Assets folder not found: {atlas_raw}")
-    if not converter.exists() or not converter.is_file():
-        raise RuntimeError(f"Bundled TGV converter not found: {converter}")
+    # A broken texture setup is reported and the geometry still imports (it used to
+    # raise here and cancel the whole import as "Import prep failed").
+    setup_error = ""
+    atlas_raw = _resolve_path(project_root, atlas_raw_text) if atlas_raw_text else None
+    if atlas_raw is None:
+        setup_error = "Atlas Assets path is empty."
+    elif not atlas_raw.is_dir():
+        setup_error = f"Atlas Assets folder not found: {atlas_raw}"
+    elif not converter.is_file():
+        setup_error = f"Bundled TGV converter not found: {converter}"
+    if setup_error:
+        _warno_log(settings, f"texture setup: {setup_error}", level="ERROR", stage="texture")
+        report["errors"].append({"atlas_ref": "__setup__", "error": setup_error})
+        return maps_by_name, report
     report["converter_source"] = converter_source
 
     atlas_root = extractor_mod.resolve_atlas_assets_root(atlas_raw)
@@ -5605,7 +4509,9 @@ def _resolve_material_maps(
         atlas_cli_path_text = str(settings.modding_suite_atlas_cli or "").strip()
         atlas_cli_path = _resolve_path(project_root, atlas_cli_path_text) if atlas_cli_path_text else None
         atlas_cache_root = _atlas_json_cache_root(settings)
-        atlas_candidates = _atlas_asset_variant_candidates(asset)
+        # One run per folder answers for every asset in it (--include-sibling-assets), so
+        # retrying with name variants ("_L", "_dest" stripped) only repeated the same run.
+        atlas_candidates = [asset]
         if not warno_root_for_atlas.exists() or not warno_root_for_atlas.is_dir():
             atlas_init_error = f"WARNO folder for Atlas JSON not found: {warno_root_for_atlas}"
         elif not modsuite_root.exists() or not modsuite_root.is_dir():
@@ -5623,6 +4529,8 @@ def _resolve_material_maps(
                         force_rebuild=False,
                         timeout_sec=max(5, int(settings.atlas_cli_timeout_sec)),
                         game=_normalize_game_id(getattr(settings, "game_preset", "WARNO")),
+                        zz_resolver=zz_resolver,
+                        zz_runtime_root=Path(zz_runtime_root_text) if zz_runtime_root_text else None,
                     )
                     atlas_map_path_text = str(atlas_map_info.get("atlas_map_path", "")).strip()
                     atlas_map_path = Path(atlas_map_path_text) if atlas_map_path_text else None
@@ -5680,8 +4588,14 @@ def _resolve_material_maps(
         refs = spk.find_texture_refs_for_asset(asset, material_ids=material_ids)
     refs = extractor_mod.unique_keep_order(refs) if hasattr(extractor_mod, "unique_keep_order") else list(dict.fromkeys(refs))
 
-    atlas_json_enabled = bool(settings.use_atlas_json_mapping and atlas_map_index)
-    strict_atlas_mode = bool(atlas_json_enabled and settings.atlas_json_strict)
+    # The atlas JSON is the only texture source for WARNO (use_atlas_json_mapping and
+    # atlas_json_strict are forced on); without it there is nothing exact to bind.
+    if not atlas_map_index:
+        report["errors"].append({"atlas_ref": "__atlas_json__", "error": "missing_source: atlas json mapping is empty"})
+        report["atlas_mode"] = "json_export_failed"
+        return maps_by_name, report
+    atlas_json_enabled = True
+    strict_atlas_mode = True
     if strict_atlas_mode:
         removed_legacy = _cleanup_strict_legacy_alias_pngs(model_dir=model_dir, asset=asset)
         if removed_legacy > 0:
@@ -5729,62 +4643,6 @@ def _resolve_material_maps(
                 f"refs fallback from atlas map targets: {len(refs)}",
                 stage="refs_resolve",
             )
-    guessed_refs: List[str] = []
-    if not atlas_json_enabled:
-        if refs and bool(settings.use_zz_dat_source) and bool(settings.fast_exact_texture_resolve):
-            companion = _build_fast_companion_refs(extractor_mod, refs, cap=24)
-            companion_exact = [
-                ref
-                for ref in companion
-                if _atlas_ref_exact_exists(
-                    extractor_mod=extractor_mod,
-                    ref=ref,
-                    atlas_root=atlas_root,
-                    fallback_roots=fallback_atlas_roots,
-                    zz_resolver=zz_resolver,
-                )
-            ]
-            if companion_exact:
-                refs = extractor_mod.unique_keep_order(list(refs) + list(companion_exact)) if hasattr(extractor_mod, "unique_keep_order") else list(dict.fromkeys(list(refs) + list(companion_exact)))
-        elif refs:
-            try:
-                guessed_refs = _guess_texture_refs_for_asset(
-                    extractor_mod=extractor_mod,
-                    asset=asset,
-                    atlas_assets_root=atlas_root,
-                    runtime_info=runtime_info,
-                    max_refs=48,
-                    include_zz_scan=bool(settings.use_zz_dat_source),
-                )
-            except Exception:
-                guessed_refs = []
-            if guessed_refs:
-                low_refs = [str(r).lower() for r in refs]
-                has_nm = any(("normaltexture" in r) or ("_nm" in r) or ("/tscnm_" in r) for r in low_refs)
-                has_orm = any(
-                    ("combinedorm" in r)
-                    or ("combinedrm" in r)
-                    or ("roughnesstexture" in r)
-                    or ("singlechannellinearmap_roughness" in r)
-                    or ("singlechannellinearmap_metallic" in r)
-                    for r in low_refs
-                )
-                if (not has_nm) or (not has_orm) or len(refs) <= 2:
-                    refs = extractor_mod.unique_keep_order(list(refs) + list(guessed_refs)) if hasattr(extractor_mod, "unique_keep_order") else list(dict.fromkeys(list(refs) + list(guessed_refs)))
-        elif not refs:
-            try:
-                guessed_refs = _guess_texture_refs_for_asset(
-                    extractor_mod=extractor_mod,
-                    asset=asset,
-                    atlas_assets_root=atlas_root,
-                    runtime_info=runtime_info,
-                    max_refs=24,
-                    include_zz_scan=bool(settings.use_zz_dat_source),
-                )
-            except Exception:
-                guessed_refs = []
-            refs = guessed_refs
-
     _warno_log(settings, f"stage: refs_resolve refs={len(refs)}", stage="refs_resolve")
     report["refs"] = list(refs)
     report["refs_by_material"] = {
@@ -5796,12 +4654,6 @@ def _resolve_material_maps(
     resolved: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     resolved_by_ref: Dict[str, dict[str, Any]] = {}
-    used_bundled_fallback = False
-    allow_bundled_fallback = (
-        converter_source == "custom"
-        and bundled_converter.exists()
-        and bundled_converter.is_file()
-    )
     deps_dir = _resolve_path(project_root, str(settings.tgv_deps_dir or "").strip() or ".warno_pydeps")
     stage_start = time.monotonic()
     stage_timeout_sec = max(30, int(settings.texture_stage_timeout_sec))
@@ -5873,50 +4725,20 @@ def _resolve_material_maps(
             resolved.append(item)
             resolved_by_ref[str(item.get("atlas_ref", ""))] = item
         except Exception as tex_exc:
-            if allow_bundled_fallback:
-                try:
-                    item = _resolve_with_converter(bundled_converter)
-                    resolved.append(item)
-                    resolved_by_ref[str(item.get("atlas_ref", ""))] = item
-                    used_bundled_fallback = True
-                    continue
-                except Exception as tex_exc2:
-                    tex_exc = tex_exc2
             errors.append({"atlas_ref": ref, "error": str(tex_exc)})
 
     # Strict resolve policy:
     # Do not auto-convert parent ZZ folders when direct refs failed. It can pull wrong textures.
     report["errors"] = errors
-    if used_bundled_fallback:
-        report["converter_source"] = "bundled"
 
-    strict_picker = None
-    if strict_atlas_mode:
-        if hasattr(extractor_mod, "pick_maps_for_material_from_atlas_resolved"):
-            strict_picker = lambda items, role: extractor_mod.pick_maps_for_material_from_atlas_resolved(
-                resolved_items=items,
-                material_role=role,
-                asset_stem=Path(asset).stem,
-            )
-        else:
-            _warno_log(
-                settings,
-                "strict atlas picker fallback: extractor helper missing, using local deterministic picker",
-                level="WARNING",
-                stage="texture",
-            )
-            strict_picker = lambda items, role: _pick_maps_for_material_strict_local(
-                resolved_items=items,
-                material_role=role,
-                asset_stem=Path(asset).stem,
-                extractor_mod=extractor_mod,
-            )
+    def strict_picker(items, role):
+        return extractor_mod.pick_maps_for_material_from_atlas_resolved(
+            resolved_items=items,
+            material_role=role,
+            asset_stem=Path(asset).stem,
+        )
 
-    if strict_atlas_mode and strict_picker is not None:
-        chosen_maps = strict_picker(resolved, "other")
-    else:
-        chosen_maps = extractor_mod.pick_material_maps_from_textures(resolved)
-        chosen_maps = _augment_maps_from_existing_files(model_dir=model_dir, asset=asset, chosen_maps=chosen_maps)
+    chosen_maps = strict_picker(resolved, "other")
     named_maps: Dict[str, Path] = {}
     named_files: list[dict[str, str]] = []
     if chosen_maps:
@@ -6073,7 +4895,10 @@ def _resolve_material_maps(
                                 break
                 refs_mid = refs_by_material.get(int(mid), [])
                 resolved_mid = [resolved_by_ref[ref] for ref in refs_mid if ref in resolved_by_ref]
-                basis = resolved_mid if resolved_mid else resolved
+                # Only a material with NO texture binding at all falls back to the unit's
+                # other textures; one whose own bindings failed stays untextured (logged)
+                # instead of picking up a neighbour's diffuse.
+                basis = resolved_mid if refs_mid else resolved
                 maps: Dict[str, Path] = {}
                 used_group_key = ""
                 want_track = role_for_pick.startswith("track")
@@ -6120,8 +4945,6 @@ def _resolve_material_maps(
                         stage="textures",
                     )
                     maps = strict_picker(basis, role_for_pick)
-                if not maps and basis is not resolved:
-                    maps = strict_picker(resolved, role_for_pick)
                 if not isinstance(maps, dict):
                     maps = {}
                 # Only use broad strict role fill when we do not have an exact
@@ -6132,82 +4955,6 @@ def _resolve_material_maps(
                     if isinstance(fill, dict):
                         for ch, src in fill.items():
                             maps.setdefault(ch, src)
-                    if basis is not resolved:
-                        fill_all = strict_picker(resolved, role_for_pick)
-                        if isinstance(fill_all, dict):
-                            for ch, src in fill_all.items():
-                                maps.setdefault(ch, src)
-                maps_by_name[mname] = _ensure_occlusion_from_same_stem(maps)
-        else:
-            if settings.auto_rename_textures:
-                named_maps, named_files = extractor_mod.build_named_texture_aliases(
-                    asset=asset,
-                    model_dir=model_dir,
-                    resolved=resolved,
-                    chosen_maps=chosen_maps,
-                )
-            map_for_materials = named_maps or chosen_maps
-            track_named_maps = extractor_mod.track_maps_from_named(named_files) if named_files else {"generic": {}, "left": {}, "right": {}}
-            for mid in material_ids:
-                mname = material_name_by_id.get(int(mid), f"Material_{int(mid):03d}")
-                role = str(material_role_by_id.get(int(mid), "other"))
-                refs_mid = refs_by_material.get(int(mid), [])
-                resolved_mid = [resolved_by_ref[ref] for ref in refs_mid if ref in resolved_by_ref]
-                maps = extractor_mod.pick_material_maps_from_textures(resolved_mid) if resolved_mid else {}
-                is_track_role = role.startswith("track")
-                if maps and named_files:
-                    if hasattr(extractor_mod, "remap_maps_to_named_sources"):
-                        maps = extractor_mod.remap_maps_to_named_sources(maps, named_files)
-                    else:
-                        def _path_key(path_value: Path) -> str:
-                            try:
-                                return str(path_value.resolve()).lower()
-                            except Exception:
-                                return str(path_value).lower()
-
-                        src_to_named: Dict[str, Path] = {}
-                        for item in named_files:
-                            src_raw = str(item.get("source", "")).strip()
-                            named_raw = str(item.get("named", "")).strip()
-                            if not src_raw or not named_raw:
-                                continue
-                            src_to_named[_path_key(Path(src_raw))] = Path(named_raw)
-                        remapped: Dict[str, Path] = {}
-                        for ch, src in maps.items():
-                            p = Path(src) if not isinstance(src, Path) else src
-                            remapped[ch] = src_to_named.get(_path_key(p), p)
-                        maps = remapped
-
-                if not maps:
-                    maps = {}
-                    for ch, src in map_for_materials.items():
-                        if is_track_role and ch == "diffuse":
-                            continue
-                        maps[ch] = src
-                else:
-                    for ch, src in map_for_materials.items():
-                        if is_track_role and ch == "diffuse":
-                            continue
-                        maps.setdefault(ch, src)
-
-                if role == "track_left":
-                    maps.update(track_named_maps.get("left", {}))
-                elif role == "track_right":
-                    maps.update(track_named_maps.get("right", {}))
-                elif role.startswith("track"):
-                    maps.update(track_named_maps.get("generic", {}))
-
-                if is_track_role:
-                    override = _pick_track_diffuse_override(
-                        extractor_mod=extractor_mod,
-                        resolved_items=resolved_mid or resolved,
-                        current_diffuse=maps.get("diffuse"),
-                    )
-                    if override is not None:
-                        maps["diffuse"] = override
-                    elif "diffuse" not in maps and "diffuse" in map_for_materials:
-                        # Last-resort fallback to avoid untextured tracks.
-                        maps["diffuse"] = map_for_materials["diffuse"]
                 maps_by_name[mname] = _ensure_occlusion_from_same_stem(maps)
 
     channel_set: set[str] = set(chosen_maps.keys())
@@ -6464,93 +5211,6 @@ def _peel_track_islands_from_wheels(buckets: List[dict]) -> List[dict]:
             pass
     return out
 
-
-def _rename_lod_parts_by_geometry(collection, is_reduced_lod: bool) -> int:
-    """Reduced-LOD only (caller-gated). On a LOD the decimated per-vertex weights make the dominant-
-    bone bucket vote assign RANDOM names (a wheel ends up 'Canon_02', the gun barrel 'Roue_G1'). The
-    geometry itself is correct, so re-name each part by WHAT IT GEOMETRICALLY IS, matching the known
-    tank layout: the big footprint = Chassis, the tall box = Tourelle, the front elevated long bar =
-    Canon, the long side belts = Chenille (already named by the peel), and every part sitting on the
-    wheel row = Roue_<side><N> numbered front->back per side. Full (high) model never reaches here."""
-    if not is_reduced_lod:
-        return 0
-    objs = [o for o in (getattr(collection, "all_objects", []) or [])
-            if getattr(o, "type", "") == "MESH" and o.data is not None and len(o.data.vertices)]
-    if len(objs) < 3:
-        return 0
-    info = []
-    for o in objs:
-        ps = [o.matrix_world @ v.co for v in o.data.vertices]
-        xs = [p.x for p in ps]; ys = [p.y for p in ps]; zs = [p.z for p in ps]
-        n = len(ps)
-        info.append({
-            "o": o, "low": _norm_low(getattr(o, "name", "")),
-            "cx": sum(xs) / n, "cy": sum(ys) / n, "cz": sum(zs) / n,
-            "dx": max(xs) - min(xs), "dy": max(ys) - min(ys), "dz": max(zs) - min(zs),
-            "ztop": max(zs),
-        })
-    used = set()
-    rename = {}
-
-    def take(it, name):
-        rename[it["o"]] = name
-        used.add(it["o"])
-
-    # 1. Chassis = the largest footprint hull part.
-    cand = [it for it in info if it["o"] not in used and it["dx"] > 4.0 and it["dy"] > 2.0]
-    if cand:
-        take(max(cand, key=lambda it: it["dx"] * it["dy"]), "Chassis")
-    # 2. Tourelle_01 = the COMPACT tall box that rises above the hull (top above 1.6 m, wide in Y but
-    # not hull-long in X, so a long upper-hull slab is not mistaken for the turret).
-    cand = [it for it in info if it["o"] not in used and it["ztop"] > 1.6 and 1.0 < it["dx"] < 3.5 and it["dy"] > 1.0]
-    if cand:
-        take(max(cand, key=lambda it: it["dx"] * it["dy"]), "Tourelle_01")
-    # 3. Canon_01 = the front-most elevated long bar (the gun): long in X, slim, up at turret height.
-    cand = [it for it in info if it["o"] not in used and it["dx"] > 2.0 and it["ztop"] > 1.4 and it["dy"] < 1.2]
-    if cand:
-        take(max(cand, key=lambda it: it["cx"]), "Canon_01")
-    # 4. Track belts = long, off-centre on a Y side, flat (catches BOTH the peeled Chenille and a whole
-    # bucket that is itself a single belt, e.g. a 6 m island the vote called 'Roue_D1'). Side by world
-    # Y to match the high layout (Droite = -Y = right). Numbering left to Blender's auto-suffix.
-    for it in info:
-        if it["o"] not in used and it["dx"] > 4.0 and abs(it["cy"]) > 0.8 and it["dz"] < 1.5:
-            take(it, "Chenille_Droite" if it["cy"] < 0.0 else "Chenille_Gauche")
-    # 5. Wheels = everything sitting on the wheel row (low, off-centre on a Y side, not a full belt and
-    # not an FX marker). Number front->back (descending X) within each side.
-    wheels = [it for it in info if it["o"] not in used
-              and it["cz"] < 1.0 and abs(it["cy"]) > 1.0 and it["dx"] < 4.0 and "fx" not in it["low"]]
-    right = sorted([it for it in wheels if it["cy"] < 0.0], key=lambda it: -it["cx"])
-    left = sorted([it for it in wheels if it["cy"] >= 0.0], key=lambda it: -it["cx"])
-    for idx, it in enumerate(right, 1):
-        take(it, f"Roue_D{idx}")
-    for idx, it in enumerate(left, 1):
-        take(it, f"Roue_G{idx}")
-    # 6. Anything still unclassified (big merged slabs the LOD decode left, stray bits) gets a neutral
-    # 'Part_NN' so it never keeps a misleading random name AND never blocks a real target name (which
-    # would otherwise force a '.001' suffix on the part that wanted it).
-    for idx, it in enumerate(sorted([it for it in info if it["o"] not in used], key=lambda it: -it["cx"]), 1):
-        take(it, f"Part_{idx:02d}")
-    changed = {o: nm for o, nm in rename.items() if _norm_low(getattr(o, "name", "")) != _norm_low(nm)}
-    # Two-pass apply: park every changing part on a unique temp name first, so renaming A -> 'Roue_D2'
-    # cannot collide with a B that still holds 'Roue_D2' (which Blender would suffix '.001').
-    for _i, o in enumerate(changed):
-        try:
-            o.name = f"__lodrn_{_i}"
-        except Exception:
-            pass
-    cnt = 0
-    for o, nm in changed.items():
-        try:
-            o.name = nm
-            cnt += 1
-        except Exception:
-            pass
-    if cnt:
-        try:
-            print(f"[warno] LOD geometry rename: {cnt} part(s) re-named by shape/position", flush=True)
-        except Exception:
-            pass
-    return cnt
 
 
 def _resolve_high_asset_for_lod(settings, lod_asset: str, lod_stem: str):
@@ -6878,98 +5538,6 @@ def _regroup_lod_islands(collection, is_reduced_lod: bool, model_is_rd: bool = F
         pass
     return cnt
 
-
-def _peel_chassis_welded_subparts(
-    buckets: List[dict],
-    *,
-    max_ratio: float = 0.06,
-    min_tris: int = 8,
-    max_subparts: int = 16,
-) -> List[dict]:
-    """RD/SD2 only: peel the obvious WELDED ANTENNAS/AERIALS/MASTS out of the Chassis/MainBody
-    bucket into their own movable objects. These thin vertical rods share the chassis bone, so
-    the name-based split can't separate them — only geometry can. We peel ONLY clearly
-    antenna-like islands (tall + thin: height >= 2.5x its widest horizontal extent) so the rest
-    of the hull (boxes, fenders, lights, the bolts) is NEVER shattered into junk objects (an
-    earlier all-islands peel produced 64 fragments). Caller gates on model_is_rd -> WARNO
-    untouched."""
-    # DISABLED (user request): antennas / masts must stay WELDED to the part they adjoin, NOT be
-    # split into separate 'Antenna_NN' objects. Returning the buckets unchanged keeps every welded
-    # sub-part (antennas, bed posts, rails, fittings) inside its Chassis/MainBody. The missile-
-    # launcher split (_split_rd_launcher) is a separate post-import pass and still runs.
-    return list(buckets)
-    result: List[dict] = []
-    for b in buckets:
-        gname = _norm_low(str(b.get("group_name", "")))
-        faces = b.get("faces") or []
-        if gname not in {"chassis", "mainbody"} or len(faces) < max(36, min_tris * 3):
-            result.append(b)
-            continue
-        comps = _chassis_face_components(len(b.get("vertices") or []), faces)
-        if len(comps) <= 1:
-            result.append(b)
-            continue
-        comps.sort(key=lambda c: -len(c))
-        total = len(faces)
-        verts = b.get("vertices") or []
-
-        def _comp_extent(face_list):
-            vs = set()
-            for fi in face_list:
-                f = faces[int(fi)]
-                vs.update((int(f[0]), int(f[1]), int(f[2])))
-            xs = [float(verts[v][0]) for v in vs]
-            ys = [float(verts[v][1]) for v in vs]
-            zs = [float(verts[v][2]) for v in vs]
-            return (max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs),
-                    (sum(xs) / len(xs), sum(ys) / len(ys), sum(zs) / len(zs)), max(zs))
-
-        keep: set = set(comps[0])  # largest component is always the hull
-        # Unit scale = bbox diagonal of the WHOLE chassis bucket (not just the largest
-        # component — a multi-shell hull like the S-tank fragments, which would understate the
-        # scale and let slivers through). A REAL antenna/mast is tall relative to the unit;
-        # small thin slivers (a row of smoke launchers, tiny fittings) are not. Without this,
-        # stridsvagn peeled 15 sliver objects and ikv peeled tiny 0.1m bits.
-        allx = [float(v[0]) for v in verts]
-        ally = [float(v[1]) for v in verts]
-        allz = [float(v[2]) for v in verts]
-        hull_diag = max((
-            (max(allx) - min(allx)) ** 2
-            + (max(ally) - min(ally)) ** 2
-            + (max(allz) - min(allz)) ** 2
-        ) ** 0.5, 1.0e-3) if verts else 1.0
-        z_top = max(allz) if allz else 1.0
-        z_bot = min(allz) if allz else 0.0
-        subs: List[List[int]] = []
-        for c in comps[1:]:
-            ntri = len(c)
-            if len(subs) >= max_subparts or ntri < int(min_tris) or ntri > int(total * max_ratio):
-                keep.update(c)
-                continue
-            dx, dy, dz, _cen, comp_top = _comp_extent(c)  # comp_top = TRUE bbox max-z (not mean+dz/2)
-            tall_thin = dz >= 2.5 * max(dx, dy, 1.0e-6)
-            tall_abs = dz >= 0.10 * hull_diag
-            # a genuine antenna/mast is a THIN rod: its horizontal footprint is small in ABSOLUTE
-            # terms. A stood-up ammo box / stowage bin / sensor slab is tall but WIDE -> excluded so
-            # it is never mislabeled 'Antenna' (the user's boxy-piece complaint).
-            rod_thin = max(dx, dy) <= max(0.35, 0.05 * hull_diag)
-            # a real mast STICKS UP near the vehicle top; a bed-frame STAKE POST / side rail sits low
-            # (its top is well below the unit top). NASAMS bed posts (top ~2.2 on a ~3.5 m unit) are
-            # NOT peeled; a whip antenna on the cab roof is. Excludes the user's false bed-post antennas.
-            sticks_up = comp_top >= (z_top - 0.25 * max(z_top - z_bot, 1.0e-3))
-            if tall_thin and tall_abs and rod_thin and sticks_up:  # thin rod near the unit top -> mast
-                subs.append(c)
-            else:
-                keep.update(c)  # boxes / posts / fenders / slivers stay welded (no junk objects)
-        if not subs:
-            result.append(b)
-            continue
-        # deterministic numbering by centroid
-        subs.sort(key=lambda c: tuple(round(v, 3) for v in _comp_extent(c)[3]))
-        result.append(_subbucket_from_faces(b, sorted(keep), str(b.get("group_name", "Chassis")), is_hull=True))
-        for n_ant, c in enumerate(subs, start=1):
-            result.append(_subbucket_from_faces(b, c, f"Antenna_{n_ant:02d}", is_hull=False))
-    return result
 
 
 def _collect_mesh_buckets(
@@ -7323,7 +5891,7 @@ def _collect_mesh_buckets(
             # skeleton node blob). Tracks were already separated via the chenille
             # branch above. Falls back to a single MainBody if the split yields nothing.
             _has_named_bones = any(str(v).strip() for v in (bone_name_by_index or {}).values())
-            if _has_named_bones and hasattr(extractor_mod, "split_faces_by_bone_deterministic"):
+            if _has_named_bones:
                 try:
                     group_payloads = extractor_mod.split_faces_by_bone_deterministic(
                         part=part,
@@ -7332,18 +5900,6 @@ def _collect_mesh_buckets(
                         material_role=role,
                         material_name=mat_name,
                         part_index=int(part_i),
-                    )
-                except Exception:
-                    group_payloads = []
-            elif _has_named_bones and hasattr(extractor_mod, "split_faces_by_bone_top_level"):
-                # Backward compatibility with older extractor builds.
-                try:
-                    group_payloads = extractor_mod.split_faces_by_bone_top_level(
-                        part=part,
-                        bone_name_by_index=bone_name_by_index,
-                        bone_parent_by_index=bone_parent_by_index or {},
-                        material_role=role,
-                        material_name=mat_name,
                     )
                 except Exception:
                     group_payloads = []
@@ -7603,16 +6159,6 @@ def _collect_mesh_buckets(
         ):
             b.pop(temp_key, None)
         out.append(b)
-    # RD/SD2 only: un-weld antennas/hatches/fittings that share the chassis bone (the
-    # name-based split can't separate them; geometry islands can). Gated on the RD/SD2
-    # game preset (NOT chenille) so it also runs on TRACKLESS RD units (boats / wheeled,
-    # e.g. fremantle's masts) whose model_is_rd would be False; WARNO is byte-for-byte
-    # unchanged. Falls back to `out` on any error.
-    if model_is_rd or is_rd_asset:
-        try:
-            out = _peel_chassis_welded_subparts(out)
-        except Exception:
-            pass
     return out
 
 
@@ -7620,9 +6166,14 @@ def _load_image(path: Path):
     if not path.exists() or not path.is_file():
         return None
     try:
-        return bpy.data.images.load(str(path), check_existing=True)
+        img = bpy.data.images.load(str(path), check_existing=True)
     except Exception:
         return None
+    try:
+        img["warno_import"] = True
+    except Exception:
+        pass
+    return img
 
 
 def _texture_node(nodes, path: Path, x: int, y: int, non_color: bool = False):
@@ -7632,11 +6183,13 @@ def _texture_node(nodes, path: Path, x: int, y: int, non_color: bool = False):
     node = nodes.new("ShaderNodeTexImage")
     node.location = (x, y)
     node.image = img
-    if non_color:
-        try:
-            node.image.colorspace_settings.name = "Non-Color"
-        except Exception:
-            pass
+    # The channel is known here from the material's texture binding; record it so
+    # the later colour-space pass uses it instead of guessing from the file name.
+    node["warno_non_color"] = bool(non_color)
+    try:
+        node.image.colorspace_settings.name = "Non-Color" if non_color else "sRGB"
+    except Exception:
+        pass
     return node
 
 
@@ -7646,12 +6199,6 @@ def _normal_invert_mode_text(value: str) -> str:
         return "none"
     return mode
 
-
-def _effective_normal_invert_mode(settings: WARNOImporterSettings) -> str:
-    # Atlas JSON conversion already writes inverted normal textures on disk.
-    if bool(getattr(settings, "use_atlas_json_mapping", False)):
-        return "none"
-    return _normal_invert_mode_text(str(getattr(settings, "normal_invert_mode", "none") or "none"))
 
 
 def _wire_normal_color_to_normal_map(nodes, links, color_socket, normal_map_node, invert_mode: str) -> None:
@@ -7975,16 +6522,6 @@ def _apply_material_nodes(
     except Exception:
         pass
 
-def _ensure_collection(scene: bpy.types.Scene, base_name: str) -> bpy.types.Collection:
-    name = base_name
-    idx = 2
-    while bpy.data.collections.get(name) is not None:
-        name = f"{base_name}_{idx}"
-        idx += 1
-    col = bpy.data.collections.new(name)
-    scene.collection.children.link(col)
-    return col
-
 
 def _collection_from_setting(scene: bpy.types.Scene, col_name: str) -> bpy.types.Collection | None:
     name = str(col_name or "").strip()
@@ -8026,6 +6563,13 @@ def _apply_dev_collection_layout(
     col = bpy.data.collections.get("Collection")
     if col is None:
         col = bpy.data.collections.new("Collection")
+    # A "Collection" that exists in the file but is not part of THIS scene would take
+    # the new objects out of the scene entirely; link it first.
+    try:
+        linked = col in scene.collection.children_recursive
+    except Exception:
+        linked = any(c == col for c in scene.collection.children)
+    if not linked:
         scene.collection.children.link(col)
     for obj in unique_objects:
         if col not in obj.users_collection:
@@ -8084,93 +6628,6 @@ def _merge_by_distance(objects: Sequence[bpy.types.Object], distance: float) -> 
         bm.free()
         mesh.update()
 
-
-def _fill_rd_mesh_holes(obj: bpy.types.Object, *, weld_dist: float = 0.0006, max_sides: int = 24) -> int:
-    """RD/SD2 unit meshes ship as OPEN shells — the hull has many open boundary edges (areas
-    the game never shows: under hatches/grilles, the open bottom, inner walls). In Blender they
-    read as holes. Weld near-coincident boundary verts into closed loops, then fill holes up to
-    `max_sides` edges (so the large intended bottom opening is left open). RD-only; skips
-    track/chains belts (their open edges are intentional UV-seam duplicates). Returns faces added."""
-    if obj.type != "MESH" or obj.data is None:
-        return 0
-    nlow = _norm_low(getattr(obj, "name", ""))
-    if (bool(obj.get("warno_is_track_mesh", False)) or bool(obj.get("warno_is_chains_mesh", False))
-            or nlow.startswith("chenille") or nlow.startswith("chains") or "track" in nlow):
-        return 0
-    mesh = obj.data
-    try:
-        bm = bmesh.new()
-        bm.from_mesh(mesh)
-        uvl = bm.loops.layers.uv.active
-        f0 = len(bm.faces)
-        if weld_dist > 0 and bm.verts:
-            bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=float(weld_dist))
-        boundary = [e for e in bm.edges if e.is_boundary]
-        if not boundary:
-            bm.free()
-            return 0
-        # representative UV per boundary vert (from its existing loops) so the new fill faces
-        # get sensible UVs instead of (0,0) -> the v1.7.4 smeared-texture bug.
-        vert_uv = {}
-        if uvl is not None:
-            for f in bm.faces:
-                for lp in f.loops:
-                    if lp.vert not in vert_uv:
-                        vert_uv[lp.vert] = lp[uvl].uv.copy()
-        res = bmesh.ops.holes_fill(bm, edges=boundary, sides=int(max_sides))
-        new_faces = [f for f in res.get("faces", []) or [] if f.is_valid]
-        if uvl is not None:
-            for f in new_faces:
-                for lp in f.loops:
-                    uv = vert_uv.get(lp.vert)
-                    if uv is not None:
-                        lp[uvl].uv = uv
-        if new_faces:
-            bmesh.ops.recalc_face_normals(bm, faces=new_faces)
-        added = len(bm.faces) - f0
-        bm.to_mesh(mesh)
-        bm.free()
-        mesh.update()
-        return max(0, int(added))
-    except Exception:
-        return 0
-
-
-def _assign_uniform_vertex_group(obj: bpy.types.Object, name: str, weight: float = 1.0) -> bool:
-    if obj.type != "MESH" or obj.data is None or not getattr(obj.data, "vertices", None):
-        return False
-    if obj.vertex_groups.get(str(name)) is not None:
-        return False
-    vg = obj.vertex_groups.new(name=str(name))
-    indices = [int(v.index) for v in obj.data.vertices]
-    if not indices:
-        return False
-    vg.add(indices, float(weight), "REPLACE")
-    return True
-
-
-def _wrap_track_uv_layer(mesh: bpy.types.Mesh, uv_layer: bpy.types.MeshUVLoopLayer) -> bool:
-    try:
-        uv_data = uv_layer.data
-    except Exception:
-        return False
-    if uv_data is None:
-        return False
-
-    max_abs = 0.0
-    for loop in uv_data:
-        max_abs = max(max_abs, abs(float(loop.uv.x)), abs(float(loop.uv.y)))
-    if max_abs <= 4.0:
-        return False
-
-    # WARNO cooker rejects UVs outside [-4, 4]. Track strips can carry large
-    # integer tile offsets, while repeat sampling only depends on the fractional part.
-    # Remove integer offsets but preserve the local tile shape.
-    for loop in uv_data:
-        u = float(loop.uv.x)
-        v = float(loop.uv.y)
-        loop.uv = (u - math.floor(u), v - math.floor(v))
-    return True
 
 
 def _track_group_sort_key(name: str) -> Tuple[int, str]:
@@ -8250,31 +6707,6 @@ def _mesh_vertex_neighbors(mesh: bpy.types.Mesh) -> List[set[int]]:
     return neighbors
 
 
-def _track_group_weight_totals(
-    obj: bpy.types.Object,
-    track_group_names: Sequence[str],
-) -> Dict[int, float]:
-    mesh = getattr(obj, "data", None)
-    if obj.type != "MESH" or mesh is None:
-        return {}
-    valid_indices: set[int] = set()
-    for group_name in track_group_names:
-        vg = obj.vertex_groups.get(str(group_name))
-        if vg is None:
-            continue
-        valid_indices.add(int(vg.index))
-    totals: Dict[int, float] = {}
-    for vert in getattr(mesh, "vertices", []) or []:
-        total = 0.0
-        for slot in getattr(vert, "groups", []) or []:
-            if int(slot.group) not in valid_indices:
-                continue
-            weight = float(slot.weight)
-            if weight > 1.0e-8:
-                total += weight
-        totals[int(vert.index)] = total
-    return totals
-
 
 def _assign_track_group_patch(
     obj: bpy.types.Object,
@@ -8301,43 +6733,15 @@ def _assign_track_group_patch(
             for other_vg in [obj.vertex_groups.get(str(other_name))]
             if other_vg is not None
         ]
-    for vert_index in unique_indices:
-        for other_vg in other_groups:
-            try:
-                other_vg.remove([int(vert_index)])
-            except Exception:
-                continue
-        vg.add([int(vert_index)], 1.0, "REPLACE")
-    return len(unique_indices)
-
-
-def _overlay_track_group_weights(
-    obj: bpy.types.Object,
-    group_name: str,
-    vert_weights: Dict[int, float],
-) -> int:
-    if obj.type != "MESH" or obj.data is None:
-        return 0
-    cleaned: Dict[int, float] = {}
-    for vert_index, weight in dict(vert_weights or {}).items():
-        idx = int(vert_index)
-        w = float(weight)
-        if idx < 0 or w <= 1.0e-8:
-            continue
-        prev = float(cleaned.get(idx, 0.0))
-        if w > prev:
-            cleaned[idx] = w
-    if not cleaned:
-        return 0
-    vg = obj.vertex_groups.get(str(group_name))
-    if vg is None:
-        vg = obj.vertex_groups.new(name=str(group_name))
-    for vert_index, weight in sorted(cleaned.items()):
+    # One RNA call per group instead of one per vertex and group.
+    for other_vg in other_groups:
         try:
-            vg.add([int(vert_index)], float(weight), "REPLACE")
+            other_vg.remove(unique_indices)
         except Exception:
             continue
-    return len(cleaned)
+    vg.add(unique_indices, 1.0, "REPLACE")
+    return len(unique_indices)
+
 
 
 def _track_helper_height_threshold(helper_positions_by_group: Dict[str, Vector] | None) -> float | None:
@@ -8416,10 +6820,11 @@ def _synthesize_zero_weight_track_lane(
         if upper_threshold is None
         or float(mesh.vertices[int(vert_index)].co.z) >= float(upper_threshold) - 1.0e-6
     ]
+    upper_zero_set = set(upper_zero)  # built once; it was rebuilt per vertex (O(n^2))
     remaining_zero = [
         int(vert_index)
         for vert_index in zero_indices
-        if int(vert_index) not in set(upper_zero)
+        if int(vert_index) not in upper_zero_set
     ]
     # Voronoi-in-X: assign every belt vertex to its NEAREST synthetic wheel helper in X.
     # The old code split the upper return lane by ONE midpoint and the lower (ground) lane
@@ -8458,100 +6863,6 @@ def _synthesize_zero_weight_track_lane(
                 track_group_names=track_group_names, exclusive=True)
     return filled
 
-
-def _refine_track_weights_from_mesh_positions(
-    imported_objects: Sequence[bpy.types.Object],
-    settings: Any | None = None,
-) -> Dict[str, Dict[str, int]]:
-    def _object_center_world(obj: bpy.types.Object) -> Vector:
-        try:
-            corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
-            if corners:
-                acc = Vector((0.0, 0.0, 0.0))
-                for corner in corners:
-                    acc += corner
-                return acc / float(len(corners))
-        except Exception:
-            pass
-        try:
-            return obj.matrix_world.to_translation().copy()
-        except Exception:
-            return Vector((0.0, 0.0, 0.0))
-
-    mesh_by_name_low: Dict[str, bpy.types.Object] = {}
-    for obj in imported_objects:
-        if getattr(obj, "type", "") != "MESH":
-            continue
-        mesh_by_name_low[_norm_low(str(obj.name))] = obj
-
-    reports: Dict[str, Dict[str, int]] = {}
-    wheel_rx = re.compile(r"^roue_elev_([dg])([0-9]+)$", re.IGNORECASE)
-    for obj in imported_objects:
-        if getattr(obj, "type", "") != "MESH" or not bool(obj.get("warno_is_track_mesh", False)):
-            continue
-        try:
-            group_sources = json.loads(str(obj.get("warno_track_group_sources_json", "") or "") or "{}")
-        except Exception:
-            group_sources = {}
-        group_sources = {
-            str(name): str(source)
-            for name, source in dict(group_sources or {}).items()
-            if str(name).strip()
-        }
-        synthetic_names = [
-            str(name)
-            for name, source in group_sources.items()
-            if _norm_low(str(source)) == "synthetic"
-        ]
-        if not synthetic_names:
-            continue
-
-        helper_positions_by_group: Dict[str, Vector] = {}
-        for group_name in sorted(group_sources.keys(), key=_track_group_sort_key):
-            m = wheel_rx.match(_norm_low(str(group_name)))
-            if not m:
-                continue
-            wheel_name = f"Roue_{str(m.group(1)).upper()}{int(m.group(2))}"
-            wheel_obj = mesh_by_name_low.get(_norm_low(wheel_name))
-            if wheel_obj is None:
-                continue
-            helper_positions_by_group[str(group_name)] = _object_center_world(wheel_obj)
-        if len(helper_positions_by_group) < 2:
-            continue
-
-        all_indices = [int(v.index) for v in getattr(obj.data, "vertices", []) or []]
-        for group_name in synthetic_names:
-            vg = obj.vertex_groups.get(str(group_name))
-            if vg is None or not all_indices:
-                continue
-            try:
-                vg.remove(all_indices)
-            except Exception:
-                continue
-
-        backfill_report = _backfill_zero_weight_track_vertices(
-            obj=obj,
-            track_group_names=sorted(group_sources.keys(), key=_track_group_sort_key),
-            group_source_by_name=group_sources,
-            helper_positions_by_group=helper_positions_by_group,
-        )
-        reports[str(obj.name)] = {
-            "zero_before": int(backfill_report.get("zero_before", 0)),
-            "zero_after": int(backfill_report.get("zero_after", 0)),
-            "filled": int(backfill_report.get("filled", 0)),
-        }
-        if settings is not None:
-            _warno_log(
-                settings,
-                (
-                    f"track weight refine obj={obj.name} "
-                    f"zero_before={int(backfill_report.get('zero_before', 0))} "
-                    f"zero_after={int(backfill_report.get('zero_after', 0))} "
-                    f"filled={int(backfill_report.get('filled', 0))}"
-                ),
-                stage="track_weights",
-            )
-    return reports
 
 
 def _backfill_zero_weight_track_vertices(
@@ -8745,126 +7056,6 @@ def _synthesize_missing_track_vertex_groups(
             created_or_filled[str(vg_name)] = 0
     return created_or_filled
 
-
-def _relabel_synthetic_track_groups(
-    obj: bpy.types.Object,
-    group_source_by_name: Dict[str, str] | None,
-    helper_positions_by_group: Dict[str, Vector] | None,
-) -> int:
-    if obj.type != "MESH" or obj.data is None:
-        return 0
-    mesh = obj.data
-    group_source_by_name = {
-        str(name): str(source)
-        for name, source in dict(group_source_by_name or {}).items()
-        if str(name).strip()
-    }
-    helper_positions_by_group = {
-        str(name): pos.copy()
-        for name, pos in dict(helper_positions_by_group or {}).items()
-        if str(name).strip() and isinstance(pos, Vector)
-    }
-    synthetic_names = [
-        str(name)
-        for name, source_name in group_source_by_name.items()
-        if _norm_low(str(source_name)) == "synthetic" and str(name) in helper_positions_by_group
-    ]
-    if len(synthetic_names) < 2:
-        return 0
-
-    occupied: Dict[str, Dict[str, Any]] = {}
-    for group_name in synthetic_names:
-        vg = obj.vertex_groups.get(str(group_name))
-        if vg is None:
-            continue
-        entries: List[Tuple[int, float]] = []
-        sx = sy = sz = sw = 0.0
-        vg_index = int(vg.index)
-        for vert in mesh.vertices:
-            weight = 0.0
-            for slot in vert.groups:
-                if int(slot.group) == vg_index and float(slot.weight) > 1.0e-8:
-                    weight = float(slot.weight)
-                    break
-            if weight <= 1.0e-8:
-                continue
-            entries.append((int(vert.index), float(weight)))
-            sx += float(vert.co.x) * float(weight)
-            sy += float(vert.co.y) * float(weight)
-            sz += float(vert.co.z) * float(weight)
-            sw += float(weight)
-        if not entries or sw <= 1.0e-8:
-            continue
-        occupied[str(group_name)] = {
-            "entries": entries,
-            "centroid": Vector((sx / sw, sy / sw, sz / sw)),
-        }
-    if not occupied:
-        return 0
-
-    occupied_names = sorted(occupied.keys(), key=_track_group_sort_key)
-    target_names = sorted(synthetic_names, key=_track_group_sort_key)
-    best_cost = float("inf")
-    best_mapping: Dict[str, str] = {}
-    for target_subset in combinations(target_names, len(occupied_names)):
-        for target_perm in permutations(target_subset):
-            cost = 0.0
-            for source_name, target_name in zip(occupied_names, target_perm):
-                centroid = occupied[str(source_name)]["centroid"]
-                helper_pos = helper_positions_by_group[str(target_name)]
-                cost += (
-                    abs(float(centroid.x) - float(helper_pos.x)) * 4.0
-                    + abs(float(centroid.y) - float(helper_pos.y)) * 0.5
-                    + abs(float(centroid.z) - float(helper_pos.z)) * 1.0
-                )
-            if cost < best_cost:
-                best_cost = float(cost)
-                best_mapping = {
-                    str(source_name): str(target_name)
-                    for source_name, target_name in zip(occupied_names, target_perm)
-                }
-    if not best_mapping:
-        return 0
-
-    changed = 0
-    target_entries: Dict[str, List[Tuple[int, float]]] = defaultdict(list)
-    source_groups: Dict[str, bpy.types.VertexGroup] = {}
-    target_groups: Dict[str, bpy.types.VertexGroup] = {}
-    for source_name, target_name in best_mapping.items():
-        source_vg = obj.vertex_groups.get(str(source_name))
-        if source_vg is None:
-            continue
-        if obj.vertex_groups.get(str(target_name)) is None:
-            obj.vertex_groups.new(name=str(target_name))
-        target_vg = obj.vertex_groups.get(str(target_name))
-        if target_vg is None:
-            continue
-        source_groups[str(source_name)] = source_vg
-        target_groups[str(target_name)] = target_vg
-        target_entries[str(target_name)].extend(list(occupied[str(source_name)]["entries"]))
-        if _norm_low(str(source_name)) != _norm_low(str(target_name)):
-            changed += 1
-    if changed <= 0:
-        return 0
-
-    for source_name, source_vg in source_groups.items():
-        indices = [int(vert_index) for vert_index, _weight in occupied[str(source_name)]["entries"]]
-        if not indices:
-            continue
-        try:
-            source_vg.remove(indices)
-        except Exception:
-            pass
-    for target_name, entries in target_entries.items():
-        target_vg = target_groups.get(str(target_name))
-        if target_vg is None:
-            continue
-        for vert_index, weight in entries:
-            try:
-                target_vg.add([int(vert_index)], float(weight), "REPLACE")
-            except Exception:
-                continue
-    return changed
 
 
 def _rebalance_rd_track_weights(obj, track_group_names, helper_positions_by_group) -> int:
@@ -9387,10 +7578,6 @@ def _asset_prefers_synthetic_default_group(asset_hint: str) -> bool:
     return True
 
 
-def _is_aircraft_control_surface_name(raw_name: str) -> bool:
-    low = _norm_low(raw_name)
-    return low == "rudder" or low.startswith("aileron_") or low.startswith("elevator_")
-
 
 # ===== Per-asset Blender datablock namespacing =====
 # Different WARNO units historically reused the same Blender material name
@@ -9594,54 +7781,44 @@ def _warno_strip_namespace(name: str) -> str:
     return raw
 
 
-def _warno_purge_orphan_datablocks() -> Dict[str, int]:
-    """Purge orphan materials/images/meshes/node_groups (users == 0 and no
-    fake user) from bpy.data BEFORE a new import so that a stale 'Vitre'
-    or 'Mi_24V' material left over from a previously deleted unit cannot
-    be re-bound by name to the new one. Idempotent."""
-    purged = {"materials": 0, "images": 0, "meshes": 0, "node_groups": 0}
+def _warno_is_plugin_datablock(block) -> bool:
     try:
-        for m in list(bpy.data.materials):
-            try:
-                if m.users == 0 and not m.use_fake_user:
-                    bpy.data.materials.remove(m, do_unlink=True)
-                    purged["materials"] += 1
-            except Exception:
-                continue
-        for img in list(bpy.data.images):
-            try:
-                if img.users == 0 and not img.use_fake_user:
-                    bpy.data.images.remove(img, do_unlink=True)
-                    purged["images"] += 1
-            except Exception:
-                continue
-        for me in list(bpy.data.meshes):
-            try:
-                if me.users == 0 and not me.use_fake_user:
-                    bpy.data.meshes.remove(me, do_unlink=True)
-                    purged["meshes"] += 1
-            except Exception:
-                continue
-        for ng in list(bpy.data.node_groups):
-            try:
-                if ng.users == 0 and not ng.use_fake_user:
-                    bpy.data.node_groups.remove(ng, do_unlink=True)
-                    purged["node_groups"] += 1
-            except Exception:
-                continue
+        if block.get("warno_import") or block.get("warno_asset"):
+            return True
     except Exception:
-        pass
+        return False
+    # Materials from imports made before the tag existed are namespaced "<asset>__<name>"
+    # or carry the cooker-reserved name.
+    name = str(getattr(block, "name", "") or "")
+    return isinstance(block, bpy.types.Material) and ("__" in name or _norm_low(name).startswith("vitre"))
+
+
+def _warno_purge_orphan_datablocks() -> Dict[str, int]:
+    """Purge orphan materials/images/meshes (users == 0, no fake user) that a previous
+    import created, BEFORE a new import, so a stale 'Vitre' or 'Mi_24V' material left
+    over from a deleted unit cannot be re-bound by name to the new one. Only
+    plugin-made datablocks are touched; it used to remove every orphan in the file,
+    including the user's own unassigned images and node groups. Idempotent."""
+    purged = {"materials": 0, "images": 0, "meshes": 0}
+    for key, collection in (("materials", bpy.data.materials), ("images", bpy.data.images), ("meshes", bpy.data.meshes)):
+        for block in list(collection):
+            try:
+                if block.users == 0 and not block.use_fake_user and _warno_is_plugin_datablock(block):
+                    collection.remove(block, do_unlink=True)
+                    purged[key] += 1
+            except Exception:
+                continue
     return purged
 
 
-def _finalize_glass_materials() -> int:
+def _finalize_glass_materials(materials: Sequence[Any]) -> int:
     """RD ships the canopy/glass material (e.g. 'Vitres') OPAQUE, but the game renders it as
     see-through tinted glass. Detect glass by name (vitre/vitres/verre/glass), make it transparent
     (low BSDF alpha + BLEND) and normalize the name to the cooker-reserved 'Vitre'. Only an OPAQUE
     glass material has its alpha lowered, so an already-transparent one is left as-is."""
     glass_rx = re.compile(r"^(vitres?|verre|glass)", re.IGNORECASE)
     count = 0
-    for mat in list(bpy.data.materials):
+    for mat in list(materials):
         if mat is None:
             continue
         bare = _norm_low(_warno_strip_namespace(str(getattr(mat, "name", ""))))
@@ -9702,7 +7879,7 @@ def _finalize_glass_materials() -> int:
     return count
 
 
-def _fix_unwired_diffuse() -> int:
+def _fix_unwired_diffuse(materials: Sequence[Any]) -> int:
     """A WARNO CombinedDA/diffuse texture for a unit whose NAME contains a channel keyword
     (Alpha_Jet, Metal_*, ...) gets mis-routed by the atlas resolver: the diffuse image node ends
     up wired to BSDF Alpha while Base Color stays empty -> the model renders flat/untextured ("all
@@ -9712,7 +7889,7 @@ def _fix_unwired_diffuse() -> int:
     whose Base Color is already wired (RD + healthy WARNO), so it only repairs the broken case."""
     suffix_rx = re.compile(r"_(a|d|nm|n|m|o|ao|r|s|orm|os|rs|alpha|normal|metallic|roughness|occlusion|diffuse)$", re.I)
     cnt = 0
-    for m in list(bpy.data.materials):
+    for m in list(materials):
         if m is None or not getattr(m, "use_nodes", False) or m.node_tree is None:
             continue
         low = _norm_low(getattr(m, "name", ""))
@@ -9740,7 +7917,7 @@ def _fix_unwired_diffuse() -> int:
     return cnt
 
 
-def _normalize_diffuse_colorspace_and_alpha() -> int:
+def _normalize_diffuse_colorspace_and_alpha(materials: Sequence[Any]) -> int:
     """Universal (WARNO + RD) node hygiene for every Principled material:
       * the DIFFUSE (image wired into Base Color) must be sRGB;
       * every OTHER image map (normal/metallic/roughness/occlusion/alpha mask) must be Non-Color;
@@ -9756,10 +7933,16 @@ def _normalize_diffuse_colorspace_and_alpha() -> int:
         img = getattr(node, "image", None)
         if img is None:
             return False
+        try:
+            tagged = node.get("warno_non_color")
+        except Exception:
+            tagged = None
+        if tagged is not None:
+            return bool(tagged)  # set from the texture binding when the node was built
         return bool(nondiff_rx.search(_norm_low(Path(str(img.name)).stem)))
 
     cnt = 0
-    for m in list(bpy.data.materials):
+    for m in list(materials):
         if m is None or not getattr(m, "use_nodes", False) or m.node_tree is None:
             continue
         nt = m.node_tree
@@ -9803,12 +7986,12 @@ def _normalize_diffuse_colorspace_and_alpha() -> int:
     return cnt
 
 
-def _name_chain_objects() -> int:
+def _name_chain_objects(objects: Sequence[Any]) -> int:
     """Name a chain-card object after its material instead of the generic peel name: a mesh whose
     only material is a chain material but named 'Chassis_N' / 'Part_N' becomes 'Chains', so the
     anti-RPG ball-chain curtain reads as its own object (not a chassis fragment)."""
     cnt = 0
-    for o in list(bpy.data.objects):
+    for o in list(objects):
         if getattr(o, "type", "") != "MESH":
             continue
         if not re.match(r"^(chassis|mainbody|part)_\d+$", _norm_low(getattr(o, "name", ""))):
@@ -12815,7 +10998,7 @@ def _build_helper_armature(
             rank = int(role_priority.get(role, 999))
             if rank < best_rank:
                 best_rank = rank
-            best_role = role
+                best_role = role
         if best_role:
             primary_role_by_index[int(bidx)] = best_role
     semantic_scene_nodes = set(gfx_required_nodes | gfx_fx_nodes | gfx_subdepiction_nodes)
@@ -12913,8 +11096,11 @@ def _build_helper_armature(
     # scene roots.  It is wrong where the model is simply missing a value: T64_obr81 ships
     # fx_fumee_chenille_d1 at the identity while its g1 twin sits at (-2.70, 1.36, 0), so
     # taking it at face value drops the right-hand track-dust emitter into the middle of the
-    # tank.  When a side-mirrored twin IS placed, drop the identity and let the mirror and
-    # fallback passes below place the node as they did before.
+    # tank.  When a side-mirrored twin IS placed, the node is the twin's exact matrix
+    # mirrored across the vehicle's side axis (Blender Y), and it stays locked like every
+    # other exact node. (It used to be dropped and re-placed by guesses - the off_mat
+    # scan, the extractor's stream candidates and a track-smoke template - so the two
+    # emitters of a pair ended up at different X/Z.)
     if exact_world_matrix_by_index:
         _geometry_bone_indices: set[int] = set()
         for _obj in imported_objects:
@@ -12928,19 +11114,21 @@ def _build_helper_armature(
             int(i): _norm_low(str(bone_name_by_index.get(int(i), "") or ""))
             for i in exact_world_matrix_by_index
         }
-        _placed_names = {
-            nm
+        _placed_index_by_name = {
+            nm: i
             for i, nm in _exact_names.items()
             if nm and exact_world_matrix_by_index[i].translation.length > 1.0e-6
         }
+        _side_mirror = Matrix.Diagonal((1.0, -1.0, 1.0, 1.0))
         for _idx in list(exact_world_matrix_by_index):
             if exact_world_matrix_by_index[_idx].translation.length > 1.0e-6:
                 continue
             if int(_idx) in _geometry_bone_indices:
                 continue
             _twin = _mirrored_side_name(_exact_names.get(int(_idx), ""))
-            if _twin and _twin in _placed_names:
-                del exact_world_matrix_by_index[_idx]
+            _twin_idx = _placed_index_by_name.get(_twin) if _twin else None
+            if _twin_idx is not None:
+                exact_world_matrix_by_index[_idx] = _side_mirror @ exact_world_matrix_by_index[_twin_idx] @ _side_mirror
 
     resolved_positions: Dict[int, Vector] = _LockedPositions(
         {}
@@ -13073,41 +11261,6 @@ def _build_helper_armature(
         child.matrix_parent_inverse = parent.matrix_world.inverted()
         child.matrix_world = wm
 
-    def _set_bone_parent_keep_world(
-        child: bpy.types.Object,
-        armature_obj: bpy.types.Object,
-        bone_name: str,
-    ) -> None:
-        wm = child.matrix_world.copy()
-        child.parent = armature_obj
-        child.parent_type = "BONE"
-        child.parent_bone = str(bone_name or "")
-        child.matrix_parent_inverse = armature_obj.matrix_world.inverted()
-        child.matrix_world = wm
-
-    def _character_anchor_position(idx: int) -> Vector | None:
-        raw_name = str(display_name_by_index.get(int(idx), bone_name_by_index.get(int(idx), "")) or "").strip()
-        if raw_name:
-            pos = _pick_position_from_payload(raw_name, bone_positions)
-            if isinstance(pos, Vector):
-                return pos.copy()
-        pos = resolved_positions.get(int(idx))
-        if isinstance(pos, Vector):
-            return pos.copy()
-        record = raw_scene_record_by_index.get(int(idx))
-        world_translation = getattr(record, "world_translation", None) if record is not None else None
-        if isinstance(world_translation, (list, tuple)) and len(world_translation) >= 3:
-            try:
-                return Vector(
-                    (
-                        float(world_translation[0]),
-                        float(world_translation[1]),
-                        float(world_translation[2]),
-                    )
-                )
-            except Exception:
-                return None
-        return None
 
     mesh_by_bone_index: Dict[int, List[bpy.types.Object]] = {}
     for obj in imported_objects:
@@ -14230,14 +12383,6 @@ def _build_helper_armature(
                     best_match = (int(source_idx), int(block_idx), point.copy())
         return best_match
 
-    def _nearest_resolved_ancestor_anchor(start_idx: int) -> Tuple[int, Vector]:
-        cur = int(bone_parent_by_index.get(int(start_idx), -1))
-        while cur >= 0:
-            pos = resolved_positions.get(int(cur))
-            if pos is not None:
-                return int(cur), pos.copy()
-            cur = int(bone_parent_by_index.get(int(cur), -1))
-        return -1, Vector((0.0, 0.0, 0.0))
 
     def _own_local_off_candidates(
         bidx: int,
@@ -14260,13 +12405,6 @@ def _build_helper_armature(
                 best = max(best, float((points[i] - points[j]).length))
         return best
 
-    def _mean_point(points: Sequence[Vector]) -> Vector:
-        if not points:
-            return Vector((0.0, 0.0, 0.0))
-        acc = Vector((0.0, 0.0, 0.0))
-        for point in points:
-            acc += point
-        return acc / float(len(points))
 
     def _best_local_helper_chain_solution(
         parent_anchor: Vector,
@@ -17089,6 +15227,42 @@ def _build_helper_armature(
                 parent_idx = int(bone_parent_by_index.get(int(bidx), -1))
                 local_transform = getattr(record, "local_transform", None)
                 world_translation = getattr(record, "world_translation", None)
+                exact_world = exact_world_matrix_by_index.get(int(bidx))
+                if exact_world is not None:
+                    # The pack's own matrices. The record's local_transform/world_translation
+                    # are reconstructions from the legacy off_mat stream (mis-indexed whenever
+                    # the node count is not a multiple of 3) and were registered here as
+                    # "spk_exact" although they were guesses. The local is taken relative to
+                    # the parent this rig uses, so parent @ local reproduces the exact world.
+                    parent_exact = exact_world_matrix_by_index.get(int(parent_idx)) if parent_idx >= 0 else None
+                    try:
+                        exact_local = (
+                            parent_exact.inverted_safe() @ exact_world
+                            if parent_exact is not None
+                            else exact_world.copy()
+                        )
+                        decomposed = _decompose_affine_components(exact_local)
+                    except Exception:
+                        decomposed = None
+                    if decomposed is not None and (parent_idx < 0 or parent_exact is not None):
+                        loc_v, basis_rows, scale_v = decomposed
+                        pending_local_rows[int(bidx)] = {
+                            "role": "raw_scene_graph",
+                            "source_kind": "spk_exact",
+                            "local_translation": [float(v) for v in loc_v],
+                            "local_rotation_basis": basis_rows,
+                            "local_scale": [float(v) for v in scale_v],
+                            "provenance": {"source": "exact_matrix_stream", "block_index": -1},
+                        }
+                        deterministic_reason_by_index[int(bidx)] = "exact_matrix_stream"
+                        local_transform = None
+                    # Full matrix, not just the translation: children compose against it.
+                    resolved_world_matrix_by_index[int(bidx)] = exact_world.copy()
+                    deterministic_exact_indices.add(int(bidx))
+                    semantic_helper_source_by_index[int(bidx)] = "spk_exact"
+                    support_helper_source_by_index[int(bidx)] = "spk_exact"
+                    deterministic_reason_by_index.setdefault(int(bidx), "exact_matrix_stream")
+                    world_translation = None
                 if local_transform is not None:
                     try:
                         local_translation = [float(v) for v in list(getattr(local_transform, "translation", []) or [])[:3]]
@@ -17131,6 +15305,20 @@ def _build_helper_armature(
             for _ in range(max(1, len(pending_local_rows) + 1)):
                 changed = False
                 for bidx, row in list(pending_local_rows.items()):
+                    if int(bidx) in exact_world_matrix_by_index:
+                        # World already set from the exact matrix; only record the local.
+                        _register_exact_local_transform(
+                            int(bidx),
+                            role="raw_scene_graph",
+                            source_kind="spk_exact",
+                            local_translation=row.get("local_translation", [0.0, 0.0, 0.0]),
+                            local_rotation_basis=row.get("local_rotation_basis"),
+                            local_scale=row.get("local_scale"),
+                            provenance=row.get("provenance"),
+                        )
+                        pending_local_rows.pop(int(bidx), None)
+                        changed = True
+                        continue
                     parent_idx = int(bone_parent_by_index.get(int(bidx), -1))
                     if parent_idx >= 0 and int(parent_idx) not in resolved_world_matrix_by_index:
                         continue
@@ -17253,21 +15441,7 @@ def _build_helper_armature(
     created_empties = 0
 
     def _character_bone_name(raw_name: str) -> str:
-        tokens = [tok for tok in re.split(r"[\s_]+", str(raw_name or "").strip()) if tok]
-        if not tokens:
-            return "Bip01"
-        out: List[str] = []
-        for token in tokens:
-            low = token.lower()
-            if low == "bip01":
-                out.append("Bip01")
-            elif len(token) == 1 and low in {"l", "r"}:
-                out.append(token.upper())
-            elif low == "upperarm":
-                out.append("UpperArm")
-            else:
-                out.append(token[:1].upper() + token[1:])
-        return " ".join(out)
+        return _pretty_character_bip_name(raw_name) or "Bip01"
 
     papyrus_bone_name_by_index: Dict[int, str] = {}
     papyrus_armature_obj: bpy.types.Object | None = None
@@ -17960,6 +16134,10 @@ def _build_helper_armature(
             armatures_by_side.setdefault(side, []).append(arm_obj)
 
     # Hierarchical OBJECT parenting from bone tree.
+    # _set_parent_keep_world reads matrix_world, which Blender only recomputes on a
+    # depsgraph update; the empties above were placed through .location, so without this
+    # their world matrix is still the identity and keep-world parenting loses the offset.
+    bpy.context.view_layer.update()
     parented_nodes = 0
     for bidx in ordered_indices:
         child = node_by_bone_index.get(int(bidx))
@@ -18042,29 +16220,20 @@ def _build_helper_armature(
         if parent is None or node.parent != parent:
             continue
         try:
-            raw_name = str(bone_name_by_index.get(int(bidx), "") or "")
             local_rotation_basis = transform_row.get("local_rotation_basis")
-            if (
-                node.type == "MESH"
-                and _is_aircraft_asset(asset_hint)
-                and _is_aircraft_control_surface_name(raw_name)
-            ):
-                local_rotation_basis = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
-            # Wheel meshes (Roue_D*, Roue_G*, but NOT Roue_Elev_* helpers) are
-            # already oriented horizontally in Eugen's source FBX — DEV blend
-            # for Leopard_1A1 confirms rotation_euler is (0,0,0). On some tanks
-            # (e.g. Leopard_2A1) SPK off_mat carries a non-identity basis that
-            # we then double-apply, rotating the cylinder onto its side.
-            # Force identity for wheel mesh nodes so the DEV behaviour matches
-            # universally without affecting tanks that already worked.
+            local_scale = transform_row.get("local_scale")
             if node.type == "MESH":
-                _raw_low = _norm_low(raw_name)
-                if _raw_low.startswith("roue_") and not _raw_low.startswith("roue_elev_"):
-                    local_rotation_basis = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+                # Mesh vertices are baked in world space, so a mesh object must keep an
+                # identity basis: giving it the node's rotation/scale turns the geometry a
+                # second time, and the final pass only moves origins back. That is what
+                # rotated wheels onto their sides, tipped rotors 90 deg and needed the
+                # per-type identity overrides and the rotor "de-displace" undo.
+                local_rotation_basis = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+                local_scale = [1.0, 1.0, 1.0]
             local_matrix = _compose_affine_components(
                 transform_row.get("local_translation", [0.0, 0.0, 0.0]),
                 local_rotation_basis,
-                transform_row.get("local_scale"),
+                local_scale,
             )
             node.matrix_parent_inverse = Matrix.Identity(4)
             loc, rot, scale = local_matrix.decompose()
@@ -18084,7 +16253,7 @@ def _build_helper_armature(
                 ensure_ascii=False,
             )
             node["warno_semantic_local_scale"] = json.dumps(
-                transform_row.get("local_scale", [1.0, 1.0, 1.0]),
+                list(local_scale) if local_scale is not None else [1.0, 1.0, 1.0],
                 ensure_ascii=False,
             )
             node["warno_semantic_provenance"] = json.dumps(
@@ -18546,7 +16715,9 @@ def _scan_assets_impl(self, context, scan_all: bool):
     query = str(settings.query or "").strip()
     _warno_log(settings, f"scan start mode={'ALL' if scan_all else 'query'} query='{query}'", stage="scan")
     if scan_all:
-        return bpy.ops.warno.build_asset_index(force_rebuild=False)
+        # The index build is its own modal operator; this one is done once it started it.
+        result = bpy.ops.warno.build_asset_index(force_rebuild=False)
+        return {"CANCELLED"} if "CANCELLED" in result else {"FINISHED"}
 
     try:
         _warno_log(settings, "stage: asset_index_prepare", stage="asset_index_prepare")
@@ -18579,12 +16750,11 @@ def _scan_assets_impl(self, context, scan_all: bool):
 
 
 def _load_extractor_module_for_worker(extractor_path: Path):
-    spec = importlib.util.spec_from_file_location(f"warno_asset_index_worker_{time.time_ns()}", str(extractor_path))
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot load extractor module: {extractor_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    # The same cached module the import uses. Loading a private copy here re-executed
+    # the whole extractor per scan and, because it was never registered in
+    # sys.modules, its dataclasses failed to build ("'NoneType' object has no
+    # attribute '__dict__'"), so the background Scan ALL always failed.
+    return _load_local_module("extractor", Path(extractor_path))
 
 
 def _build_asset_index_payload_worker(
@@ -18671,20 +16841,24 @@ class WARNO_OT_BuildAssetIndex(Operator):
                 "game": _normalize_game_id(getattr(settings, "game_preset", "WARNO")),
             }
 
+            # The thread only touches this dict, never the operator: if Blender frees the
+            # operator (file load) while the build runs, "self" access would raise.
+            job = self._job
+
             def worker():
                 try:
                     payload = _build_asset_index_payload_worker(
-                        extractor_path=Path(self._job["extractor_path"]),
-                        spk_paths=[Path(p) for p in self._job["spk_paths"]],
-                        signature=dict(self._job["signature"]),
-                        index_path=Path(self._job["index_path"]),
-                        game=self._job["game"],
+                        extractor_path=Path(job["extractor_path"]),
+                        spk_paths=[Path(p) for p in job["spk_paths"]],
+                        signature=dict(job["signature"]),
+                        index_path=Path(job["index_path"]),
+                        game=job["game"],
                     )
-                    self._job["payload"] = payload
+                    job["payload"] = payload
                 except Exception as exc:
-                    self._job["error"] = str(exc)
+                    job["error"] = str(exc)
                 finally:
-                    self._job["done"] = True
+                    job["done"] = True
 
             self._thread = threading.Thread(target=worker, name="WARNO_AssetIndexBuilder", daemon=True)
             self._thread.start()
@@ -18779,159 +16953,6 @@ class WARNO_OT_ScanAssetsAll(Operator):
     def execute(self, context):
         return _scan_assets_impl(self, context, scan_all=True)
 
-
-class WARNO_OT_PickAssetBrowser(Operator):
-    bl_idname = "warno.pick_asset_browser"
-    bl_label = "Pick Asset Browser"
-    bl_description = "Pick asset by folder/model/LOD in a browser-like dialog"
-
-    root_key: EnumProperty(name="Root", items=_browser_root_items, update=_update_browser_root_key)
-    category_key: EnumProperty(name="Category", items=_browser_category_items, update=_update_browser_category_key)
-    folder_key: EnumProperty(name="Folder", items=_browser_folder_items, update=_update_browser_folder_key)
-    search_text: StringProperty(name="Search", default="", update=_update_browser_search_text)
-    model_key: EnumProperty(name="Model", items=_browser_model_items)
-    lod_key: EnumProperty(name="LOD", items=_browser_lod_items)
-
-    def invoke(self, context, _event):
-        settings = context.scene.warno_import
-        folders = _asset_folders_from_cache(settings)
-        if not folders:
-            try:
-                index_data, source, _runtime_info, _spk_paths = _ensure_asset_index_sync(settings, force_rebuild=False)
-                extractor_mod = _extractor_module(settings)
-                _apply_picker_view_from_index(
-                    settings,
-                    extractor_mod,
-                    index_data,
-                    source=source,
-                    query="",
-                )
-                folders = _asset_folders_from_cache(settings)
-            except Exception:
-                pass
-        if not folders:
-            self.report({"WARNING"}, "No scanned assets. Run Scan ALL Assets first.")
-            return {"CANCELLED"}
-
-        selected_primary = str(settings.selected_asset_group or "").strip()
-        selected_lod = str(settings.selected_asset_lod or "").strip()
-        found_folder_key = ""
-        found_model_key = ""
-        for folder in folders:
-            fkey = str(folder.get("key", "")).strip()
-            models = folder.get("models", [])
-            if not isinstance(models, list):
-                continue
-            for m in models:
-                primary = str(m.get("primary", "")).strip()
-                if primary != selected_primary:
-                    continue
-                found_folder_key = fkey
-                found_model_key = primary
-                break
-            if found_folder_key:
-                break
-
-        if not found_folder_key:
-            first = folders[0]
-            found_folder_key = str(first.get("key", "")).strip()
-            first_models = first.get("models", []) if isinstance(first.get("models", []), list) else []
-            found_model_key = str(first_models[0].get("primary", "")).strip() if first_models else "__none__"
-
-        root_key = _folder_root_key(found_folder_key)
-        self.root_key = root_key
-        found_category = ""
-        found_folder_key_low = str(found_folder_key or "").strip().lower()
-        for folder in folders:
-            fkey = str(folder.get("key", "")).strip().lower()
-            if fkey != found_folder_key_low:
-                continue
-            found_category = str(folder.get("category", "")).strip() or _asset_category_from_folder_key(fkey)
-            break
-        self.category_key = found_category or "__all__"
-        self.folder_key = found_folder_key or "__none__"
-        self.search_text = ""
-        self.model_key = found_model_key or "__none__"
-        if selected_lod and selected_lod != "__base__":
-            self.lod_key = selected_lod
-        else:
-            self.lod_key = "__base__"
-
-        return context.window_manager.invoke_props_dialog(self, width=1100)
-
-    def draw(self, context):
-        layout = self.layout
-        top = layout.row(align=True)
-        top.prop(self, "root_key")
-        top.prop(self, "category_key")
-        top.prop(self, "search_text")
-
-        row = layout.row(align=True)
-        c1 = row.column(align=True)
-        c1.label(text="Folder")
-        c1.prop(self, "folder_key", text="")
-
-        c2 = row.column(align=True)
-        c2.label(text="Model")
-        c2.prop(self, "model_key", text="")
-
-        c3 = row.column(align=True)
-        c3.label(text="LOD")
-        c3.prop(self, "lod_key", text="")
-
-        chosen = str(self.model_key or "").strip()
-        lod = str(self.lod_key or "").strip()
-        if lod and lod != "__base__":
-            chosen = lod
-        layout.separator()
-        layout.label(text=f"Will use: {chosen}", icon="OBJECT_DATA")
-
-    def execute(self, context):
-        settings = context.scene.warno_import
-        model = str(self.model_key or "").strip()
-        if not model or model == "__none__":
-            return {"CANCELLED"}
-        lod = str(self.lod_key or "").strip()
-        final_asset = lod if lod and lod != "__base__" else model
-
-        settings.asset_sync_lock = True
-        try:
-            _safe_set_selected_asset_group(settings, model)
-            _safe_set_selected_asset_lod(settings, lod if lod else "__base__")
-            _safe_set_selected_asset(settings, final_asset)
-        finally:
-            settings.asset_sync_lock = False
-        _sync_group_lod_from_selected(settings)
-        settings.status = f"Picked: {final_asset}"
-        return {"FINISHED"}
-
-
-class WARNO_OT_PickAssetPopup(Operator):
-    bl_idname = "warno.pick_asset_popup"
-    bl_label = "Pick Asset (Popup)"
-    bl_description = "Popup search list for scanned assets"
-    bl_options = {"INTERNAL"}
-
-    asset_pick: EnumProperty(name="Asset", items=_asset_popup_enum_items)
-
-    def invoke(self, context, _event):
-        # Blender 5.x may return None here in some builds; operator invoke must return a set.
-        result = context.window_manager.invoke_search_popup(self)
-        return result if isinstance(result, set) else {"RUNNING_MODAL"}
-
-    def execute(self, context):
-        settings = context.scene.warno_import
-        pick = str(self.asset_pick or "").strip()
-        if not pick or pick == "__none__":
-            return {"CANCELLED"}
-        settings.asset_sync_lock = True
-        try:
-            _safe_set_selected_asset(settings, pick)
-        finally:
-            settings.asset_sync_lock = False
-        _sync_group_lod_from_selected(settings)
-        settings.status = f"Picked: {pick}"
-        return {"FINISHED"}
 
 
 # =====================================================================
@@ -19919,7 +17940,7 @@ class WARNO_OT_GetUVFromGame(Operator):
     _EXE_BY_GAME = {"WARGAME_RD": "WarGame3.exe", "WARNO": "WARNO.exe", "STEEL_DIVISION_2": "SteelDivision2.exe"}
     _ROOT_DEFAULT = {
         "WARGAME_RD": r"C:\Program Files (x86)\Steam\steamapps\common\Wargame Red Dragon",
-        "WARNO": r"F:\SteamLibrary\steamapps\common\WARNO",
+        "WARNO": r"C:\Program Files (x86)\Steam\steamapps\common\WARNO",
         "STEEL_DIVISION_2": r"C:\Program Files (x86)\Steam\steamapps\common\Steel Division 2",
     }
     _NEW_CONSOLE = 0x00000010  # CREATE_NEW_CONSOLE
@@ -20044,6 +18065,29 @@ class WARNO_OT_GetUVFromGame(Operator):
         return None
 
 
+class _ImportScope:
+    """Stand-in for the scene collection handed to the post-import passes.
+
+    Those passes iterate ``collection.all_objects``. With the scene collection that
+    meant every object in the file: the reduced-LOD regroup cut the user's other
+    meshes into islands and deleted the originals, the LOD swap rewrote an earlier
+    import's meshes, and the wheel/track passes of a second unit bound to the first
+    unit's rig. ``all_objects`` here lists only objects created since the import
+    started (armatures, empties and objects a pass splits off included); ``objects``
+    is the real collection's, so a pass that links a new object still links it to
+    the scene.
+    """
+
+    def __init__(self, collection, preexisting_ptrs):
+        self._collection = collection
+        self._preexisting = set(preexisting_ptrs)
+        self.objects = collection.objects
+
+    @property
+    def all_objects(self):
+        return [o for o in self._collection.all_objects if int(o.as_pointer()) not in self._preexisting]
+
+
 class WARNO_OT_ImportAsset(Operator):
     bl_idname = "warno.import_asset"
     bl_label = "Import To Blender"
@@ -20051,10 +18095,41 @@ class WARNO_OT_ImportAsset(Operator):
 
     def execute(self, context):
         settings = context.scene.warno_import
+        # The rig build switches the active object into Edit Mode; starting from Edit or
+        # Pose mode on another object made that fail half-way ("context is incorrect").
+        if getattr(context, "mode", "OBJECT") != "OBJECT":
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except Exception:
+                pass
+        self._warno_console_toggled = False
+        try:
+            return self._execute_impl(context)
+        except Exception as exc:
+            # Any unexpected failure still closes the progress counter and the console the
+            # import opened, and leaves the scene in Object Mode.
+            msg = f"Import failed: {exc}"
+            settings.status = msg
+            _warno_log(settings, msg, level="ERROR", stage="import")
+            self.report({"ERROR"}, msg)
+            try:
+                if getattr(bpy.context, "mode", "OBJECT") != "OBJECT":
+                    bpy.ops.object.mode_set(mode="OBJECT")
+            except Exception:
+                pass
+            _toggle_import_console(settings, open_console=False, active=self._warno_console_toggled)
+            return {"CANCELLED"}
+        finally:
+            # Release the log file between imports (Windows would keep it locked).
+            _close_log_handles()
+
+    def _execute_impl(self, context):
+        settings = context.scene.warno_import
         _enforce_fixed_runtime_defaults(settings)
         t0 = time.monotonic()
         progress_total_steps = 8
         console_toggled = _toggle_import_console(settings, open_console=True)
+        self._warno_console_toggled = console_toggled
         # Start the cursor progress counter (visible % near the mouse, updates even while
         # this blocking operator runs) so the user can see the import is working. Torn down
         # in _toggle_import_console(open_console=False), which every import exit routes through.
@@ -20227,16 +18302,10 @@ class WARNO_OT_ImportAsset(Operator):
                     raise RuntimeError(f"Asset not found in SPK: {asset} ({mesh_spk_path})")
                 asset_real, meta = hit
 
+                # The requested asset is always the one imported. (A pre-pass used to decode
+                # the whole mesh once just to score LOD/"dest" siblings by name, then the
+                # decode below ran a second time.)
                 variant_note = ""
-                try:
-                    picked_asset, picked_note = _choose_asset_variant_for_import(extractor_mod, spk, asset_real)
-                    if picked_asset and picked_asset != asset_real:
-                        hit2 = spk.find_best_fat_entry_for_asset(picked_asset)
-                        if hit2 is not None:
-                            asset_real, meta = hit2
-                            variant_note = f"variant={Path(asset_real).name} ({picked_note})"
-                except Exception:
-                    pass
 
                 # Decoding the mesh is the longest blocking phase (per-part IRISZoom decode,
                 # track UV, bone names). Feed a per-part callback so the progress bar/cursor
@@ -20267,6 +18336,12 @@ class WARNO_OT_ImportAsset(Operator):
                         pass
 
                 model = spk.get_model_geometry(asset_real, progress_cb=_decode_progress)
+                try:
+                    _good, _total, _ratio = _model_valid_face_stats(model)
+                    if _total and _ratio < 0.98:
+                        variant_note = f"WARNING partial decode: {_good}/{_total} faces valid ({_ratio:.3f})"
+                except Exception:
+                    pass
                 # REAL LOD geometry: while the spk is open, also decode the originally-requested
                 # _mid/_low asset and convert it into the same world space (rotation + dev scale)
                 # the buckets use. The post-build swap puts this geometry onto the high parts.
@@ -20335,7 +18410,8 @@ class WARNO_OT_ImportAsset(Operator):
                 if need_bone_map:
                     for skeleton_path in _resolve_skeleton_spk_paths(project_root, settings, runtime_info):
                         try:
-                            skeleton_spks.append(stack.enter_context(extractor_mod.SpkMeshExtractor(skeleton_path, game=game)))
+                            # Only the node tables are read from skeleton packs.
+                            skeleton_spks.append(stack.enter_context(extractor_mod.SpkMeshExtractor(skeleton_path, game=game, fat_only=True)))
                         except Exception:
                             continue
 
@@ -20362,6 +18438,14 @@ class WARNO_OT_ImportAsset(Operator):
                             legacy_operators_source=None,
                             enable_operator_semantics=False,
                             game=game,
+                            # The GFX ndfbins come from the game packs (--gfx-root) when
+                            # they are there; otherwise the CLI reads the Output dump.
+                            zz_resolver=runtime_info.get("zz_resolver"),
+                            zz_runtime_root=(
+                                Path(str(runtime_info.get("runtime_root", "")).strip())
+                                if str(runtime_info.get("runtime_root", "") or "").strip()
+                                else None
+                            ),
                         )
                         gfx_manifest_info = gfx_resolver.manifest_for_asset(asset_real)
                     except Exception as exc:
@@ -20386,6 +18470,7 @@ class WARNO_OT_ImportAsset(Operator):
                             f"turrets={len(gfx_manifest_info.get('turrets', []) or [])} "
                             f"fx={len(gfx_manifest_info.get('weapon_fx_anchors', []) or [])} "
                             f"subdepictions={len(gfx_manifest_info.get('subdepictions', []) or [])}"
+                            + _gfx_input_log_text(gfx_manifest_info.get("gfx_input"))
                         ),
                         level="WARNING" if str(gfx_manifest_info.get("source", "none")) == "legacy_ndf_mirror" else "INFO",
                         stage="gfx",
@@ -20550,6 +18635,9 @@ class WARNO_OT_ImportAsset(Operator):
             return {"CANCELLED"}
 
         collection = context.scene.collection
+        # The post-import passes walk "collection.all_objects"; give them only the
+        # objects this import creates, never the user's other meshes (see _ImportScope).
+        import_scope = _ImportScope(collection, preexisting_object_ptrs)
         settings.last_import_collection = WARNO_SCENE_COLLECTION_SENTINEL
         imported_objects: List[bpy.types.Object] = []
         material_cache: Dict[str, bpy.types.Material] = {}
@@ -20625,6 +18713,7 @@ class WARNO_OT_ImportAsset(Operator):
             used_object_names.add(_norm_low(obj_name))
 
             mesh = bpy.data.meshes.new(obj_name)
+            mesh["warno_import"] = True
             mesh.from_pydata(bucket["vertices"], [], bucket["faces"])
             mesh.update()
             uv_layer = mesh.uv_layers.new(name="UVMap")
@@ -20722,6 +18811,7 @@ class WARNO_OT_ImportAsset(Operator):
                     mat = bpy.data.materials.get(mat_name)
                     if mat is None:
                         mat = bpy.data.materials.new(name=mat_name)
+                    mat["warno_import"] = True
                     _apply_material_nodes(
                         mat,
                         maps,
@@ -20748,10 +18838,13 @@ class WARNO_OT_ImportAsset(Operator):
                 mesh.materials.append(mat)
                 mat_slot_by_mid[mid] = len(mesh.materials) - 1
 
-            for face_i, poly in enumerate(mesh.polygons):
-                if face_i < len(bucket["face_mids"]):
-                    mid = int(bucket["face_mids"][face_i])
-                    poly.material_index = int(mat_slot_by_mid.get(mid, 0))
+            _face_mids = bucket["face_mids"]
+            _n_polys = len(mesh.polygons)
+            _slots = [
+                int(mat_slot_by_mid.get(int(_face_mids[i]), 0)) if i < len(_face_mids) else 0
+                for i in range(_n_polys)
+            ]
+            mesh.polygons.foreach_set("material_index", _slots)
 
             obj = bpy.data.objects.new(obj_name, mesh)
             obj["warno_group"] = preferred_group_name
@@ -20904,9 +18997,7 @@ class WARNO_OT_ImportAsset(Operator):
         _set_status(settings, "stage: building scene objects", stage="import")
         if bool(settings.use_merge_by_distance):
             _merge_by_distance(imported_objects, float(settings.merge_distance))
-        # NOTE: hole-fill (v1.7.4/v1.7.6) is DISABLED — filling the game's open-shell gaps
-        # made flat sheets across large gaps that look like folds/creases. The open edges are
-        # the game's own mesh; leave them. (_fill_rd_mesh_holes kept but not called.)
+        # No hole filling: the open edges are the game's own mesh.
         auto_smooth_mode = str(settings.auto_smooth_mode or "OFF").upper()
         if auto_smooth_mode in {"MODIFIER", "APPLY"}:
             try:
@@ -20916,18 +19007,18 @@ class WARNO_OT_ImportAsset(Operator):
                     _apply_auto_smooth_modifier(imported_objects, float(FIXED_AUTO_SMOOTH_ANGLE))
             except Exception as exc:
                 _warno_log(settings, f"auto_smooth warning: {exc}", level="WARNING", stage="import")
-        # Track weights are already synthesized from raw helper positions during mesh build.
-        # A second scene-space rewrite pass tends to rename upper/endcap patches incorrectly
-        # on vehicles like Leopard where missing helper ordinals must stay segment-aware.
-        # Keep the first-pass weights authoritative.
-        # _refine_track_weights_from_mesh_positions(imported_objects, settings=settings)
 
         # Record pre-rig WORLD VERTEX POSITIONS of rotor/engine parts (Helice, Bloc_Moteur, ...) so a
         # later pass can detect & undo a BAD bone-pull that displaces OR re-orients them off their
         # correct FBX pose (Ka-50: the rig drags the gearbox up AND tips it 90 deg onto its side).
+        # With exact node matrices the rig moves mesh ORIGINS only (it never rotates or
+        # displaces world-baked geometry), so these repair passes have nothing to undo and are
+        # skipped; they remain for packs without a matrix stream (Red Dragon / SD2).
+        _rsg = bone_payload.get("raw_scene_graph") if isinstance(bone_payload, dict) else None
+        _exact_scene = bool(getattr(_rsg, "exact_transforms", False))
         _rotor_engine_rx = re.compile(r"(helice|rotor|\bpale|propeller|rotopale|moteur)", re.IGNORECASE)
         _prepull_world = {}
-        for _o in imported_objects:
+        for _o in ([] if _exact_scene else imported_objects):
             if getattr(_o, "type", "") == "MESH" and _o.data and len(_o.data.vertices) and _rotor_engine_rx.search(getattr(_o, "name", "")):
                 _prepull_world[_o.name] = [(_o.matrix_world @ _v.co).copy() for _v in _o.data.vertices]
 
@@ -20946,7 +19037,7 @@ class WARNO_OT_ImportAsset(Operator):
             # snap sees the real disc. No-op for single-island (normal) wheels.
             try:
                 _is_rd_preset0 = (str(getattr(settings, "game_preset", "") or "").upper() in ("WARGAME_RD", "STEEL_DIVISION_2"))
-                _nren = _rename_elevator_named_wheels(collection, _is_rd_preset0)
+                _nren = _rename_elevator_named_wheels(import_scope, _is_rd_preset0)
                 if _nren:
                     _warno_log(settings, f"wheel rename: {_nren} elevator-named wheel mesh(es) renamed to their Roue_* station", stage="import")
             except Exception as _exc:
@@ -20956,7 +19047,7 @@ class WARNO_OT_ImportAsset(Operator):
             # elevator station out into its own Roue_* object. Runs BEFORE the declutter/fill so
             # the reclaimed wheel occupies its station (no donor overlay -> no double wheels).
             try:
-                _nrc = _reclaim_chassis_wheel_discs(collection, imported_objects, _is_rd_preset0)
+                _nrc = _reclaim_chassis_wheel_discs(import_scope, imported_objects, _is_rd_preset0)
                 if _nrc:
                     _warno_log(settings, f"wheel reclaim: {_nrc} welded wheel(s) pulled out of the Chassis onto their stations", stage="import")
             except Exception as _exc:
@@ -20964,13 +19055,13 @@ class WARNO_OT_ImportAsset(Operator):
             # WHEELED units with no elevator rig (FIROS_30/25, iveco): pull the ±Y mirror-paired
             # truck wheels welded into the Chassis out into their own Roue_D/G objects.
             try:
-                _nrw = _reclaim_chassis_wheels_no_elev(collection, imported_objects, _is_rd_preset0)
+                _nrw = _reclaim_chassis_wheels_no_elev(import_scope, imported_objects, _is_rd_preset0)
                 if _nrw:
                     _warno_log(settings, f"wheel reclaim (no-elev): {_nrw} truck wheel(s) pulled out of the Chassis", stage="import")
             except Exception as _exc:
                 _warno_log(settings, f"wheel reclaim (no-elev) failed: {_exc}", level="WARNING", stage="import")
             try:
-                _ndc = _declutter_rd_wheel_islands(imported_objects, collection, _is_rd_preset0)
+                _ndc = _declutter_rd_wheel_islands(imported_objects, import_scope, _is_rd_preset0)
                 if _ndc:
                     _warno_log(settings, f"wheel declutter: {_ndc} scrambled wheel(s) cleaned of stray discs", stage="import")
             except Exception as _exc:
@@ -20980,7 +19071,7 @@ class WARNO_OT_ImportAsset(Operator):
             # wheels are already on their rows. RD adds twin-mirror + Y-row normalization.
             try:
                 _is_rd_wfx = (str(getattr(settings, "game_preset", "") or "").upper() in ("WARGAME_RD", "STEEL_DIVISION_2"))
-                _nfix = _fix_outlier_wheels(imported_objects, collection, rd_extra=_is_rd_wfx)
+                _nfix = 0 if _exact_scene else _fix_outlier_wheels(imported_objects, import_scope, rd_extra=_is_rd_wfx)
                 if _nfix:
                     _warno_log(settings, f"outlier wheel fix: {_nfix} wheel(s) snapped to mirror", stage="import")
             except Exception:
@@ -20989,7 +19080,7 @@ class WARNO_OT_ImportAsset(Operator):
             # Roue_* nodes have no geometry (empty placeholders = missing wheels in-game).
             # Fill each placeholder with an instance of a donor wheel.
             try:
-                _nfw = _fill_empty_rd_wheels(imported_objects, collection, _is_rd_wfx)
+                _nfw = _fill_empty_rd_wheels(imported_objects, import_scope, _is_rd_wfx)
                 if _nfw:
                     _warno_log(settings, f"wheel fill: {_nfw} missing wheel(s) instanced from donor wheels", stage="import")
             except Exception as _exc:
@@ -20997,7 +19088,7 @@ class WARNO_OT_ImportAsset(Operator):
             # Align the whole wheel group to the track belt (ITA Leopard: stations reconstructed
             # ~1 m rearward of the belt -> empty front curve + sprocket past the rear end).
             try:
-                _wdelta = _align_wheel_row_to_belt(collection, _is_rd_wfx)
+                _wdelta = _align_wheel_row_to_belt(import_scope, _is_rd_wfx)
                 if _wdelta:
                     _warno_log(settings, f"wheel row align: shifted {_wdelta:+.2f} m onto the belt centre", stage="import")
             except Exception as _exc:
@@ -21006,7 +19097,7 @@ class WARNO_OT_ImportAsset(Operator):
             # Droite/Gauche and weight each belt to its side wheels. No-op for single-side
             # (RD / already-split) tracks.
             try:
-                _nsplit = _split_and_weight_merged_track(imported_objects, collection)
+                _nsplit = _split_and_weight_merged_track(imported_objects, import_scope)
                 if _nsplit:
                     _warno_log(settings, f"track split+weight: {_nsplit} merged belt(s) split into Droite/Gauche", stage="import")
             except Exception as _exc:
@@ -21015,7 +19106,7 @@ class WARNO_OT_ImportAsset(Operator):
             # after their armature objects — the cooker matches them by name, a plain 'Armature'
             # name means no track animation. Normalize AFTER every pass that binds belts.
             try:
-                _ntm = _normalize_track_modifier_names(collection)
+                _ntm = _normalize_track_modifier_names(import_scope)
                 if _ntm:
                     _warno_log(settings, f"track modifier rename: {_ntm} modifier(s) named after their armature", stage="import")
             except Exception as _exc:
@@ -21073,14 +19164,15 @@ class WARNO_OT_ImportAsset(Operator):
         # Rotor geometry fixes — pure mesh repairs, so run them OUTSIDE the auto_pull_bones gate
         # (they don't need an armature; otherwise Ka_50_AA etc. stay broken when bones are off).
         try:
-            _nrot = _fix_flyaway_rotors(collection)
+            _nrot = 0 if _exact_scene else _fix_flyaway_rotors(import_scope)
             if _nrot:
                 _warno_log(settings, f"rotor fly-away fix: {_nrot} rotor(s) re-centered", stage="import")
         except Exception as _exc:
             _warno_log(settings, f"rotor fly-away fix failed: {_exc}", level="WARNING", stage="import")
         # Coaxial rotors (Ka-50/52/27): stack the two discs on one mast (same X,Y).
         try:
-            _ncox = _align_coaxial_rotors(collection)
+            # Also wrong for tandem rotors (CH-47): it moved both discs to their mean X/Y.
+            _ncox = 0 if _exact_scene else _align_coaxial_rotors(import_scope)
             if _ncox:
                 _warno_log(settings, f"coaxial rotor align: {_ncox} disc(s) stacked on mast", stage="import")
         except Exception as _exc:
@@ -21090,29 +19182,29 @@ class WARNO_OT_ImportAsset(Operator):
         try:
             _is_rd_preset = (str(getattr(settings, "game_preset", "") or "").upper() in ("WARGAME_RD", "STEEL_DIVISION_2")
                              and not _is_reduced_lod)
-            _nwh = _rename_rd_wheels_to_skeleton(collection, _is_rd_preset)
+            _nwh = _rename_rd_wheels_to_skeleton(import_scope, _is_rd_preset)
             if _nwh:
                 _warno_log(settings, f"RD wheel rebind: {_nwh} wheel(s) renamed to their Roue_* skeleton bone", stage="import")
             # the rebind can pick an ELEVATOR anchor when the wheel's own placeholder fell to the
             # origin (C-13/60 G8) -> normalize such 'Roue_Elev_*'-named wheel MESHES to 'Roue_*'.
-            _nren2 = _rename_elevator_named_wheels(collection, _is_rd_preset)
+            _nren2 = _rename_elevator_named_wheels(import_scope, _is_rd_preset)
             if _nren2:
                 _warno_log(settings, f"wheel rename: {_nren2} elevator-named wheel mesh(es) renamed to their Roue_* station", stage="import")
                 # a just-renamed wheel may lack its opposite twin (M60A1 D4 without G4) — run the
                 # fill/twin-synth once more so the mirror instance is created. Occupancy checks
                 # make the re-run a no-op for every already-handled station.
-                _nfw2 = _fill_empty_rd_wheels(imported_objects, collection, _is_rd_preset)
+                _nfw2 = _fill_empty_rd_wheels(imported_objects, import_scope, _is_rd_preset)
                 if _nfw2:
                     _warno_log(settings, f"wheel fill (post-rebind): {_nfw2} wheel(s) added", stage="import")
             # hull mesh named after an FX node (weights hung on fx_stress_02 -> VCC-1 TUA):
             # rename it to Chassis, consuming the Chassis EMPTY.
-            _nfx = _fix_fx_named_hull(collection, _is_rd_preset)
+            _nfx = _fix_fx_named_hull(import_scope, _is_rd_preset)
             if _nfx:
                 _warno_log(settings, f"hull rename: Fx_*-named hull mesh renamed to Chassis", stage="import")
             # SDK convention (M1_Abrams): the '_1' idler/sprocket armature per side is parented to
             # the Chassis. On Fx-named-hull units the Chassis only exists now (after the rename
             # above), so the '_1' armatures were left parentless at build time -> parent them now.
-            _ntac = _parent_track_armatures_to_chassis(collection)
+            _ntac = _parent_track_armatures_to_chassis(import_scope)
             if _ntac:
                 _warno_log(settings, f"track armature parent: {_ntac} '_1' armature(s) parented to Chassis", stage="import")
             # WELDED-BELT class (VCC-1 TUA): the belts import as real Chenille_* objects via
@@ -21126,7 +19218,7 @@ class WARNO_OT_ImportAsset(Operator):
         try:
             _is_rd_reseat = (str(getattr(settings, "game_preset", "") or "").upper() in ("WARGAME_RD", "STEEL_DIVISION_2")
                              and not _is_reduced_lod)
-            _nws = _reseat_rd_wheel_origins(collection, _is_rd_reseat)
+            _nws = _reseat_rd_wheel_origins(import_scope, _is_rd_reseat)
             if _nws:
                 _warno_log(settings, f"wheel reseat: {_nws} wheel origin/parent pair(s) re-seated onto their geometry", stage="import")
         except Exception as _exc:
@@ -21136,7 +19228,7 @@ class WARNO_OT_ImportAsset(Operator):
         try:
             _is_rd_preset2 = (str(getattr(settings, "game_preset", "") or "").upper() in ("WARGAME_RD", "STEEL_DIVISION_2")
                               and not _is_reduced_lod)
-            _nls = _split_rd_launcher(collection, _is_rd_preset2)
+            _nls = _split_rd_launcher(import_scope, _is_rd_preset2)
             if _nls:
                 _warno_log(settings, f"RD launcher split: {_nls} 'Launcher' part(s) separated from Chassis", stage="import")
         except Exception as _exc:
@@ -21147,7 +19239,7 @@ class WARNO_OT_ImportAsset(Operator):
         try:
             _is_rd_radar = (str(getattr(settings, "game_preset", "") or "").upper() in ("WARGAME_RD", "STEEL_DIVISION_2")
                             and not _is_reduced_lod)
-            _nrsp = _split_rd_radar_from_chassis(collection, _is_rd_radar)
+            _nrsp = _split_rd_radar_from_chassis(import_scope, _is_rd_radar)
             if _nrsp:
                 _warno_log(settings, f"RD radar split: {_nrsp} radar part(s) separated from Chassis onto their masts", stage="import")
         except Exception as _exc:
@@ -21155,7 +19247,7 @@ class WARNO_OT_ImportAsset(Operator):
         # RD: weld each antenna/mast island left in the Chassis onto the part it is mounted on
         # (turret etc.) by base proximity. Runs AFTER the launcher split so 'Launcher' is a target.
         try:
-            _naw = _weld_rd_antennas_to_nearest_part(collection, _is_rd_preset2)
+            _naw = _weld_rd_antennas_to_nearest_part(import_scope, _is_rd_preset2)
             if _naw:
                 _warno_log(settings, f"RD antenna weld: {_naw} antenna island(s) merged into their nearest part", stage="import")
         except Exception as _exc:
@@ -21165,12 +19257,12 @@ class WARNO_OT_ImportAsset(Operator):
         # from scratch: split into connected-component islands, classify by geometry, re-merge into the
         # correct parts (Chenille / Roue_<D/G><N> / Canon_01 / Tourelle_01 / Chassis / Part_NN).
         try:
-            _nrg = _regroup_lod_islands(collection, _is_reduced_lod, _model_is_rd)
+            _nrg = _regroup_lod_islands(import_scope, _is_reduced_lod, _model_is_rd)
             if _nrg:
                 _warno_log(settings, f"LOD island regroup: rebuilt {_nrg} part(s) from geometry", stage="import")
                 # the regroup deleted the original objects and built new ones -> refresh the list the
                 # later passes (selection, active object) iterate, else they touch removed StructRNA.
-                imported_objects[:] = list(getattr(collection, "all_objects", []) or [])
+                imported_objects[:] = list(import_scope.all_objects)
         except Exception as _exc:
             _warno_log(settings, f"LOD island regroup failed: {_exc}", level="WARNING", stage="import")
 
@@ -21236,8 +19328,17 @@ class WARNO_OT_ImportAsset(Operator):
 
         # Glass: RD ships the canopy material ('Vitres') opaque; make glass see-through and
         # normalize its name to the cooker-reserved 'Vitre'.
+        # The material passes below only see this import's objects and materials;
+        # they used to walk all of bpy.data and rename/rewire the user's own materials.
+        _import_objects = list(import_scope.all_objects)
+        _import_materials = list({
+            slot.material.as_pointer(): slot.material
+            for _o in _import_objects
+            for slot in getattr(_o, "material_slots", [])
+            if slot.material is not None
+        }.values())
         try:
-            n_glass = _finalize_glass_materials()
+            n_glass = _finalize_glass_materials(_import_materials)
             if n_glass > 0:
                 _warno_log(settings, f"glass: {n_glass} material(s) made transparent + named Vitre", stage="import")
         except Exception as exc:
@@ -21245,7 +19346,7 @@ class WARNO_OT_ImportAsset(Operator):
 
         # Chains: name the ball-chain curtain object 'Chains' (not the generic 'Chassis_2' peel name).
         try:
-            n_chain = _name_chain_objects()
+            n_chain = _name_chain_objects(_import_objects)
             if n_chain > 0:
                 _warno_log(settings, f"chains: {n_chain} chain object(s) named 'Chains'", stage="import")
         except Exception:
@@ -21254,7 +19355,7 @@ class WARNO_OT_ImportAsset(Operator):
         # Diffuse repair: re-wire a diffuse texture left unlinked from Base Color (keyword-named
         # units like Alpha_Jet whose diffuse got mis-routed to the alpha input).
         try:
-            n_diff = _fix_unwired_diffuse()
+            n_diff = _fix_unwired_diffuse(_import_materials)
             if n_diff > 0:
                 _warno_log(settings, f"diffuse repair: {n_diff} material(s) re-wired to Base Color", stage="import")
         except Exception as _exc:
@@ -21263,7 +19364,7 @@ class WARNO_OT_ImportAsset(Operator):
         # Universal node hygiene: diffuse -> sRGB, other maps -> Non-Color, and the diffuse COLOR
         # must never drive BSDF Alpha (alpha is always a separate map). WARNO + RD.
         try:
-            n_norm = _normalize_diffuse_colorspace_and_alpha()
+            n_norm = _normalize_diffuse_colorspace_and_alpha(_import_materials)
             if n_norm > 0:
                 _warno_log(settings, f"colorspace/alpha hygiene: {n_norm} fix(es) (diffuse sRGB, maps Non-Color, alpha unlinked)", stage="import")
         except Exception as _exc:
@@ -21274,7 +19375,7 @@ class WARNO_OT_ImportAsset(Operator):
         # a Non-Color '*_A' texture (Color -> Alpha), BLEND. RD/SD2 only -> WARNO untouched.
         try:
             _is_rd_glass = (str(getattr(settings, "game_preset", "") or "").upper() in ("WARGAME_RD", "STEEL_DIVISION_2"))
-            _ngl = _fix_rd_glass_vitre(collection, _is_rd_glass)
+            _ngl = _fix_rd_glass_vitre(import_scope, _is_rd_glass)
             if _ngl:
                 _warno_log(settings, f"RD glass fix: {_ngl} glass material(s) wired (body diffuse + _A alpha)", stage="import")
         except Exception as _exc:
@@ -21325,7 +19426,7 @@ class WARNO_OT_ImportAsset(Operator):
                                     pass
                         _lod_mat_by_mid[_mid] = _mat
                     _nswap, _ntris, _swapped_names = _swap_in_real_lod_geometry(
-                        imported_objects, collection, _lod_real_parts, settings, _lod_mat_by_mid)
+                        imported_objects, import_scope, _lod_real_parts, settings, _lod_mat_by_mid)
                 except Exception as _exc:
                     _nswap = 0
                     _warno_log(settings, f"real LOD swap failed ({_exc}) -> decimate fallback", level="WARNING", stage="import")
@@ -21571,8 +19672,6 @@ CLASSES = [
     WARNO_OT_BuildAssetIndex,
     WARNO_OT_ScanAssets,
     WARNO_OT_ScanAssetsAll,
-    WARNO_OT_PickAssetBrowser,
-    WARNO_OT_PickAssetPopup,
     # New tree-view browser
     WARNO_UL_AssetBrowser,
     WARNO_OT_BrowserToggleFolder,
@@ -21632,6 +19731,7 @@ def unregister():
         bpy.utils.unregister_class(cls)
     ASSET_PICKER_VIEW_CACHE.clear()
     ASSET_INDEX_SESSION_CACHE.clear()
+    _close_log_handles()
 
 
 if __name__ == "__main__":
