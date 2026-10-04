@@ -8,7 +8,9 @@ If Atlas path is provided, it also resolves texture references and builds OBJ+MT
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
+import hashlib
 import importlib.util
 import inspect
 from dataclasses import dataclass, field
@@ -8618,6 +8620,142 @@ def find_gfx_ndfbins_in_zz(resolver: "ZZDatResolver") -> Dict[str, Any] | None:
     }
 
 
+def _is_zz_resolver_pack_name(name: str) -> bool:
+    """Packs find_warno_texture_dat_files hands to the ZZ resolver."""
+    low = str(name or "").lower()
+    return (
+        _is_numbered_zz_dat_name(name)
+        or bool(_LETTERED_ZZ_RX.match(Path(name).stem))
+        or low.endswith("_assets.dat")
+    )
+
+
+def _walk_dat_entries(scan_root: Path) -> List[Tuple[Path, int, int]]:
+    """(path, size, mtime_ns) of every .dat under scan_root. os.scandir hands the stats
+    over with the directory listing on Windows, so 15,000 packs cost one walk, not
+    15,000 stat calls."""
+    out: List[Tuple[Path, int, int]] = []
+    stack = [str(scan_root)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.name.lower().endswith(".dat"):
+                            st = entry.stat(follow_symlinks=False)
+                            out.append((Path(entry.path), int(st.st_size), int(st.st_mtime_ns)))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return out
+
+
+def find_warno_ndf_dat_entries(warno_root: Path, *, game: "str | None" = None) -> List[Tuple[Path, int, int]]:
+    """(path, size, mtime_ns) of every EDAT pack under the install that the ZZ resolver
+    does not index. WARNO keeps its compiled NDF there, not in the ZZ packs: the GFX
+    ndfbins sit in AllPlatforms/NDF/GFX of Data/PC/<version>/Glad.dat, per-map NDF in
+    the map packs."""
+    scan_root = _scan_root_for_dat_files(warno_root, get_game_profile(game))
+    if scan_root is None:
+        return []
+    return [row for row in _walk_dat_entries(scan_root) if not _is_zz_resolver_pack_name(row[0].name)]
+
+
+def _pack_holds_gfx_ndfbins(dat: Path) -> bool:
+    """Whether the pack's dictionary lists one of GFX_NDFBIN_NAMES under a folder path
+    with a "gfx" segment (the rule find_gfx_ndfbins_in_zz applies). Unreadable or
+    non-EDAT files hold nothing."""
+    wanted = {name.lower() for name in GFX_NDFBIN_NAMES}
+    try:
+        _header, rows = _scan_zz_dat_rows(dat)
+    except Exception:
+        return False
+    for row in rows:
+        parent, _sep, base = normalize_asset_path(str(row[0])).lower().rpartition("/")
+        if base in wanted and "gfx" in parent.split("/"):
+            return True
+    return False
+
+
+_NDF_GFX_PACKS_CACHE_NAME = ".ndf_gfx_packs.json"
+_NDF_GFX_PACKS_CACHE_VERSION = 1
+_NDF_GFX_RESOLVER_CACHE: Dict[str, Tuple[str, "ZZDatResolver | None"]] = {}
+
+
+def get_ndf_gfx_resolver(
+    warno_root: Path,
+    *,
+    game: "str | None" = None,
+    cache_root: "Path | None" = None,
+) -> "ZZDatResolver | None":
+    """Resolver over the non-ZZ packs that hold GFX ndfbins (newest patch layer first),
+    or None when no pack does.
+
+    Which packs those are is read from the packs themselves: every non-ZZ pack's
+    dictionary is scanned once (about 15,000 packs on a current WARNO, nearly all of
+    them per-map) and the answer is kept in <cache_root>/.ndf_gfx_packs.json under a
+    signature of all those packs' paths, sizes and dates. A game update adds or changes
+    packs, which changes the signature and reruns the scan.
+    """
+    entries = find_warno_ndf_dat_entries(warno_root, game=game)
+    if not entries:
+        return None
+    digest = hashlib.sha1()
+    for path, size, mtime_ns in sorted(entries, key=lambda e: str(e[0]).lower()):
+        digest.update(f"{str(path).lower()}|{size}|{mtime_ns}\n".encode("utf-8", "surrogatepass"))
+    signature = digest.hexdigest()
+    memo_key = f"{str(Path(warno_root)).lower()}|{game or ''}"
+    memo = _NDF_GFX_RESOLVER_CACHE.get(memo_key)
+    if memo is not None and memo[0] == signature:
+        return memo[1]
+
+    cache_file = Path(cache_root) / _NDF_GFX_PACKS_CACHE_NAME if cache_root is not None else None
+    packs: "List[Path] | None" = None
+    if cache_file is not None:
+        try:
+            cached = json.loads(cache_file.read_text(encoding="utf-8"))
+            if (
+                int(cached.get("version", 0)) == _NDF_GFX_PACKS_CACHE_VERSION
+                and cached.get("signature") == signature
+            ):
+                packs = [Path(p) for p in cached.get("packs", [])]
+        except (OSError, ValueError, TypeError, AttributeError):
+            packs = None
+    if packs is None:
+        dats = [e[0] for e in entries]
+        workers = max(1, min(16, (os.cpu_count() or 4) * 2))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            flags = list(pool.map(_pack_holds_gfx_ndfbins, dats))
+        packs = [dat for dat, has in zip(dats, flags) if has]
+        if cache_file is not None:
+            try:
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                tmp = cache_file.with_name(cache_file.name + f".{os.getpid()}.tmp")
+                tmp.write_text(
+                    json.dumps(
+                        {
+                            "version": _NDF_GFX_PACKS_CACHE_VERSION,
+                            "signature": signature,
+                            "scanned": len(dats),
+                            "packs": [str(p) for p in packs],
+                        },
+                        indent=1,
+                    ),
+                    encoding="utf-8",
+                )
+                os.replace(tmp, cache_file)
+            except OSError:
+                pass
+    resolver = ZZDatResolver(packs) if packs else None
+    _NDF_GFX_RESOLVER_CACHE.clear()
+    _NDF_GFX_RESOLVER_CACHE[memo_key] = (signature, resolver)
+    return resolver
+
+
 GFX_ASSEMBLED_ROOT = "_gfx_root"
 
 
@@ -8701,9 +8839,10 @@ def build_or_load_gfx_manifest(
     """GFX manifest for one asset, exported by moddingSuite's GFX CLI and cached.
 
     With zz_resolver and zz_runtime_root, the four GFX ndfbins are taken from the game
-    packs (extracted into zz_runtime_root) and passed as --gfx-root, and the cache is
-    keyed on their archive MD5s. Otherwise (or when the packs lack them) the CLI reads
-    the Output/AllPlatforms/NDF/GFX dump, keyed on those files' stats.
+    packs (the ZZ packs, else the other packs -- on WARNO, Glad.dat), extracted into
+    zz_runtime_root and passed as --gfx-root, and the cache is keyed on their archive
+    MD5s. Otherwise (or when no pack holds them) the CLI reads the
+    Output/AllPlatforms/NDF/GFX dump, keyed on those files' stats.
     """
     asset_norm = normalize_asset_path(str(asset_path or "")).strip()
     if not asset_norm:
@@ -8731,14 +8870,28 @@ def build_or_load_gfx_manifest(
         if not _accepts_kwargs(mod.export_gfx_json, "gfx_root"):
             gfx_input["note"] = f"wrapper {wrapper.name} has no gfx_root option; reading the Output dump"
         else:
-            try:
-                zz_in = _gfx_inputs_from_zz(zz_resolver, Path(zz_runtime_root))
-            except Exception as exc:
-                zz_in = None
-                gfx_input["note"] = f"GFX ndfbins could not be extracted from the game packs: {exc}"
-            else:
-                if zz_in is None:
-                    gfx_input["note"] = "the game packs hold no gfx folder with all four GFX ndfbins"
+            # The ZZ packs first (already indexed), then the other packs: WARNO keeps
+            # AllPlatforms/NDF/GFX in Glad.dat, which the ZZ resolver does not read.
+            zz_in = None
+            pack_errors: List[str] = []
+            for get_resolver in (
+                lambda: zz_resolver,
+                lambda: get_ndf_gfx_resolver(warno_root, game=game, cache_root=Path(zz_runtime_root)),
+            ):
+                try:
+                    resolver = get_resolver()
+                    zz_in = _gfx_inputs_from_zz(resolver, Path(zz_runtime_root)) if resolver is not None else None
+                except Exception as exc:
+                    pack_errors.append(str(exc))
+                    zz_in = None
+                if zz_in is not None:
+                    break
+            if zz_in is None:
+                gfx_input["note"] = (
+                    "GFX ndfbins could not be extracted from the game packs: " + "; ".join(pack_errors)
+                    if pack_errors
+                    else "the game packs hold no gfx folder with all four GFX ndfbins"
+                )
             if zz_in is not None:
                 gfx_root_arg = Path(zz_in["dir"])
                 gfx_input = {

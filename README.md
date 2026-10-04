@@ -151,7 +151,10 @@ current settings out, **Load My config** to restore them. Key fields:
 **Where the GFX manifest and atlas data come from.** The plugin extracts each
 asset's `TextureSmall.atlas` and the four GFX ndfbins (`Unit`, `Weapon`, `Depiction`,
 `DepictionResources`) from the game packs and passes them to the CLIs with
-`--atlas-file` / `--gfx-root`. Only a moddingSuite build that has these options
+`--atlas-file` / `--gfx-root`. On WARNO the atlases sit in the ZZ packs and the GFX
+ndfbins in `AllPlatforms/NDF/GFX` of `Data/PC/<version>/Glad.dat`. The plugin finds
+that pack by reading the dictionaries of all non-ZZ packs once per game update and
+caches the answer in `zz_runtime/.ndf_gfx_packs.json`. Only a moddingSuite build that has these options
 (branch `blender-plugin-interop`) reads them; older builds skip them. For atlases that
 changes little, since every build looks in the extracted copy first. The GFX CLI of an
 older build, however, reads `<WARNO>/Output/AllPlatforms/NDF/GFX/*.ndfbin`, a dump you
