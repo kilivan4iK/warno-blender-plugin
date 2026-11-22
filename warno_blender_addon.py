@@ -1,7 +1,7 @@
 bl_info = {
     "name": "WARNO Importer",
     "author": "Kilivanchik",
-    "version": (1, 7, 0),
+    "version": (1, 7, 1),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > WARNO",
     "description": "Direct WARNO SPK importer with textures and optional helper bones",
@@ -45,6 +45,7 @@ MODULE_CACHE: dict[tuple[str, str], tuple[int, Any]] = {}
 ZZ_RUNTIME_SESSION_CACHE: dict[tuple[str, str, str, tuple[tuple[str, int, int], ...]], Dict[str, Any]] = {}
 ASSET_INDEX_SESSION_CACHE: dict[str, Dict[str, Any]] = {}
 ASSET_PICKER_VIEW_CACHE: dict[str, Dict[str, Any]] = {}
+RESKIN_SESSION_CACHE: dict[str, tuple[Any, List[Dict[str, str]]]] = {}
 SAFE_NAME_RX = re.compile(r"[^A-Za-z0-9_.-]+")
 LOD_SUFFIX_LOCAL_RX = re.compile(r"_(LOW|MID|HIGH|LOD[0-9]+)$", re.IGNORECASE)
 CONTROL_CHAR_RX = re.compile(r"[\x00-\x1f\x7f]+")
@@ -1615,6 +1616,7 @@ def _asset_index_signature(runtime_info: Dict[str, Any], mesh_spk_paths: Sequenc
         "runtime_root": runtime_root_norm,
         "mesh_spk": spk_rows,
         "zz_dat": zz_rows,
+        "reskins": 1,  # index also lists re-skinned units (TResourceMesh Textures= override)
     }
 
 
@@ -2232,6 +2234,63 @@ def _scan_assets_from_spk_paths(
     return out
 
 
+def _reskin_entries_for_root(extractor_mod, warno_root: "Path | str") -> List[Dict[str, str]]:
+    """Re-skinned units of this WARNO install (see scan_warno_reskin_depictions), cached per session."""
+    root_text = str(warno_root or "").strip()
+    if not root_text or not hasattr(extractor_mod, "scan_warno_reskin_depictions"):
+        return []
+    root = Path(root_text)
+    try:
+        sig = extractor_mod.reskin_sources_signature(root)
+    except Exception:
+        return []
+    key = str(root).lower()
+    cached = RESKIN_SESSION_CACHE.get(key)
+    if cached is not None and cached[0] == sig:
+        return cached[1]
+    try:
+        entries = list(extractor_mod.scan_warno_reskin_depictions(root))
+    except Exception:
+        entries = []
+    RESKIN_SESSION_CACHE[key] = (sig, entries)
+    return entries
+
+
+def _merge_reskin_assets(extractor_mod, assets: Sequence[str], reskins: Sequence[Dict[str, str]]) -> List[str]:
+    """Add re-skinned units whose base mesh is in the SPK and which have no real FBX of their own."""
+    out = [str(a) for a in assets]
+    real = {a.lower() for a in out}
+    added = 0
+    for r in reskins:
+        virtual = str(r.get("asset", "") or "").strip()
+        mesh = str(r.get("mesh", "") or "").strip()
+        if not virtual or virtual.lower() in real or mesh.lower() not in real:
+            continue
+        real.add(virtual.lower())
+        out.append(virtual)
+        added += 1
+    if added:
+        out.sort(key=lambda a: _asset_picker_sort_key(extractor_mod, a))
+    return out
+
+
+def _reskin_for_asset(settings: "WARNOImporterSettings", asset: str) -> Dict[str, str] | None:
+    if _normalize_game_id(getattr(settings, "game_preset", "WARNO")) != "WARNO":
+        return None
+    key = str(asset or "").strip().replace("\\", "/").lower()
+    if not key:
+        return None
+    try:
+        extractor_mod = _extractor_module(settings)
+        warno_root = _resolve_path(_project_root(settings), str(settings.warno_root or "").strip())
+        for r in _reskin_entries_for_root(extractor_mod, warno_root):
+            if str(r.get("asset", "")).lower() == key:
+                return r
+    except Exception:
+        return None
+    return None
+
+
 def _build_asset_index_payload(extractor_mod, assets: Sequence[str], signature: Dict[str, Any], spk_count: int) -> Dict[str, Any]:
     groups = _build_asset_groups(extractor_mod, assets)
     folders = _build_asset_folders_cache(extractor_mod, groups)
@@ -2388,12 +2447,16 @@ def _ensure_asset_index_sync(
         if cached is not None and _asset_index_signature_matches(cached, signature):
             return cached, "cache", runtime_info, mesh_spk_paths
 
+    game_id = _normalize_game_id(getattr(settings, "game_preset", "WARNO"))
     assets = _scan_assets_from_spk_paths(
         extractor_mod,
         mesh_spk_paths,
         query=None,
-        game=_normalize_game_id(getattr(settings, "game_preset", "WARNO")),
+        game=game_id,
     )
+    if game_id == "WARNO":
+        warno_root = _resolve_path(project_root, str(settings.warno_root or "").strip())
+        assets = _merge_reskin_assets(extractor_mod, assets, _reskin_entries_for_root(extractor_mod, warno_root))
     payload = _build_asset_index_payload(extractor_mod, assets, signature, len(mesh_spk_paths))
     _save_asset_index_file(index_path, payload)
     return payload, "rebuilt", runtime_info, mesh_spk_paths
@@ -5499,7 +5562,11 @@ def _resolve_material_maps(
     material_name_by_id: Dict[int, str],
     material_role_by_id: Dict[int, str],
     runtime_info: Dict[str, Any] | None = None,
+    texture_asset: str = "",
 ) -> tuple[Dict[str, Dict[str, Path]], dict[str, Any]]:
+    # texture_asset: re-skinned unit path (<Textures folder>/<mesh name>.fbx). The atlas is
+    # looked up by it while geometry/material ids still come from `asset` (the base mesh).
+    atlas_asset = str(texture_asset or "").strip() or str(asset)
     maps_by_name: Dict[str, Dict[str, Path]] = {}
     stage_t0 = time.monotonic()
     report: dict[str, Any] = {
@@ -5594,7 +5661,7 @@ def _resolve_material_maps(
     atlas_map_index: Dict[str, List[Dict[str, Any]]] | None = None
     atlas_map_path: Path | None = None
     atlas_map_targets: List[str] = []
-    atlas_map_asset_path = str(asset)
+    atlas_map_asset_path = str(atlas_asset)
     atlas_init_error = ""
     if bool(settings.use_atlas_json_mapping):
         _warno_log(settings, "stage: atlas_map_build", stage="atlas_map_build")
@@ -5605,7 +5672,7 @@ def _resolve_material_maps(
         atlas_cli_path_text = str(settings.modding_suite_atlas_cli or "").strip()
         atlas_cli_path = _resolve_path(project_root, atlas_cli_path_text) if atlas_cli_path_text else None
         atlas_cache_root = _atlas_json_cache_root(settings)
-        atlas_candidates = _atlas_asset_variant_candidates(asset)
+        atlas_candidates = _atlas_asset_variant_candidates(atlas_asset)
         if not warno_root_for_atlas.exists() or not warno_root_for_atlas.is_dir():
             atlas_init_error = f"WARNO folder for Atlas JSON not found: {warno_root_for_atlas}"
         elif not modsuite_root.exists() or not modsuite_root.is_dir():
@@ -5632,11 +5699,11 @@ def _resolve_material_maps(
                     atlas_targets_raw = atlas_map_info.get("atlas_map_targets")
                     if isinstance(atlas_targets_raw, list):
                         atlas_map_targets = [str(x).strip() for x in atlas_targets_raw if str(x).strip()]
-                    atlas_map_asset_path = str(atlas_asset_candidate or asset)
+                    atlas_map_asset_path = str(atlas_asset_candidate or atlas_asset)
                     report["atlas_map_entries"] = int(atlas_map_info.get("atlas_map_entries", 0) or 0)
                     report["atlas_map_targets"] = len(atlas_map_targets)
                     extra_note = ""
-                    if _norm_ref_like(atlas_map_asset_path) != _norm_ref_like(asset):
+                    if _norm_ref_like(atlas_map_asset_path) != _norm_ref_like(atlas_asset):
                         extra_note = f" asset_fallback={atlas_map_asset_path}"
                     _warno_log(
                         settings,
@@ -5683,7 +5750,7 @@ def _resolve_material_maps(
     atlas_json_enabled = bool(settings.use_atlas_json_mapping and atlas_map_index)
     strict_atlas_mode = bool(atlas_json_enabled and settings.atlas_json_strict)
     if strict_atlas_mode:
-        removed_legacy = _cleanup_strict_legacy_alias_pngs(model_dir=model_dir, asset=asset)
+        removed_legacy = _cleanup_strict_legacy_alias_pngs(model_dir=model_dir, asset=atlas_asset)
         if removed_legacy > 0:
             _warno_log(
                 settings,
@@ -5701,7 +5768,7 @@ def _resolve_material_maps(
             filtered_targets = _filter_atlas_targets_by_materials(
                 atlas_map_index=atlas_map_index,
                 material_name_by_id=material_name_by_id,
-                asset_hint=asset,
+                asset_hint=atlas_asset,
             )
             targets_to_use = (
                 filtered_targets
@@ -18583,7 +18650,13 @@ def _load_extractor_module_for_worker(extractor_path: Path):
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Cannot load extractor module: {extractor_path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # Python 3.13 (Blender 5.3+): @dataclass looks the module up in sys.modules while the
+    # module body runs; an unregistered module crashes it and Scan ALL never builds the index.
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(spec.name, None)
     return module
 
 
@@ -18593,9 +18666,12 @@ def _build_asset_index_payload_worker(
     signature: Dict[str, Any],
     index_path: Path,
     game: "str | None" = None,
+    warno_root: str = "",
 ) -> Dict[str, Any]:
     extractor_mod = _load_extractor_module_for_worker(extractor_path)
     assets = _scan_assets_from_spk_paths(extractor_mod, spk_paths, query=None, game=game)
+    if warno_root and _normalize_game_id(game or "WARNO") == "WARNO":
+        assets = _merge_reskin_assets(extractor_mod, assets, _reskin_entries_for_root(extractor_mod, warno_root))
     payload = _build_asset_index_payload(extractor_mod, assets, signature, len(spk_paths))
     _save_asset_index_file(index_path, payload)
     return payload
@@ -18669,6 +18745,7 @@ class WARNO_OT_BuildAssetIndex(Operator):
                 "signature": signature,
                 "extractor_path": extractor_path,
                 "game": _normalize_game_id(getattr(settings, "game_preset", "WARNO")),
+                "warno_root": str(_resolve_path(project_root, str(settings.warno_root or "").strip())),
             }
 
             def worker():
@@ -18679,6 +18756,7 @@ class WARNO_OT_BuildAssetIndex(Operator):
                         signature=dict(self._job["signature"]),
                         index_path=Path(self._job["index_path"]),
                         game=self._job["game"],
+                        warno_root=self._job["warno_root"],
                     )
                     self._job["payload"] = payload
                 except Exception as exc:
@@ -19691,7 +19769,7 @@ def _collection_asset_from_name(col_name: str) -> str:
     for obj in col.all_objects:
         if obj.type != "MESH":
             continue
-        asset = str(obj.get("warno_asset", "")).strip()
+        asset = str(obj.get("warno_reskin_asset", "") or obj.get("warno_asset", "")).strip()
         if asset:
             return asset
     return ""
@@ -19714,6 +19792,11 @@ class WARNO_OT_ApplyTextures(Operator):
         if not asset or asset == "__none__":
             self.report({"WARNING"}, "No WARNO asset selected/found for texture apply.")
             return {"CANCELLED"}
+        reskin_texture_asset = ""
+        reskin = _reskin_for_asset(settings, asset)
+        if reskin:
+            reskin_texture_asset = str(reskin["asset"])
+            asset = str(reskin["mesh"])
 
         try:
             extractor_mod = _extractor_module(settings)
@@ -19757,7 +19840,7 @@ class WARNO_OT_ApplyTextures(Operator):
                     auto_name_materials=bool(settings.auto_name_materials),
                 )
 
-                model_dir = _cache_asset_dir(extractor_mod, settings, asset_real)
+                model_dir = _cache_asset_dir(extractor_mod, settings, reskin_texture_asset or asset_real)
                 model_dir.mkdir(parents=True, exist_ok=True)
                 _set_status(settings, "stage: resolving textures", stage="apply_textures")
                 material_maps_by_name, texture_report = _resolve_material_maps(
@@ -19770,6 +19853,7 @@ class WARNO_OT_ApplyTextures(Operator):
                     material_name_by_id=material_name_by_id,
                     material_role_by_id=material_role_by_id,
                     runtime_info=runtime_info,
+                    texture_asset=reskin_texture_asset,
                 )
                 _force_opaque_baked_tracks(model, material_name_by_id, material_maps_by_name)
         except Exception as exc:
@@ -20082,6 +20166,18 @@ class WARNO_OT_ImportAsset(Operator):
             self.report({"WARNING"}, msg)
             _toggle_import_console(settings, open_console=False, active=console_toggled)
             return {"CANCELLED"}
+
+        # Re-skinned unit (no FBX of its own): geometry from the base mesh, textures from its folder.
+        _reskin_texture_asset = ""
+        _reskin = _reskin_for_asset(settings, asset)
+        if _reskin:
+            _reskin_texture_asset = str(_reskin["asset"])
+            asset = str(_reskin["mesh"])
+            _warno_log(
+                settings,
+                f"re-skinned unit {_reskin.get('name', '')}: mesh={asset} textures={_reskin.get('textures', '')}",
+                stage="import",
+            )
 
         # Reduced-LOD detection (computed ONCE, early): stem ends '_mid'/'_low'/'_lodN', asset is in a
         # '/lods/' folder, OR an explicit non-base LOD is picked in the UI. Reduced LODs carry FEWER
@@ -20420,7 +20516,7 @@ class WARNO_OT_ImportAsset(Operator):
                         stage="import",
                     )
 
-                model_dir = _cache_asset_dir(extractor_mod, settings, asset_real)
+                model_dir = _cache_asset_dir(extractor_mod, settings, _reskin_texture_asset or asset_real)
                 model_dir.mkdir(parents=True, exist_ok=True)
                 texture_dir_to_open = str(model_dir.resolve())
                 _set_status(settings, "stage: resolving textures", stage="import")
@@ -20434,6 +20530,7 @@ class WARNO_OT_ImportAsset(Operator):
                     material_name_by_id=material_name_by_id,
                     material_role_by_id=material_role_by_id,
                     runtime_info=runtime_info,
+                    texture_asset=_reskin_texture_asset,
                 )
                 _force_opaque_baked_tracks(model, material_name_by_id, material_maps_by_name)
                 _log_import_progress(
@@ -20756,6 +20853,8 @@ class WARNO_OT_ImportAsset(Operator):
             obj = bpy.data.objects.new(obj_name, mesh)
             obj["warno_group"] = preferred_group_name
             obj["warno_asset"] = asset
+            if _reskin_texture_asset:
+                obj["warno_reskin_asset"] = _reskin_texture_asset
             obj["warno_group_bone_index"] = int(group_bone_index)
             # Track meshes skip merge-by-distance (keep the clean game vertex topology so
             # the seam UV isn't collapsed). Match WARNO 'chenille_droite/gauche' AND the RD

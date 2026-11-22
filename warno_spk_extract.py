@@ -8787,6 +8787,116 @@ def _scan_zz_dat_entries(dat_path: Path) -> Tuple[Dict[str, int], List[Dict[str,
         return header, _parse_zz_dat_v2_entries(dat_path, header, legacy_padding=False)
 
 
+# --- Re-skinned units (TResourceMesh with a Textures= override) -------------------------
+# Since the Nation Pack / 2026 DLC most new-nation units ship WITHOUT their own FBX: the
+# depiction says "use that mesh, but take the textures from this folder", e.g.
+#     export Modele_UH1H_COL is TResourceMesh
+#     ( Mesh=ModelFile_UH1H_US  Textures="GameData:/Assets/3D/Units/COL/Helico/UH_1H_Huey" )
+# Base.spk has no entry for them, so they never reached the asset browser. The texture
+# atlas of such a folder declares its model as "<Textures folder>/<mesh file name>", and
+# the mesh material names match the atlas names 1:1, so that path is used as the
+# importable "virtual" asset: geometry from the base mesh, textures from the folder.
+_RESKIN_CONST_RX = re.compile(r"""export\s+([A-Za-z0-9_]+)\s+is\s+['"](?:GameData:)?/?([^'"]+?\.fbx)['"]""", re.IGNORECASE)
+_RESKIN_RESOURCE_RX = re.compile(r"""export\s+([A-Za-z0-9_]+)\s+is\s+TResourceMesh\s*\((.*?)\)""", re.IGNORECASE | re.DOTALL)
+_RESKIN_MESH_RX = re.compile(r"""\bMesh\s*=\s*([A-Za-z0-9_]+|['"][^'"]+['"])""", re.IGNORECASE)
+_RESKIN_TEXTURES_RX = re.compile(r"""\bTextures\s*=\s*['"](?:GameData:)?/?([^'"]+)['"]""", re.IGNORECASE)
+_RESKIN_LOD_RX = re.compile(r"_(mid|low)$", re.IGNORECASE)
+
+
+def _reskin_source_dats(warno_root: Path) -> List[Path]:
+    """Non-ZZ, non-map packages of every patch layer (Game.dat / Common.dat / Data.dat ...)."""
+    pc_root = Path(warno_root) / "Data" / "PC"
+    out: List[Path] = []
+    if not pc_root.is_dir():
+        return out
+    layer_dirs: List[Path] = []
+    for d in pc_root.iterdir():
+        if d.is_dir() and d.name.isdigit():
+            layer_dirs.append(d)
+            layer_dirs.extend(sub for sub in d.iterdir() if sub.is_dir() and sub.name.isdigit())
+    for d in layer_dirs:
+        for p in d.glob("*.dat"):
+            low = p.name.lower()
+            if low.startswith(("zz", "_")):
+                continue
+            out.append(p)
+    out.sort(key=lambda p: (_zz_dat_sort_key(p), str(p).lower()))
+    return out
+
+
+def reskin_sources_signature(warno_root: Path) -> List[List[Any]]:
+    rows: List[List[Any]] = []
+    for p in _reskin_source_dats(warno_root):
+        try:
+            st = p.stat()
+            rows.append([str(p).lower(), int(st.st_mtime_ns), int(st.st_size)])
+        except Exception:
+            continue
+    return rows
+
+
+def scan_warno_reskin_depictions(warno_root: Path) -> List[Dict[str, str]]:
+    """List re-skinned units as {"asset": virtual fbx, "mesh": base fbx, "textures": folder, "name": export}.
+
+    Reads Gameplay/Gfx depiction NDF straight from the patch layers (newest layer wins per
+    file). LOD (_MID/_LOW) variants are skipped: the browser lists the main model only.
+    """
+    texts: Dict[str, str] = {}
+    for dat in _reskin_source_dats(warno_root):
+        try:
+            _header, entries = _scan_zz_dat_entries(dat)
+        except Exception:
+            continue
+        try:
+            with dat.open("rb") as fh:
+                for e in entries:
+                    low = str(e.get("path", "")).lower()
+                    if not low.endswith(".ndf") or "gfx/" not in low:
+                        continue
+                    fh.seek(int(e["abs_offset"]))
+                    raw = fh.read(int(e["size"]))
+                    if raw[:4] == b"EUG0":
+                        continue
+                    texts[low] = raw.decode("utf-8", errors="replace")
+        except Exception:
+            continue
+
+    consts: Dict[str, str] = {}
+    for txt in texts.values():
+        for m in _RESKIN_CONST_RX.finditer(txt):
+            consts[m.group(1)] = normalize_asset_path(m.group(2))
+
+    out: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for txt in texts.values():
+        for m in _RESKIN_RESOURCE_RX.finditer(txt):
+            body = m.group(2)
+            mm = _RESKIN_MESH_RX.search(body)
+            tm = _RESKIN_TEXTURES_RX.search(body)
+            if mm is None or tm is None:
+                continue
+            mesh_ref = mm.group(1).strip("'\"")
+            mesh = consts.get(mesh_ref, "")
+            if not mesh and mesh_ref.lower().endswith(".fbx"):
+                mesh = normalize_asset_path(re.sub(r"(?i)^gamedata:/?", "", mesh_ref))
+            tex_dir = normalize_asset_path(tm.group(1)).rstrip("/")
+            if not mesh or not tex_dir:
+                continue
+            mesh_pp = PurePosixPath(mesh)
+            if _RESKIN_LOD_RX.search(m.group(1)) or _RESKIN_LOD_RX.search(mesh_pp.stem) or _RESKIN_LOD_RX.search(tex_dir):
+                continue
+            if PurePosixPath(tex_dir).as_posix().lower() == mesh_pp.parent.as_posix().lower():
+                continue
+            virtual = f"{tex_dir}/{mesh_pp.name}"
+            key = virtual.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"asset": virtual, "mesh": mesh, "textures": tex_dir, "name": m.group(1)})
+    out.sort(key=lambda r: r["asset"].lower())
+    return out
+
+
 class ZZDatResolver:
     def __init__(self, dat_files: Sequence[Path]):
         self.dat_files = [Path(p) for p in dat_files if Path(p).exists() and Path(p).is_file()]
